@@ -787,13 +787,13 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 
 - [ ] Wheel installs on Python 3.11, 3.12, 3.13 on macOS and Ubuntu
 - [ ] Leak test (Rule 3), equivalence test (Rule 9) and context-equivalence test (Rule 13) run on every workload, every tier, every CI job; none is skippable
-- [ ] Kill/resume at 15 points and chaos matrix at zero leaks, zero duplicates, zero equivalence failures
+- [x] Kill/resume at 15 points and chaos matrix at zero leaks, zero duplicates, zero equivalence failures
 - [ ] LangGraph integration works on an unchanged graph file; plain-Python integration works; MCP proxy works with a generic client
-- [ ] T0, T1 drafters shipped; T2 behind an extra
+- [x] T0, T1 drafters shipped; T2 behind an extra
 - [ ] Offline opportunity analysis, online latency bench (budget-capped), overhead bench, adversarial suite — all with committed JSON, CIs, and commands
-- [ ] `RESULTS.md`, README numbers, and the PDF are generated; `check_numbers.py` and the vocabulary check are green
-- [ ] "What beats it" section in README and report, before the wins
-- [ ] Every prior-art project in §3 credited by name in the README
+- [x] `RESULTS.md`, README numbers, and the PDF are generated; `check_numbers.py` and the vocabulary check are green
+- [x] "What beats it" section in README and report, before the wins
+- [x] Every prior-art project in §3 credited by name in the README
 - [ ] Published to PyPI; installed and demoed from the published wheel
 
 ---
@@ -959,6 +959,8 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [4.x] NOT VERIFIED END TO END: the transport has not been driven by a real MCP client against a real upstream server in this environment. Phase Gate 4 (a generic client producing the same ledger as the LangGraph integration) is therefore NOT met and 4.x is ticked for the rules and the wiring, not for that gate. — 2026-09-16
 [9.2] All six docs written (effect-classes, hazards, limitations, replay, adapters, mcp-proxy); specunode init writes the config and .specunode/ and was run to check it. — 2026-09-16
 [9.4] bench/make_report_pdf.py regenerates the report from bench/results/*.json. A test asserts the generator's own source contains no hard-coded figure, because a number typed into the generator would survive a change in what was measured and the provenance link would break silently. The wall-clock section renders 'not measured' rather than being omitted. — 2026-09-16
+[T2] Tier-2 draft model shipped behind the optional extra. It holds the only prompt in the package, and it lives in drafters/ rather than the control path — a drafter may hold one because everything it produces is a candidate the gate must still confirm by exact equality. A test greps the four control packages for that prompt text. — 2026-09-16
+[T2] Decision: a draft model that is down, rate-limited or slow returns no opinion rather than failing the run. The sequential path is always correct, so losing a speculation is not an error; a drafter that could fail a run would make speculation a liability rather than an optimisation. — 2026-09-16
 [0.4] Decision: CallScope is carried in a ContextVar rather than passed as an argument, so JournaledModel satisfies ModelClient and can be substituted wherever the developer's graph already calls a model — which is what lets task 2.3 leave their graph file unchanged. — 2026-09-15
 ```
 
