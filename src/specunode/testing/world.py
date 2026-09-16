@@ -27,15 +27,18 @@ that honestly instead of quietly.
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal
+from pathlib import Path
+from typing import Literal, TextIO
 
-from specunode.canonical import JsonValue, chash
+from specunode.canonical import JsonValue, canonical, chash
 from specunode.testing.faults import Faults
 
 __all__ = [
@@ -147,16 +150,139 @@ class World:
     #: the branch has been squashed, to show the effect lands anyway.
     pending_jobs: list[tuple[str, str, Mapping[str, JsonValue]]] = field(default_factory=list)
 
+    #: When set, every mutation and read is appended here and fsynced before the call
+    #: returns, and reopening the world replays the file. Tasks 2.5 and 5.2 SIGKILL a
+    #: subprocess and then compare the resumed run's mutations against the uninterrupted
+    #: run's; an in-memory world dies with the process it was killed in, so the resumed
+    #: process could not see a duplicate dispatch of an effect the dead one already sent --
+    #: which is the whole thing those tests exist to catch.
+    log_path: Path | None = None
+
     _sequence: int = 0
     #: Effect keys already applied, so a truly idempotent tool collapses repeat deliveries.
     _applied_keys: set[str] = field(default_factory=set)
     _tools: dict[str, WorldTool] = field(default_factory=dict, repr=False)
+    _log: TextIO | None = field(default=None, repr=False)
+    _replaying: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         for table in ("customers", "tickets", "jobs", "messages", "charges", "docs"):
             self.tables.setdefault(table, {})
         if not self._tools:
             self._tools = self._build_tools()
+        if self.log_path is not None:
+            self._open_log(self.log_path)
+
+    # -- durability ------------------------------------------------------------------------
+
+    def _open_log(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            self._recover(path)
+        self._log = path.open("a", encoding="utf-8")
+
+    def _recover(self, path: Path) -> None:
+        """Rebuild state from the log.
+
+        Replaying the recorded row rather than re-running the tool: a tool call can fail, be
+        partitioned or be duplicated, and re-running one during recovery would have to
+        reproduce all of that. The record already says what the row became.
+        """
+        self._replaying = True
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # A torn final line means the process died mid-append. Everything before
+                    # it is intact, which is exactly the guarantee these tests need.
+                    break
+                self._replay_event(event)
+        finally:
+            self._replaying = False
+
+    def _replay_event(self, event: Mapping[str, JsonValue]) -> None:
+        kind = event.get("kind")
+        self._sequence = max(self._sequence, _as_int(event.get("sequence")))
+        if kind == "read":
+            self.reads.append(
+                ReadHit(
+                    sequence=_as_int(event.get("sequence")),
+                    branch_id=str(event.get("branch_id", "")),
+                    tool=str(event.get("tool", "")),
+                    args_hash=str(event.get("args_hash", "")),
+                    ts=_as_float(event.get("ts")),
+                    speculative=bool(event.get("speculative", False)),
+                )
+            )
+            return
+        table, row_id = str(event.get("table", "")), str(event.get("row_id", ""))
+        self.mutations.append(
+            Mutation(
+                sequence=_as_int(event.get("sequence")),
+                branch_id=str(event.get("branch_id", "")),
+                effect_key=str(event.get("effect_key", "")),
+                tool=str(event.get("tool", "")),
+                args_hash=str(event.get("args_hash", "")),
+                table=table,
+                row_id=row_id,
+                ts=_as_float(event.get("ts")),
+                speculative=bool(event.get("speculative", False)),
+            )
+        )
+        self.versions[(table, row_id)] = self.versions.get((table, row_id), 0) + 1
+        row_after = event.get("row_after")
+        if isinstance(row_after, Mapping):
+            self.tables.setdefault(table, {})[row_id] = dict(row_after)
+        elif row_after is None:
+            self.tables.setdefault(table, {}).pop(row_id, None)
+        key = event.get("effect_key")
+        if isinstance(key, str) and key:
+            self._applied_keys.add(key)
+
+    def _append_log(self, event: Mapping[str, JsonValue]) -> None:
+        if self._log is None or self._replaying:
+            return
+        self._log.write(canonical(event).decode("utf-8") + "\n")
+        self._log.flush()
+        os.fsync(self._log.fileno())
+
+    def _persist_mutation(self, record: Mutation, row_after: JsonValue) -> None:
+        self._append_log(
+            {
+                "kind": "mutation",
+                "sequence": record.sequence,
+                "branch_id": record.branch_id,
+                "effect_key": record.effect_key,
+                "tool": record.tool,
+                "args_hash": record.args_hash,
+                "table": record.table,
+                "row_id": record.row_id,
+                "ts": record.ts,
+                "speculative": record.speculative,
+                "row_after": row_after,
+            }
+        )
+
+    def _persist_read(self, record: ReadHit) -> None:
+        self._append_log(
+            {
+                "kind": "read",
+                "sequence": record.sequence,
+                "branch_id": record.branch_id,
+                "tool": record.tool,
+                "args_hash": record.args_hash,
+                "ts": record.ts,
+                "speculative": record.speculative,
+            }
+        )
+
+    def close(self) -> None:
+        if self._log is not None:
+            self._log.close()
+            self._log = None
 
     def _build_tools(self) -> dict[str, WorldTool]:
         """The world's tools, with the semantics the world really has.
@@ -217,38 +343,55 @@ class World:
 
     # -- the single funnel every state change passes through -----------------------------
 
-    def _mutate(self, tool: str, args: Mapping[str, JsonValue], table: str, row_id: str) -> None:
-        """Record a mutation. The only place ``self.tables`` is allowed to change."""
+    def _mutate(
+        self,
+        tool: str,
+        args: Mapping[str, JsonValue],
+        table: str,
+        row_id: str,
+        apply: Callable[[], None] | None = None,
+    ) -> None:
+        """Apply and record a mutation. The only place ``self.tables`` is allowed to change.
+
+        The state change runs *inside* the funnel rather than beside it, for two reasons.
+        It makes "no tool can move state without recording it" structural rather than a
+        convention -- disabling this method leaves the tables untouched whatever the tool
+        does. And it means the record can carry the resulting row, which is what lets the
+        durable log be replayed on recovery without re-running any tool.
+        """
         context = current_call_context()
         self._sequence += 1
+        if apply is not None:
+            apply()
         self.versions[(table, row_id)] = self.versions.get((table, row_id), 0) + 1
-        self.mutations.append(
-            Mutation(
-                sequence=self._sequence,
-                branch_id=context.branch_id,
-                effect_key=context.effect_key,
-                tool=tool,
-                args_hash=chash(dict(args)),
-                table=table,
-                row_id=row_id,
-                ts=time.monotonic(),
-                speculative=context.speculative,
-            )
+        row = self.tables.get(table, {}).get(row_id)
+        record = Mutation(
+            sequence=self._sequence,
+            branch_id=context.branch_id,
+            effect_key=context.effect_key,
+            tool=tool,
+            args_hash=chash(dict(args)),
+            table=table,
+            row_id=row_id,
+            ts=time.monotonic(),
+            speculative=context.speculative,
         )
+        self.mutations.append(record)
+        self._persist_mutation(record, dict(row) if row is not None else None)
 
     def _record_read(self, tool: str, args: Mapping[str, JsonValue]) -> None:
         context = current_call_context()
         self._sequence += 1
-        self.reads.append(
-            ReadHit(
-                sequence=self._sequence,
-                branch_id=context.branch_id,
-                tool=tool,
-                args_hash=chash(dict(args)),
-                ts=time.monotonic(),
-                speculative=context.speculative,
-            )
+        record = ReadHit(
+            sequence=self._sequence,
+            branch_id=context.branch_id,
+            tool=tool,
+            args_hash=chash(dict(args)),
+            ts=time.monotonic(),
+            speculative=context.speculative,
         )
+        self.reads.append(record)
+        self._persist_read(record)
 
     # -- queries the tests ask ------------------------------------------------------------
 
@@ -306,8 +449,14 @@ class World:
         count = 0
         while self.pending_jobs:
             branch_id, tool, args = self.pending_jobs.pop(0)
+            job_id = str(args.get("job_id", "unknown"))
+
+            def apply(job_id: str = job_id) -> None:
+                row = self.tables["jobs"].setdefault(job_id, {})
+                row["reindexed"] = _as_int(row.get("reindexed")) + 1
+
             with self.bind(branch_id=branch_id, effect_key="<async>", speculative=False):
-                self._mutate(tool, args, "jobs", str(args.get("job_id", "unknown")))
+                self._mutate(tool, args, "jobs", job_id, apply)
             count += 1
         return count
 
@@ -332,7 +481,12 @@ class World:
         return self._read_row(table, row_id, witness=witness)
 
     async def _write(
-        self, tool: str, args: Mapping[str, JsonValue], table: str, row_id: str
+        self,
+        tool: str,
+        args: Mapping[str, JsonValue],
+        table: str,
+        row_id: str,
+        apply: Callable[[], None] | None = None,
     ) -> JsonValue:
         """Apply a write once per delivery, recording every delivery.
 
@@ -345,9 +499,9 @@ class World:
         spec = self._tools[tool]
         applied = 0
         for _ in range(self.faults.deliveries(tool)):
-            self._mutate(tool, args, table, row_id)
             key = current_call_context().effect_key
-            already = spec.truly_idempotent and key and key in self._applied_keys
+            already = bool(spec.truly_idempotent and key and key in self._applied_keys)
+            self._mutate(tool, args, table, row_id, None if already else apply)
             if not already:
                 applied += 1
                 if key:
@@ -398,72 +552,93 @@ class World:
     async def create_ticket(self, customer_id: str, title: str) -> JsonValue:
         ticket_id = f"tkt-{chash({'c': customer_id, 't': title})[:8]}"
         args: dict[str, JsonValue] = {"customer_id": customer_id, "title": title}
-        result = await self._write("create_ticket", args, "tickets", ticket_id)
-        self.tables["tickets"].setdefault(
-            ticket_id, {"customer_id": customer_id, "title": title, "status": "open"}
-        )
+
+        def apply() -> None:
+            self.tables["tickets"].setdefault(
+                ticket_id, {"customer_id": customer_id, "title": title, "status": "open"}
+            )
+
+        result = await self._write("create_ticket", args, "tickets", ticket_id, apply)
         return {**result, "ticket_id": ticket_id}  # type: ignore[dict-item]
 
     async def update_ticket(self, ticket_id: str, status: str) -> JsonValue:
         args: dict[str, JsonValue] = {"ticket_id": ticket_id, "status": status}
-        result = await self._write("update_ticket", args, "tickets", ticket_id)
-        self.tables["tickets"].setdefault(ticket_id, {})["status"] = status
-        return result
+
+        def apply() -> None:
+            self.tables["tickets"].setdefault(ticket_id, {})["status"] = status
+
+        return await self._write("update_ticket", args, "tickets", ticket_id, apply)
 
     async def restart_job(self, job_id: str) -> JsonValue:
         args: dict[str, JsonValue] = {"job_id": job_id}
-        result = await self._write("restart_job", args, "jobs", job_id)
-        row = self.tables["jobs"].setdefault(job_id, {"restarts": 0, "status": "unknown"})
-        row["status"] = "running"
-        row["restarts"] = _as_int(row.get("restarts")) + 1
-        return result
+
+        def apply() -> None:
+            row = self.tables["jobs"].setdefault(job_id, {"restarts": 0, "status": "unknown"})
+            row["status"] = "running"
+            row["restarts"] = _as_int(row.get("restarts")) + 1
+
+        return await self._write("restart_job", args, "jobs", job_id, apply)
 
     async def post_summary(self, channel: str, text: str) -> JsonValue:
         message_id = f"msg-{len(self.tables['messages']) + 1}"
         args: dict[str, JsonValue] = {"channel": channel, "text": text}
-        result = await self._write("post_summary", args, "messages", message_id)
-        self.tables["messages"][message_id] = {"channel": channel, "text": text}
+
+        def apply() -> None:
+            self.tables["messages"][message_id] = {"channel": channel, "text": text}
+
+        result = await self._write("post_summary", args, "messages", message_id, apply)
         return {**result, "message_id": message_id}  # type: ignore[dict-item]
 
     async def charge_card(self, customer_id: str, amount: float) -> JsonValue:
         """Not idempotent, by design. Demo 1 counts how many of these reach the world."""
         charge_id = f"chg-{len(self.tables['charges']) + 1}"
         args: dict[str, JsonValue] = {"customer_id": customer_id, "amount": amount}
-        result = await self._write("charge_card", args, "charges", charge_id)
-        self.tables["charges"][charge_id] = {"customer_id": customer_id, "amount": amount}
-        customer = self.tables["customers"].setdefault(customer_id, {"balance": 0.0})
-        customer["balance"] = _as_float(customer.get("balance")) - float(amount)
+
+        def apply() -> None:
+            self.tables["charges"][charge_id] = {"customer_id": customer_id, "amount": amount}
+            customer = self.tables["customers"].setdefault(customer_id, {"balance": 0.0})
+            customer["balance"] = _as_float(customer.get("balance")) - float(amount)
+
+        result = await self._write("charge_card", args, "charges", charge_id, apply)
         return {**result, "charge_id": charge_id}  # type: ignore[dict-item]
 
     async def send_receipt(self, customer_id: str, charge_id: str) -> JsonValue:
         message_id = f"rcpt-{len(self.tables['messages']) + 1}"
         args: dict[str, JsonValue] = {"customer_id": customer_id, "charge_id": charge_id}
-        result = await self._write("send_receipt", args, "messages", message_id)
-        self.tables["messages"][message_id] = {"to": customer_id, "charge_id": charge_id}
-        return result
+
+        def apply() -> None:
+            self.tables["messages"][message_id] = {"to": customer_id, "charge_id": charge_id}
+
+        return await self._write("send_receipt", args, "messages", message_id, apply)
 
     async def send_email(self, to: str, subject: str, body: str) -> JsonValue:
         """Irreversible: there is no compensating action that unsends an email."""
         message_id = f"eml-{len(self.tables['messages']) + 1}"
         args: dict[str, JsonValue] = {"to": to, "subject": subject, "body": body}
-        result = await self._write("send_email", args, "messages", message_id)
-        self.tables["messages"][message_id] = {"to": to, "subject": subject, "body": body}
-        return result
+
+        def apply() -> None:
+            self.tables["messages"][message_id] = {"to": to, "subject": subject, "body": body}
+
+        return await self._write("send_email", args, "messages", message_id, apply)
 
     async def reserve_capacity(self, job_id: str, units: int) -> JsonValue:
         args: dict[str, JsonValue] = {"job_id": job_id, "units": units}
-        result = await self._write("reserve_capacity", args, "jobs", job_id)
-        row = self.tables["jobs"].setdefault(job_id, {})
-        row["reserved"] = _as_int(row.get("reserved")) + int(units)
-        return result
+
+        def apply() -> None:
+            row = self.tables["jobs"].setdefault(job_id, {})
+            row["reserved"] = _as_int(row.get("reserved")) + int(units)
+
+        return await self._write("reserve_capacity", args, "jobs", job_id, apply)
 
     async def release_capacity(self, job_id: str, units: int) -> JsonValue:
         """The compensator for :meth:`reserve_capacity` -- a *second* effect, not an undo."""
         args: dict[str, JsonValue] = {"job_id": job_id, "units": units}
-        result = await self._write("release_capacity", args, "jobs", job_id)
-        row = self.tables["jobs"].setdefault(job_id, {})
-        row["reserved"] = _as_int(row.get("reserved")) - int(units)
-        return result
+
+        def apply() -> None:
+            row = self.tables["jobs"].setdefault(job_id, {})
+            row["reserved"] = _as_int(row.get("reserved")) - int(units)
+
+        return await self._write("release_capacity", args, "jobs", job_id, apply)
 
     async def enqueue_reindex(self, index: str) -> JsonValue:
         """Looks exactly like a read. Is not one (attack 7.10).

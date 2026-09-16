@@ -235,3 +235,67 @@ async def test_an_async_write_behind_a_read_lands_after_its_branch_is_gone() -> 
     assert world.mutating_branches() == {"br-squashed"}, (
         "the effect is attributed to the branch that caused it, even though that branch is gone"
     )
+
+
+# -- durability ----------------------------------------------------------------------------
+#
+# Tasks 2.5 and 5.2 SIGKILL a subprocess and then assert the resumed run's mutations equal the
+# uninterrupted run's byte for byte. An in-memory world dies with the process it was killed in,
+# so the resumed process would start with an empty log and could not detect a duplicate
+# dispatch of an effect the dead process already sent -- which is the thing those tests exist
+# to catch. The world therefore keeps an append-only log, fsynced before each call returns.
+
+
+async def test_a_durable_world_survives_being_reopened(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    log = tmp_path / "world.jsonl"
+    world = World(log_path=log)
+    world.seed("jobs", "etl-1", status="failed", restarts=0)
+    with world.bind(branch_id="br-1", effect_key="k1"):
+        await world.restart_job(job_id="etl-1")
+        await world.charge_card(customer_id="cus-1", amount=10.0)
+    before = world.snapshot()
+    world.close()
+
+    recovered = World(log_path=log)
+    assert [m.effect_key for m in recovered.mutations] == ["k1", "k1"]
+    assert recovered.mutating_branches() == {"br-1"}
+    assert recovered.tables["jobs"]["etl-1"]["status"] == "running"
+    assert recovered.tables["charges"] == before["charges"]  # type: ignore[index]
+
+
+async def test_recovery_keeps_applied_keys_so_a_resume_does_not_double_apply(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    log = tmp_path / "world.jsonl"
+    world = World(log_path=log)
+    with world.bind(branch_id="br-1", effect_key="same-key"):
+        await world.restart_job(job_id="etl-1")
+    world.close()
+
+    recovered = World(log_path=log)
+    with recovered.bind(branch_id="br-1", effect_key="same-key"):
+        result = await recovered.restart_job(job_id="etl-1")
+    assert isinstance(result, dict) and result["applied"] == 0, (
+        "a resumed run re-delivered an idempotent effect and the world applied it twice"
+    )
+    assert len(recovered.mutations_by("restart_job")) == 2, "both deliveries stay visible"
+
+
+async def test_a_torn_final_line_loses_only_that_line(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A process killed mid-append leaves a partial line; everything before it is intact."""
+    log = tmp_path / "world.jsonl"
+    world = World(log_path=log)
+    with world.bind(branch_id="br-1", effect_key="k"):
+        for index in range(1, 4):
+            await world.restart_job(job_id=f"etl-{index}")
+    world.close()
+
+    log.write_text(log.read_text()[:-40])  # truncate mid-record, as a SIGKILL would
+    recovered = World(log_path=log)
+    assert 2 <= len(recovered.mutations) <= 3
+    assert all(m.tool == "restart_job" for m in recovered.mutations)
+
+
+async def test_an_in_memory_world_writes_no_log(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    world = World()
+    with world.bind(branch_id="br-1", effect_key="k"):
+        await world.restart_job(job_id="etl-1")
+    assert list(tmp_path.iterdir()) == []

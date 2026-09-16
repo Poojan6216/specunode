@@ -90,8 +90,19 @@ REQUIRED_FIELDS: Final[Mapping[str, frozenset[str]]] = {
     "effect_staged": frozenset(
         {"effect_id", "branch_id", "step", "tool", "args_hash", "key", "nkey", "stage_index"}
     ),
+    # dispatch_index records the order effects actually LEFT, which is not the same fact as
+    # stage_index. A ledger ordered by stage_index would put a reversed drain back into stage
+    # order and quietly pass the equivalence test's "dispatch order reversed" planted bug.
     "effect_dispatched": frozenset(
-        {"effect_id", "branch_id", "nkey", "stage_index", "authorised_by_offset", "deduped"}
+        {
+            "effect_id",
+            "branch_id",
+            "nkey",
+            "stage_index",
+            "dispatch_index",
+            "authorised_by_offset",
+            "deduped",
+        }
     ),
     "effect_dead_lettered": frozenset({"effect_id", "branch_id", "nkey", "attempts", "last_error"}),
     "effect_discarded": frozenset({"branch_id", "count", "reason"}),
