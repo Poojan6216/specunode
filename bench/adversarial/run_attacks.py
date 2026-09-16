@@ -30,6 +30,8 @@ from specunode.core.branch import Branch, BranchStatus
 from specunode.core.decision import ToolCall
 from specunode.core.effects import EffectClass, ToolRegistry, ToolSpec
 from specunode.core.hazards import handle_for, has_handle
+from specunode.ids import new_ulid
+from specunode.journal.journal import Journal
 from specunode.testing.world import World, standard_world
 
 __all__ = ["ATTACKS", "AttackResult", "run_all"]
@@ -360,6 +362,138 @@ async def attack_79_staging_an_irreversible_effect() -> AttackResult:
     )
 
 
+async def attack_77_drafter_poisoning() -> AttackResult:
+    """7.7 — train the pattern index on traces whose "strong chain" ends in a write.
+
+    An adversary who can influence what the index learns can make it confidently predict a
+    write that the model never asks for. Every one of those is squashed, so nothing reaches the
+    world; what it costs is wasted tokens, wasted upstream reads and stalls. The measurement is
+    that cost, and the assertion is that leaks stay at zero.
+    """
+    from specunode.core.policy import Budget, Policy
+    from specunode.drafters.base import DraftContext
+    from specunode.drafters.t1_pattern import PatternDrafter, PatternIndex
+    from specunode.verify.gate import resolve_decision
+
+    # The adversarial "strong chain": a lookup that carries an amount, followed by a charge
+    # that consumes it. The amount has to be reachable from history or the drafter declines to
+    # offer the prediction at all -- an unfillable guess would squash every time and its only
+    # effect would be the reads its branch paid for.
+    poison = [
+        ToolCall("lookup_customer", {"customer_id": "cus-1", "amount": 999.0}),
+        ToolCall("charge_card", {"customer_id": "cus-1", "amount": 999.0}),
+    ]
+    index = PatternIndex(order=2)
+    index.train([poison] * 50)
+    drafter = PatternDrafter(index=index)
+
+    world = standard_world()
+    registry = ToolRegistry()
+    registry.register(ToolSpec(name="charge_card", effect=EffectClass.WRITE, fn=world.charge_card))
+    registry.register(
+        ToolSpec(
+            name="lookup_customer", effect=EffectClass.READ, fn=world.lookup_customer, witness=True
+        )
+    )
+
+    budget = Budget(policy=Policy(alpha_window=4, alpha_floor=0.5))
+    honest = ToolCall("lookup_customer", {"customer_id": "cus-2"})
+    squashed = 0
+    predicted = 0
+    for _ in range(8):
+        candidates = await drafter.predict(
+            DraftContext(
+                run_id="r",
+                branch_id="b",
+                step_index=1,
+                node_id="n",
+                history=(poison[0],),
+                known_tools=registry.names(),
+            )
+        )
+        if not candidates:
+            break
+        predicted += 1
+        guess = candidates[0].decision
+        if resolve_decision(guess, honest) is BranchStatus.SQUASHED:
+            squashed += 1
+            budget.record_resolution(tier=1, confirmed=False, tokens=250)
+
+    leaked = world.mutations_by("charge_card")
+    return AttackResult(
+        id="7.7",
+        name="drafter poisoning",
+        claim="a poisoned index wastes tokens and stalls; it cannot put an effect in the world",
+        measured={
+            "predictions_made": predicted,
+            "squashed": squashed,
+            "wasted_tokens": budget.wasted_tokens,
+            "speculation_disabled_by_alpha_gate": 1 if not budget.may_speculate() else 0,
+            "leaked_effects": len(leaked),
+        },
+        defeated_runtime=bool(leaked),
+    )
+
+
+async def attack_78_replay_under_model_drift() -> AttackResult:
+    """7.8 — replay a journal after changing the system prompt, and after changing the tools.
+
+    Expected: divergence at the first step in both cases, rather than a replay that quietly
+    continues down a trajectory the recorded run never took.
+    """
+    import tempfile
+
+    from specunode.core.model import (
+        CallScope,
+        JournaledModel,
+        Message,
+        RequestEnvelope,
+        TextBlock,
+        ToolDef,
+        scoped,
+    )
+    from specunode.journal.replay import ReplayDivergence, ReplayModel
+    from specunode.testing.models import ScriptedModel, tool_turn
+
+    run_id = new_ulid()
+    journal = Journal(Path(tempfile.mkdtemp()) / "drift.db")
+    base = RequestEnvelope(
+        model="scripted",
+        system=(TextBlock(text="You are a support agent."),),
+        messages=(Message(role="user", content=(TextBlock(text="help"),)),),
+        tools=(ToolDef(name="lookup_customer", description="look up", input_schema={}),),
+        max_tokens=128,
+    )
+    journaled = JournaledModel(ScriptedModel(turns=[tool_turn(("a", {}))]), journal)
+    with scoped(CallScope(run_id=run_id, branch_id="br-1", step=0)):
+        await journaled.complete(base)
+
+    from dataclasses import replace as dc_replace
+
+    outcomes: dict[str, int] = {}
+    for label, changed in (
+        ("system_prompt", dc_replace(base, system=(TextBlock(text="You are a support agent!"),))),
+        ("tool_list", dc_replace(base, tools=(*base.tools, ToolDef("x", "x", {})))),
+    ):
+        replay = ReplayModel(journal=journal, run_id=run_id)
+        step_of_first_divergence = -1
+        try:
+            with scoped(CallScope(run_id=run_id, step=0)):
+                await replay.complete(changed)
+        except ReplayDivergence as exc:
+            step_of_first_divergence = exc.step
+        outcomes[f"first_divergence_step_after_{label}_change"] = step_of_first_divergence
+
+    caught_both = all(step == 0 for step in outcomes.values())
+    return AttackResult(
+        id="7.8",
+        name="replay under model drift",
+        claim="a changed prompt or tool list diverges at the first step, never silently continues",
+        measured={**outcomes, "both_caught_at_step_0": 1 if caught_both else 0},
+        defeated_runtime=not caught_both,
+    )
+
+
 ATTACKS: Sequence[tuple[str, Callable[[], Awaitable[AttackResult]]]] = (
     ("7.1", attack_71_misdeclared_tool),
     ("7.2", attack_72_read_with_side_effects),
@@ -367,6 +501,8 @@ ATTACKS: Sequence[tuple[str, Callable[[], Awaitable[AttackResult]]]] = (
     ("7.4", attack_74_duplicate_delivery),
     ("7.5", attack_75_return_value_laundering),
     ("7.6", attack_76_prompt_injected_tool_call),
+    ("7.7", attack_77_drafter_poisoning),
+    ("7.8", attack_78_replay_under_model_drift),
     ("7.9", attack_79_staging_an_irreversible_effect),
     ("7.10", attack_710_async_side_effect_behind_a_read),
 )

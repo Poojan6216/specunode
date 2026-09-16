@@ -134,10 +134,15 @@ report how much of each workload has that shape.
 
 ## What beats it
 
-Eight strategies, all of which work, with measured rates. This section is generated from
-`bench/adversarial/run_attacks.py` rather than written from memory, and a test fails the build
-if any of them stops defeating the runtime — either a hole was genuinely closed and this list
-should shrink, or the attack stopped exercising what it claims to, and both need looking at.
+Ten strategies are run; eight of them defeat the runtime, and those eight are listed below with
+measured rates. The other two are held — a poisoned pattern index wastes tokens and stalls but
+cannot put an effect in the world, and a replay after a changed prompt or tool list diverges at
+the very first step rather than continuing down a trajectory the recorded run never took.
+
+This section is generated from `bench/adversarial/run_attacks.py` rather than written from
+memory, and a test fails the build if any of the eight stops defeating the runtime — either a
+hole was genuinely closed and this list should shrink, or the attack stopped exercising what it
+claims to. Both need a look.
 
 ```
 python bench/adversarial/run_attacks.py --all

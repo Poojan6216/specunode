@@ -54,6 +54,8 @@ Every strategy below defeats the runtime. Each reports a measured rate.
 | 7.4 | duplicate delivery of a non-idempotent tool | beats it | delivered=2, duplicates=1, intended=1 |
 | 7.5 | return-value laundering | beats it | cases=9, caught=6, miss_rate=0.333, missed=3, missed_cases=L6 base64-encoded, L7 hex-encoded, L9 split inside the prefix |
 | 7.6 | prompt-injected tool call | beats it | dispatched_when_only_the_drafter_predicted_it=0, dispatched_when_the_model_emitted_it=1 |
+| 7.7 | drafter poisoning | held | leaked_effects=0, predictions_made=8, speculation_disabled_by_alpha_gate=1, squashed=8, wasted_tokens=2000 |
+| 7.8 | replay under model drift | held | both_caught_at_step_0=1, first_divergence_step_after_system_prompt_change=0, first_divergence_step_after_tool_list_change=0 |
 | 7.9 | staging an irreversible effect | beats it | barrier_by_default=1, staged_when_enabled=1 |
 | 7.10 | asynchronous side effect behind a READ | beats it | effects_landing_after_the_squash=1, leaked_effects_per_squashed_branch=1, mutations_at_squash_time=0, synchronous_response_looks_like_a_read=1 |
 

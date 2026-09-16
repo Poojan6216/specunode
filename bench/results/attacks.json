@@ -73,6 +73,32 @@
       "name": "prompt-injected tool call"
     },
     {
+      "claim": "a poisoned index wastes tokens and stalls; it cannot put an effect in the world",
+      "defeated_runtime": false,
+      "error": null,
+      "id": "7.7",
+      "measured": {
+        "leaked_effects": 0,
+        "predictions_made": 8,
+        "speculation_disabled_by_alpha_gate": 1,
+        "squashed": 8,
+        "wasted_tokens": 2000
+      },
+      "name": "drafter poisoning"
+    },
+    {
+      "claim": "a changed prompt or tool list diverges at the first step, never silently continues",
+      "defeated_runtime": false,
+      "error": null,
+      "id": "7.8",
+      "measured": {
+        "both_caught_at_step_0": 1,
+        "first_divergence_step_after_system_prompt_change": 0,
+        "first_divergence_step_after_tool_list_change": 0
+      },
+      "name": "replay under model drift"
+    },
+    {
       "claim": "off by default; with it on, an effect with no undo is released by machinery",
       "defeated_runtime": true,
       "error": null,
