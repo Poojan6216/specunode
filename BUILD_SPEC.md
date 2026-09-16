@@ -989,6 +989,8 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, after 64 of 71 tasks. The seven that are not done are listed below with
 the reason each one is blocked, and none of them is blocked on more work I could do here.**
 
+**666 tests pass, 27 skip. `ruff` and the configured `mypy --strict` are clean.**
+
 ### What was built, in five sentences
 
 SpecuNode executes an agent graph the way an out-of-order CPU executes instructions: reads
@@ -1104,13 +1106,68 @@ The Progress Log above has 100+ entries; these are the ones that changed the sha
 12. **The corpus effect-class table is hand-written and `str_replace_editor` is a WRITE**, though
     its `view` command reads. Classifying by inspecting the `command` argument is the
     argument-level heuristic Hard Rule 2 forbids.
+13. **The three sample apps are deliberately three different shapes**, not three instances of
+    one. `support_agent` calls the model directly and issues each tool itself (Demo 1's
+    pattern); `ops_agent` hands its whole turn to the runtime via `session.call_turn` and emits
+    several calls in it; `research_agent` is read-heavy and its write is irreversible and
+    therefore a barrier. A suite where every workload took the same path would test one path
+    three times.
+14. **Each workload declares `drives_turn` and `tier_1_can_predict`**, and the tests assert
+    them. These are expectations about what the runtime will and will not do on that shape.
+    Without them, a workload that silently stopped speculating would still pass every
+    comparison, because two runs that never speculate are trivially equivalent.
+15. **A confirmed speculation's effects are adopted by the canonical branch** rather than the
+    child being retired. Only one branch retires, and re-attributing the effect is what makes
+    the run identical to the one that never speculated — which is Hard Rule 9 restated.
+
+### What the expanded coverage found
+
+The three mandatory tests originally ran on one workload at one tier. Parameterising them over
+three workloads and two drafter tiers was the last substantive work done here, and it surfaced
+four defects. None was reachable from the previous coverage, and one was fatal.
+
+**A confirmed prediction of a write deadlocked the run.** The child branch staged the effect,
+the canonical branch adopted the child's task and awaited its ack, and nothing drained the
+child's buffer — the drain dispatches by branch id and only the canonical branch retires. The
+run hung rather than failing, which is the worst of the three outcomes because nothing reports
+it. This is the case the project is named for. It survived because no test had ever confirmed a
+prediction of a *write*: the stub drafter predicts a read for its confirm case and a write only
+for its squash cases, and reads stage nothing while squashed buffers are discarded, never
+drained. Fixed with `StoreBuffer.adopt`.
+
+**Speculating changed the idempotency keys.** A confirmed speculation did not advance the
+canonical branch's step cursor, so every later call in the run derived a different key
+depending on whether the runtime happened to speculate. A resume with speculation off would
+not have deduped against a crashed run that had it on, and the effect would have been delivered
+twice. That is a Hard Rule 9 violation, and the equivalence test caught it the instant a
+workload confirmed a prediction — which had never happened before.
+
+**Park events are keyed by branch id**, so the event the child set when it staged was on a key
+nothing waits on. Found while fixing the first defect; without it the effect moved to the
+correct list and still never left.
+
+**The journal could not tell a predicted branch from the canonical one.** Every `branch_forked`
+entry recorded `predicted: null` and `tier: null`, and a confirmed speculative branch was never
+journaled as resolved at all. "How much did this run actually speculate" was unanswerable from
+the durable record, which is the only record Hard Rule 12 permits an answer to come from.
+
+Two further things are findings rather than defects, and are in `docs/limitations.md`:
+
+- **A drafter cannot use the result of the call it was just asked about.** It is consulted
+  immediately after a block parses, when that block's call has only been issued. The earliest
+  usable result is from a block two back. This halves the reach of PASTE's data-flow idea
+  inside this runtime, and waiting for the read before asking would serialise exactly what
+  early issue exists to overlap.
+- **A one-call-per-turn workload offers the drafter nothing**, because its history is the calls
+  within the current turn. That is 1.0000 of the offline corpus, and it is the same fact as the
+  0.0000 speculable span seen from the runtime side rather than from the trace.
 
 ### Definition of Done: what is not ticked, and why
 
 | Item | Status |
 |---|---|
 | Wheel on 3.11/3.12/3.13, macOS **and Ubuntu** | Verified on macOS for all three; Ubuntu is CI-only and CI has not been run. |
-| The three tests on **every** workload and **every** tier | They run and are never skipped, but on one workload and tiers 0 and 1. A second and third sample app (`ops_agent`, `research_agent`) were not built. |
+| The three tests on every workload, every tier, **every CI job** | They run, are never skipped, and now cover all three sample apps at tiers 0 and 1. Tier 2 is a draft *model* behind an optional extra: requiring it here would make a mandatory test skippable, which is the one property these files may never have, so it is covered by its own tests instead. The open clause is **every CI job** — CI has not been run. |
 | LangGraph ✓, plain ✓, **MCP proxy with a generic client** | The proxy's rules are tested (20 tests) and the stdio transport is wired, but it has not been driven by a real client against a real upstream server. Phase Gate 4 is **not** met. |
 | Offline ✓, overhead ✓, adversarial ✓, **online latency** | Needs an API key. Not run. |
 | Published to PyPI; demoed from the published wheel | Not done. Needs credentials. |
@@ -1148,9 +1205,11 @@ entirely on numbers that need an API key.
 **Drive the MCP proxy end to end.** The rules are tested and the transport is wired, but "wired"
 and "works" are different words and only one of them has been demonstrated.
 
-**Build the other two sample apps.** One workload is enough to test a mechanism and not enough to
-characterise it. `ops_agent` in particular is the one that would show Demo 2's shape, and its
-absence is why Demo 2 was not built.
+**Widen the coverage matrix again, and expect it to find more.** Going from one workload at one
+tier to three workloads at two tiers found four defects in an afternoon, one of them fatal to
+the project's central claim. That is not a comfortable ratio, and the honest reading is that the
+next axis — more tiers, more fault injection, more turn shapes — probably has more in it. Demo 2
+was still not built, because `ops_agent` only reached its final shape at the end.
 
 **Spend the time on the predictor, not the buffer.** The store buffer works and its guarantees
 hold under every fault I could inject. The number that decides whether any of it pays for itself
