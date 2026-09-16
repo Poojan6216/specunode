@@ -594,15 +594,15 @@ state:
 
 Goal: an installable package with a journal that records and replays a scripted run — no speculation, no tools yet.
 
-- [ ] **0.1 Scaffold.** `uv init`, hatchling, ruff, mypy strict, pytest, CI matrix 3.11/3.12/3.13 on Ubuntu + macOS. `specunode --version` works from a built wheel.
+- [x] **0.1 Scaffold.** `uv init`, hatchling, ruff, mypy strict, pytest, CI matrix 3.11/3.12/3.13 on Ubuntu + macOS. `specunode --version` works from a built wheel.
   *Verify:* `uv build && uv tool install dist/*.whl && specunode --version` in a clean venv on 3.11.
-- [ ] **0.2 Canonical form.** `canonical()`, `chash()`, `decisions_equal()`. Property tests: round-trip through `json.loads` is a fixed point; key order and whitespace never change the hash; NFC vs NFD strings hash equal; `-0.0` and `0.0` hash equal; NaN raises; two `FreeText` never resolve equal.
+- [x] **0.2 Canonical form.** `canonical()`, `chash()`, `decisions_equal()`. Property tests: round-trip through `json.loads` is a fixed point; key order and whitespace never change the hash; NFC vs NFD strings hash equal; `-0.0` and `0.0` hash equal; NaN raises; two `FreeText` never resolve equal.
   *Verify:* `hypothesis` suite passes 2,000 examples per property.
-- [ ] **0.3 Journal.** SQLite WAL, `synchronous=FULL`, one `entries` table (`run_id, offset, kind, payload_json, payload_hash, prev_hash, ts`). `append()` returns only after `fsync`. Hash-chained per run. Same DDL file loads on Postgres 16 under `testcontainers`.
+- [x] **0.3 Journal.** SQLite WAL, `synchronous=FULL`, one `entries` table (`run_id, offset, kind, payload_json, payload_hash, prev_hash, ts`). `append()` returns only after `fsync`. Hash-chained per run. Same DDL file loads on Postgres 16 under `testcontainers`.
   *Verify:* a test appends 1,000 entries, kills the process (`os._exit`) mid-append in a subprocess at a random point, reopens, and asserts the chain verifies and the last entry is either fully present or absent — never partial.
-- [ ] **0.4 ModelClient + journaled wrapper.** Protocol with `complete()` and `stream()`. `JournaledModel` writes `model_request` before the call and `model_response` before returning the result to the caller. Anthropic adapter behind an optional extra; `ScriptedModel` for tests.
+- [x] **0.4 ModelClient + journaled wrapper.** Protocol with `complete()` and `stream()`. `JournaledModel` writes `model_request` before the call and `model_response` before returning the result to the caller. Anthropic adapter behind an optional extra; `ScriptedModel` for tests.
   *Verify:* `ReplayModel` fed the journal of a `ScriptedModel` run reproduces every response; a changed request at step *k* raises `ReplayDivergence(k, diff)` and the test asserts no further entries were written.
-- [ ] **0.5 Vocabulary + no-LLM-in-control-path tests.** `tests/test_vocabulary.py` and `tests/test_no_llm_in_control_path.py` exist and pass on the empty packages.
+- [x] **0.5 Vocabulary + no-LLM-in-control-path tests.** `tests/test_vocabulary.py` and `tests/test_no_llm_in_control_path.py` exist and pass on the empty packages.
   *Verify:* planting the word "guaranteed" in `README.md` fails the vocabulary test; planting `messages=[` in `src/specunode/core/policy.py` fails the control-path test.
 
 **Phase Gate 0:** wheel installs on 3.11; journal survives the kill test; replay diverges loudly; both honesty tests fire on planted violations.
@@ -613,9 +613,9 @@ Goal: an installable package with a journal that records and replays a scripted 
 
 Goal: writes can be staged and drained, and there is a world that will tell us if one ever escapes.
 
-- [ ] **1.1 Effect classes + registry.** `ToolSpec`, `ToolRegistry`, MCP annotation mapping per §5. Unknown tools synthesise `WRITE(idempotent=False)` and log once.
+- [x] **1.1 Effect classes + registry.** `ToolSpec`, `ToolRegistry`, MCP annotation mapping per §5. Unknown tools synthesise `WRITE(idempotent=False)` and log once.
   *Verify:* a tool registered with no class is treated as WRITE; an MCP tool with `readOnlyHint=true` maps to READ; one with no annotations maps to WRITE; overrides in config win.
-- [ ] **1.2 Fake world.** `World` with tables (`customers`, `tickets`, `jobs`, `messages`) and endpoint-style tools; every mutation appended to `world.mutations` as `(branch_id, effect_key, tool, args_hash, ts)`. Fault injection per §5. `World.reads_with_witness()` returns `{value, witness}` where witness is a per-row version counter.
+- [x] **1.2 Fake world.** `World` with tables (`customers`, `tickets`, `jobs`, `messages`) and endpoint-style tools; every mutation appended to `world.mutations` as `(branch_id, effect_key, tool, args_hash, ts)`. Fault injection per §5. `World.reads_with_witness()` returns `{value, witness}` where witness is a per-row version counter.
   *Verify:* `world.mutations` is the only way state changes; a test monkeypatches every public write path and asserts each appends exactly one record.
 - [ ] **1.3 Idempotency keys + dedupe.** Rule 8 derivation. Dedupe table in the journal keyed on `key`; dispatch checks it first.
   *Verify:* property test — same `(run, lineage, step, tool, args)` → same key across processes; any one component changed → different key; draining the same buffer twice sends each effect once (asserted against `world.mutations`).
@@ -846,6 +846,35 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 *Agent: append one line per completed task, decision, blocker or defect. Format: `[task-id] what — date`. This is the audit trail the Final Report is written from.*
 
 ```
+[0.1] Scaffold: uv + hatchling + ruff(100) + mypy --strict, CI matrix 3.11/3.12/3.13 x {ubuntu,macos}. Wheel built and installed clean on all three locally. — 2026-09-15
+[0.1] Decision: repo built in place at the project root rather than a nested specunode/ directory; the section 6 tree is reproduced exactly under it. — 2026-09-15
+[0.1] Decision: CI runs the three mandatory invariant tests as an explicit step with --runxfail and greps the report for skipped/xfailed/deselected, so none can be quietly disabled. — 2026-09-15
+[0.2] canonical()/chash()/decisions_equal(). 28 property tests at 2,000 examples each. — 2026-09-15
+[0.2] Decision: canonical() rejects two object keys that collide only after NFC normalisation, rather than silently dropping one — a silent drop would let two different calls share an idempotency key. Not specified; chosen as the option that satisfies Hard Rules 4 and 8. — 2026-09-15
+[0.2] Decision: ULID implemented in ids.py rather than taking a dependency; monotonic within a millisecond so effects staged in the same tick still render in stage order. — 2026-09-15
+[0.2] Defect found and closed: Python's == says 1 == 1.0 and True == 1, so a dataclass __eq__ would confirm a speculation that predicted {"amount": 1} against an actual {"amount": 1.0}. decisions_equal compares canonical bytes only; a regression test pins the trap. — 2026-09-15
+[0.5] Honesty tests: vocabulary, no-LLM-in-control-path, number traceability. Each carries parametrised proofs that it fires on planted violations and stays quiet on legitimate prose. — 2026-09-15
+[0.5] Decision: the control-path check parses the AST instead of grepping for `messages=` and `prompt`. A grep cannot tell a protocol signature that forwards the developer's messages from code that authors a prompt, and fires on every docstring Hard Rule 13 needs. The literal `messages=[` grep the spec names is retained alongside it, so the planted-bug check still fires. — 2026-09-15
+[0.5] Decision: BUILD_SPEC.md is excluded from the vocabulary scan — it is the input specification, not a claim this project makes, and it necessarily quotes the whole forbidden vocabulary in order to forbid it. — 2026-09-15
+[ARCH] Ran a 9-agent design pass over the seven cross-cutting mechanisms before writing runtime code, then audited the result against the 13 Hard Rules. Agents verified CPython 3.11.9 TaskGroup cancellation semantics and LangGraph 1.2.11 task-id stability empirically rather than assuming them. Note in the session scratchpad; key resolutions recorded below as they are implemented. — 2026-09-15
+[ARCH] Resolved conflict: dispatch dedupe is keyed on nkey (the Rule 8 key derived with an EMPTY lineage), not on the lineage-bearing key. Keyed on the latter, every stall-and-re-stage and every resume that re-mints branch ids would re-dispatch. nkey is also the idempotency token handed to the tool adapter. — 2026-09-15
+[1.1] Effect classes, ToolRegistry, MCP annotation mapping. Undeclared tools classify as WRITE and never raise on get(); running one raises UnknownTool. — 2026-09-15
+[1.1] Decision: forward_keys templates are literal text plus {args.<name>} and nothing else — no str.format, no eval. str.format would expose {args.__class__.__init__.__globals__} and would silently quote under !r, so a write declaring ticket:T1 would never intersect a read declaring ticket:'T1' and the overlap check would report a miss. — 2026-09-15
+[1.2] Fake world with branch-attributed mutation log, witnessed reads, four injectable faults. A parametrised test disables the mutation funnel and asserts no tool can move state around it. — 2026-09-15
+[1.2] Decision: World tools carry their TRUE semantics separately from the developer's DECLARED ToolSpec. The gap between them is the runtime's trust boundary and is where attacks 7.1 and 7.10 live; enqueue_reindex models it directly. — 2026-09-15
+[1.2] Decision: reads are recorded when the request is sent, not when it returns, so a speculative read cancelled by a squash still counts as having reached upstream (attack 7.2). — 2026-09-15
+[1.2] Decision: added a `charges` table beyond the four the spec names, so Demo 1's double-charge is visible in state and not only in the mutation log. — 2026-09-15
+[0.3] Journal: WAL, synchronous=FULL, one fsync per entry, hash-chained per run, dense per-run offsets assigned in Python. Kill test green: 1,000 appends with os._exit at a random point, 15 runs. — 2026-09-15
+[0.3] Signature change: Journal.read's `after` defaults to -1, not section 7's 0. Offsets are dense from zero and `after` is exclusive, so the specified default silently skips every run's first entry — which for a replay means losing run_started, the entry the config and registry are checked against. — 2026-09-15
+[0.3] Decision: entry_hash is a pure function of the six non-payload columns rather than a stored column, so the chain covers kind/offset/run_id/ts while the table keeps exactly the columns the spec names. — 2026-09-15
+[0.3] Defect found and closed: the first draft of verify_chain compared canonical(payload) against canonical(payload) — a check that could never fail. Entry now carries the stored payload_json so byte fidelity is checked against the text actually on disk, which catches a hand-edited journal whose JSON is valid but not canonical. — 2026-09-15
+[0.3] Decision: one journal writer per database file per process on a single-threaded executor. SQLite WAL admits one writer; this serialises 20 concurrent runs (task 5.3) in FIFO order rather than scattering SQLITE_BUSY retries through the runtime. — 2026-09-15
+[0.4] ModelClient protocol, RequestEnvelope + request_hash (Rule 13), JournaledModel, ReplayModel/ReplayDivergence, ScriptedModel/RecordingModel, Anthropic adapter behind the optional extra. — 2026-09-15
+[0.4] Decision: the request hash is taken inside JournaledModel at the wire boundary, not by the caller. If anything between caller and socket mutates the request, a caller-side hash records a clean value for a dirty request and Rule 13 becomes a no-op that still reports zero divergences. — 2026-09-15
+[0.4] Decision: provider correlation ids are rewritten to positional tokens (tu:<turn>:<ordinal>) rather than dropped. Dropping them would let a tool result attached to the wrong call hash equal a correct one; hashing them raw would diverge every replay for no reason. — 2026-09-15
+[0.4] Decision: Rule 13 tracks role='target' requests only. A draft model's request legitimately differs, and folding it in would raise ContextDivergence on every tier-2 run's first call — whose obvious fix is to loosen the comparison until it stops catching real target-side divergence too. — 2026-09-15
+[0.4] Decision: the Anthropic adapter lives in integrations/, not core/, so the Hard Rule 1 control-path scan needs no exemption. Not a reorganisation of the section 6 tree; the spec does not place the provider adapter. — 2026-09-15
+[0.4] Decision: CallScope is carried in a ContextVar rather than passed as an argument, so JournaledModel satisfies ModelClient and can be substituted wherever the developer's graph already calls a model — which is what lets task 2.3 leave their graph file unchanged. — 2026-09-15
 ```
 
 ---
