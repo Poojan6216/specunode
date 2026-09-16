@@ -1,0 +1,34 @@
+{
+  "demo": "leak",
+  "runs": 50,
+  "measured_tool": "charge_card",
+  "arms": [
+    {
+      "runtime": "naive-parallel",
+      "runs": 50,
+      "mispredictions": 10,
+      "effects_reaching_world": 60,
+      "effects_from_squashed_branches": 10,
+      "staged_and_discarded": 0,
+      "speculative_reads": 50
+    },
+    {
+      "runtime": "specunode",
+      "runs": 50,
+      "mispredictions": 10,
+      "effects_reaching_world": 50,
+      "effects_from_squashed_branches": 0,
+      "staged_and_discarded": 10,
+      "speculative_reads": 50
+    },
+    {
+      "runtime": "sequential",
+      "runs": 50,
+      "mispredictions": 0,
+      "effects_reaching_world": 50,
+      "effects_from_squashed_branches": 0,
+      "staged_and_discarded": 0,
+      "speculative_reads": 50
+    }
+  ]
+}

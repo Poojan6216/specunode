@@ -53,6 +53,7 @@ _NOT_A_CLAIM = re.compile(
     | \b\d+\.\d+\.\d+\b
     | \b(?:version|release|tag|schema_version)\s*:?\s*\d+(?:\.\d+)*
     | \bpython\s*3\.\d+
+    | \b(?:19|20)\d{2}s\b
     | \b(?:19|20)\d{2}\b
     | \bRFC\s*\d+ | \bPEP\s*\d+
     | ^\s{0,3}(?:\d+[.)]|[-*+])\s
