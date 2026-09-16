@@ -5,6 +5,45 @@ Everything the model said and everything a tool returned is written to the journ
 run can be resumed, a finished run can be replayed, and the effect ledger can say which model
 decision authorised each effect.
 
+## Pointing the commands at a graph
+
+`specunode resume` and `specunode replay` both re-drive a graph, and a journal does not contain
+one — it records what a graph *did*, not what it is. Both commands read `specunode.yaml` for a
+`graph:` entry naming the callable that builds it:
+
+```yaml
+schema_version: 1
+graph: "your_app.agent:build"     # -> (graph_adapter, tool_registry)
+```
+
+The callable takes no arguments and returns the adapter and the tool registry. The registry is
+not optional: effect classes are declared out of band and never inferred, so a builder that
+returns only a graph is refused rather than run with everything defaulted to `WRITE`.
+
+Without the entry, both commands exit 2 and say what to add. That is deliberate — importing
+something plausible and re-driving the wrong program is worse than stopping.
+
+## What a replay sends
+
+Nothing, unless you ask. A replay re-drives the graph, and a graph that re-drives dispatches, so
+a replay of a run that charged a card would charge it again — from a command whose entire
+purpose is to answer a question about the past.
+
+```
+specunode replay <run_id>              # dispatches nothing
+specunode replay <run_id> --dispatch   # sends effects for real
+```
+
+In the default mode the effects are still journaled and still appear in the rendered ledger,
+because the run really did decide to make them. Their status reads `DISPATCHED (dry run: not
+sent)` — on the row, not only in a banner, because a rendering is something people paste into
+a ticket and one that reads `DISPATCHED` for an unsent effect is a lie that travels.
+
+A replay writes to `replay-<run_id>.db` beside the journal it is reading, never into it.
+Interleaving a new run's entries with the record it is checking against would corrupt the only
+evidence there is.
+
+
 ## The journal
 
 One entry is one row is one statement is one commit is one fsync. Not batched. About a hundred

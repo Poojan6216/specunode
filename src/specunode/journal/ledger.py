@@ -209,6 +209,11 @@ class LedgerRow:
     #: The two entries store the arguments once and the digest twice precisely so that a
     #: back-patched argument between staging and dispatch has somewhere to show up.
     args_mismatch: bool = False
+    #: True when the dispatcher was told not to call the tool -- ``specunode replay`` without
+    #: ``--dispatch``. The status still reads DISPATCHED because that is what the run *did*
+    #: with the effect; this says the world never heard about it, and the rendering says so on
+    #: the row rather than only in a banner somebody may not have kept.
+    dry_run: bool = False
 
     @property
     def sort_key(self) -> tuple[int, int]:
@@ -671,6 +676,7 @@ def _row(
         ack_hash=None if ack is None else chash(ack),
         compensates=compensates,
         args_mismatch=bool(staged_hash and dispatched_hash and staged_hash != dispatched_hash),
+        dry_run=_as_bool(payload, "dry_run"),
     )
 
 
@@ -1156,6 +1162,11 @@ def _render_call(call: ToolCall, *, ellipsis: str) -> str:
 def _render_status(row: LedgerRow, *, ellipsis: str) -> str:
     if row.status == "DEAD_LETTER":
         return f"DEAD_LETTER {row.reason or 'unknown'}"
+    if row.dry_run:
+        # On the row, not only in the command's banner. A rendering is something people paste
+        # into a ticket, and one that reads DISPATCHED for an effect nobody sent is a lie that
+        # travels.
+        return f"{row.status} (dry run: not sent)"
     acks = 0 if row.ack is None else 1
     return f"{row.status} ack={acks}"
 

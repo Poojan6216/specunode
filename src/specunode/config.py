@@ -170,12 +170,30 @@ class StateConfig(_Model):
 
 class Config(_Model):
     schema_version: int = SCHEMA_VERSION
+    #: ``"module:attribute"`` naming a zero-argument callable that returns
+    #: ``(graph_adapter, tool_registry)``.
+    #:
+    #: ``specunode resume`` and ``specunode replay`` re-drive a graph, and a journal does not
+    #: contain one -- it records what a graph did, not what it is. Rather than guess, both
+    #: commands refuse unless this says where to find it. The ``module:attribute`` form is the
+    #: one already used for a custom reducer, so there is one convention rather than two.
+    graph: str | None = None
     journal: JournalConfig = Field(default_factory=JournalConfig)
     target: TargetConfig = Field(default_factory=TargetConfig)
     drafters: tuple[DrafterConfig, ...] = (DrafterConfig(tier=0),)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     tools: dict[str, ToolOverride] = Field(default_factory=dict)
     state: StateConfig = Field(default_factory=StateConfig)
+
+    @field_validator("graph")
+    @classmethod
+    def _graph_is_a_reference(cls, value: str | None) -> str | None:
+        if value is not None and value.count(":") != 1:
+            raise ValueError(
+                f"graph {value!r} is not a 'module:attribute' reference; it names the callable "
+                "that builds the graph and its tool registry"
+            )
+        return value
 
     @field_validator("schema_version")
     @classmethod

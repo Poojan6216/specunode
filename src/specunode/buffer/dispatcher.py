@@ -52,6 +52,10 @@ class DispatchOutcome:
     attempts: int = 0
     error: str | None = None
     sent: Sent = "no"
+    #: True when the dispatcher was asked not to call the tool. Carried through to the journal
+    #: and the ledger, because a row that reads DISPATCHED for an effect that never left is
+    #: exactly the kind of untrue record this project exists to make impossible.
+    dry_run: bool = False
 
 
 @dataclass
@@ -65,6 +69,14 @@ class Dispatcher:
     #: Off by default so a chaos run can reproduce what it found. Turn it on in production,
     #: where a thundering herd matters more than reproducibility.
     jitter: bool = False
+    #: Never call the tool; report the effect as it would have been sent.
+    #:
+    #: This exists for ``specunode replay``. Replaying a run against its journal re-drives the
+    #: graph, and a graph that re-drives dispatches -- so a replay of a run that charged a card
+    #: would charge it again, from a command whose whole purpose is to answer a question about
+    #: the past. The default there is therefore to dispatch nothing, and sending for real is
+    #: behind a flag that names what it is for.
+    dry_run: bool = False
 
     def _delay_ms(self, attempt: int) -> float:
         return float(min(self.base_delay_ms * (2.0 ** (attempt - 1)), self.cap_delay_ms))
@@ -84,6 +96,12 @@ class Dispatcher:
         its invariant as a set comparison.
         """
         spec = self.registry.get(tool)
+        if self.dry_run:
+            # Resolved above, so an unknown tool is still an error here rather than something
+            # a dry run silently reports as fine and a real one then fails on.
+            return DispatchOutcome(
+                ok=True, ack={"dry_run": True}, attempts=0, sent="no", dry_run=True
+            )
         last_error: str | None = None
         last_sent: Sent = "no"
 

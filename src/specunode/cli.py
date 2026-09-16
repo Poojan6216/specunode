@@ -13,6 +13,7 @@ that names what it is for.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import typer
@@ -27,7 +28,8 @@ from specunode.journal.ledger import (
     sign_ledger,
     verify_ledger,
 )
-from specunode.journal.replay import recover
+from specunode.journal.replay import ReplayDivergence, ReplayModel, recover
+from specunode.runner import RunnerError, build_graph, build_target
 
 app = typer.Typer(
     name="specunode",
@@ -120,6 +122,134 @@ def ledger(
         )
         return
     typer.echo(render_ledger(built, short_ids=short, normalised=normalised))
+
+
+@app.command()
+def resume(
+    run_id: str = typer.Argument(..., help="The run to continue."),
+    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+    config: Path = typer.Option(None, "--config", help=f"Defaults to ./{DEFAULT_CONFIG_NAME}."),
+) -> None:
+    """Continue a run that was interrupted, without re-sending what already went out.
+
+    Nothing is replayed and nothing is re-decided. Committed state is rebuilt from the branches
+    the journal records as retired, the step counter continues above the position they consumed,
+    and the graph is driven on from there. An effect that was acked before the crash is claimed
+    and skipped; one whose request demonstrably never left is re-sent; one that may or may not
+    have taken effect is dead-lettered unless its tool declared a repeat harmless.
+
+    This needs a live target: the turns the journal does not already hold have to be asked for.
+    """
+    import asyncio
+
+    from specunode.buffer.dispatcher import Dispatcher
+    from specunode.buffer.store_buffer import StoreBuffer
+    from specunode.core.model import JournaledModel
+    from specunode.core.scheduler import Scheduler
+
+    loaded = load_config(config)
+    try:
+        adapter, registry = build_graph(loaded)
+        target = build_target(loaded)
+    except RunnerError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from exc
+
+    book = Journal(journal)
+    scheduler = Scheduler(
+        graph=adapter,
+        registry=registry,
+        journal=book,
+        buffer=StoreBuffer(journal=book, run_id=""),
+        dispatcher=Dispatcher(registry=registry),
+        target=JournaledModel(target, book, provider=loaded.target.provider),
+        policy=loaded.to_policy(),
+        reducers=loaded.state.reducers,
+    )
+    result = asyncio.run(scheduler.resume(run_id))
+    typer.echo(render_ledger(result.ledger))
+    if not result.ok:
+        typer.echo(f"run did not complete: {result.error}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command()
+def replay(
+    run_id: str = typer.Argument(..., help="The run to replay."),
+    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+    config: Path = typer.Option(None, "--config", help=f"Defaults to ./{DEFAULT_CONFIG_NAME}."),
+    speculation: str = typer.Option("on", "--speculation", help="on|off."),
+    dispatch: bool = typer.Option(
+        False,
+        "--dispatch",
+        help="Actually send effects. Off by default: a replay that re-sent every effect "
+        "would charge every card again.",
+    ),
+) -> None:
+    """Re-run a journaled run against its own recorded model output.
+
+    Refuses at the first turn whose request does not match the journal's, naming the step and
+    the fields that differ, rather than continuing down a trajectory the recorded run never
+    took. Dispatches nothing unless ``--dispatch`` says otherwise.
+    """
+    import asyncio
+
+    from specunode.buffer.dispatcher import Dispatcher
+    from specunode.buffer.store_buffer import StoreBuffer
+    from specunode.core.scheduler import Scheduler
+    from specunode.ids import new_ulid
+
+    if speculation not in {"on", "off"}:
+        typer.echo(f"--speculation takes 'on' or 'off', not {speculation!r}", err=True)
+        raise typer.Exit(2)
+
+    loaded = load_config(config)
+    try:
+        adapter, registry = build_graph(loaded)
+    except RunnerError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from exc
+
+    source = Journal(journal)
+    recovery = recover(source, run_id)
+    # A replay re-drives the run from its *beginning*, so it starts from the inputs the
+    # journal recorded rather than from the state the run ended in. Starting from the end
+    # state routes straight to the graph's terminal node and replays nothing, which looks
+    # like a clean replay and checks not one thing.
+    started = next(iter(source.read(run_id, kinds=["run_started"])), None)
+    if started is None:
+        typer.echo(f"run {run_id} has no run_started entry; there is nothing to replay", err=True)
+        raise typer.Exit(2)
+    inputs = started.payload.get("inputs")
+    if not isinstance(inputs, dict):
+        inputs = {}
+    # A fresh journal: replaying into the one being read would interleave a new run's entries
+    # with the record it is checking against, and the record is the only evidence there is.
+    into = Journal(journal.parent / f"replay-{run_id}.db")
+    policy = loaded.to_policy()
+    scheduler = Scheduler(
+        graph=adapter,
+        registry=registry,
+        journal=into,
+        buffer=StoreBuffer(journal=into, run_id=""),
+        dispatcher=Dispatcher(registry=registry, dry_run=not dispatch),
+        target=ReplayModel(
+            journal=source, run_id=run_id, retired_branches=recovery.retired_branches
+        ),
+        policy=replace(policy, speculation=speculation == "on"),
+        reducers=loaded.state.reducers,
+    )
+    try:
+        result = asyncio.run(scheduler.run(new_ulid(), dict(inputs)))
+    except ReplayDivergence as divergence:
+        typer.echo(str(divergence), err=True)
+        raise typer.Exit(1) from divergence
+    if not dispatch:
+        typer.echo("(dry run: no effect was sent; pass --dispatch to send them)")
+    typer.echo(render_ledger(result.ledger))
+    if not result.ok:
+        typer.echo(f"replay did not complete: {result.error}", err=True)
+        raise typer.Exit(1)
 
 
 @app.command("verify-ledger")

@@ -601,6 +601,7 @@ class StoreBuffer:
                         "attempt": result.attempts,
                         "deduped": False,
                         "ack": result.ack,
+                        "dry_run": result.dry_run,
                         "compensation_for": None,
                     },
                 )
