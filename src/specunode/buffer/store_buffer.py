@@ -146,6 +146,12 @@ class StoreBuffer:
     _lineages: dict[str, tuple[str, ...]] = field(default_factory=dict)
     _closed: set[str] = field(default_factory=set)
     _drained: set[str] = field(default_factory=set)
+    #: Effects that already reached a terminal outcome, so a second drain of the same branch
+    #: neither re-claims nor re-reports them. A node body released by one drain can stage more
+    #: writes, and the scheduler drains again; without this the second pass would re-walk the
+    #: first pass's effects.
+    _settled: dict[str, set[str]] = field(default_factory=dict)
+    _dispatch_seq: dict[str, int] = field(default_factory=dict)
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     #: Futures a node body awaits for a staged write's real result. Completed only by the
     #: drain, and only after the confirming entry is durable.
@@ -436,35 +442,28 @@ class StoreBuffer:
         outcomes: list[tuple[str, EffectOutcome]] = []
         halted_at: int | None = None
         ok = True
-        dispatch_index = -1
+        settled = self._settled.setdefault(branch.id, set())
+        index = -1
 
-        # The list is read live, by index, and never snapshotted. Completing one effect's ack
-        # resumes the node body that was waiting on it, and that body may stage the next write
-        # from the value it just received -- `ack = await charge_card(...)` followed by
-        # `send_receipt(ack["charge_id"])` is the ordinary shape. Against a snapshot, that
-        # second effect is journaled as staged, never dispatched, and produces no ledger row:
-        # an authorised write silently dropped, identically in both arms, so the equivalence
-        # test stays green while the world never receives it.
-        #
+        # The list is read live, by index, and never snapshotted: completing one effect's ack
+        # can resume a node body that stages the next write from the value it just received.
         # Positional, never sorted -- not by key and not by effect id. Effect ids are ULIDs, so
         # sorting by one usually *reproduces* insertion order, which would make a reordering
         # bug invisible in testing and surface only under clock skew.
         while True:
-            dispatch_index += 1
+            index += 1
             live = self._staged.get(branch.id, [])
-            if dispatch_index >= len(live):
-                # Give a node body resumed by the last ack a chance to stage its next write
-                # before concluding the buffer is empty.
-                await asyncio.sleep(0)
-                live = self._staged.get(branch.id, [])
-                if dispatch_index >= len(live):
-                    break
-            effect = live[dispatch_index]
+            if index >= len(live):
+                break
+            effect = live[index]
+            if effect.id in settled:
+                continue
 
             if halted_at is not None:
                 outcomes.append((effect.id, EffectOutcome.NOT_ATTEMPTED))
                 continue
 
+            dispatch_index = self._dispatch_seq.get(branch.id, 0)
             claim = await self.journal.claim_dispatch(
                 PendingClaim(
                     run_id=self.run_id,
@@ -476,12 +475,14 @@ class StoreBuffer:
                 )
             )
             if claim.outcome is Claim.ALREADY_DISPATCHED:
+                settled.add(effect.id)
                 self._complete_ack(effect.id, claim.ack)
                 outcomes.append((effect.id, EffectOutcome.SKIPPED_DEDUPE))
                 continue
             if claim.outcome is Claim.AMBIGUOUS and not effect.idempotent:
-                # A previous attempt may already have taken effect and the tool has not said
-                # a repeat is harmless. Guessing either way is worse than stopping.
+                # A previous attempt may already have taken effect and the tool has not said a
+                # repeat is harmless. Guessing either way is worse than stopping.
+                settled.add(effect.id)
                 await self._dead_letter(
                     effect,
                     branch,
@@ -500,6 +501,8 @@ class StoreBuffer:
                 idempotency_key=effect.nkey,
                 branch_id=branch.id,
             )
+            settled.add(effect.id)
+            self._dispatch_seq[branch.id] = dispatch_index + 1
             if result.ok:
                 await self.journal.settle_dispatch(
                     run_id=self.run_id,
@@ -541,15 +544,14 @@ class StoreBuffer:
             )
             outcomes.append((effect.id, EffectOutcome.DEAD_LETTER))
             # Halt rather than skip: the effects after this one were staged on the assumption
-            # that this one happened, and sending them anyway would put the world in a state
-            # no run ever produced.
+            # that this one happened, and sending them anyway would put the world in a state no
+            # run ever produced.
             halted_at, ok = dispatch_index, False
 
         # An effect that was staged and never got an outcome is an authorised write that
         # vanished. Nothing else in the suite can see that, so it is reported here rather than
         # left to be noticed by its absence from the world.
-        accounted = {effect_id for effect_id, _ in outcomes}
-        undrained = tuple(e.id for e in self.pending(branch.id) if e.id not in accounted)
+        undrained = tuple(e.id for e in self.pending(branch.id) if e.id not in settled)
         return DrainReport(
             branch.id,
             tuple(outcomes),

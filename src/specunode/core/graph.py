@@ -30,12 +30,13 @@ than silent so the benchmark's hazard histogram stays complete.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, TypeAlias, runtime_checkable
 
 from specunode.canonical import JsonValue
 from specunode.core.decision import Decision
+from specunode.core.model import ModelClient
 
 __all__ = [
     "END",
@@ -120,7 +121,14 @@ class RunSession:
     call_tool: Callable[[str, Mapping[str, JsonValue]], Awaitable[JsonValue]]
     #: Called by an adapter when a node reaches a decision point.
     decide: Callable[[Decision], Awaitable[Decision]]
-    state: dict[str, JsonValue] = field(default_factory=dict)
+    #: The target model, already wrapped so every request and response is journaled before
+    #: the runtime acts on it. A node calls this rather than constructing its own client --
+    #: that substitution is what lets a developer's graph file stay unchanged.
+    model: ModelClient | None = None
+    #: The branch's working state. A MutableMapping rather than a dict so the runtime can hand
+    #: over a copy-on-write fork that measures its own delta, while a node body still just
+    #: reads and writes keys.
+    state: MutableMapping[str, JsonValue] = field(default_factory=dict)
 
 
 @runtime_checkable

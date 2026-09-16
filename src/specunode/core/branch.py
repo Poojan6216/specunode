@@ -23,6 +23,7 @@ from enum import Enum
 from specunode.canonical import JsonValue
 from specunode.core.decision import Decision
 from specunode.core.model import Message
+from specunode.core.state import BranchState
 
 __all__ = [
     "Branch",
@@ -194,7 +195,10 @@ class Branch:
     status: BranchStatus = BranchStatus.SPECULATIVE
     reason: str | None = None
     cursor: StepCursor = field(default_factory=StepCursor)
-    state: dict[str, JsonValue] = field(default_factory=dict)
+    #: The branch's working copy. A BranchState rather than a plain dict so that the fork is
+    #: genuinely copy-on-write and the retirement delta is measured from the fork point -- a
+    #: shared dict is how Hard Rule 6 gets violated by accident.
+    state: BranchState = field(default_factory=BranchState)
     context: list[Message] = field(default_factory=list)
     read_set: list[ReadRecord] = field(default_factory=list)
     #: (step, request_hash) for every *target* request this branch sent. Hard Rule 13
@@ -256,7 +260,7 @@ class Branch:
             cursor=self.cursor,
             # Copy-on-write at the level that matters: a child must never be able to reach a
             # parent's mutable container and change what the parent (or a sibling) sees.
-            state=dict(self.state),
+            state=self.state.fork(),
             context=list(self.context),
             read_set=list(self.read_set),
             tier=tier,

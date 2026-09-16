@@ -332,12 +332,16 @@ async def test_draining_twice_sends_nothing_twice(tmp_path: Path) -> None:
         branch, ToolCall("restart_job", {"job_id": "etl-1"}), registry_of(dispatcher, "restart_job")
     )
     offset = await confirm(journal, branch)
-    await buffer.drain(branch, dispatcher, confirmed_offset=offset, authorised_by_offset=offset)
+    first = await buffer.drain(
+        branch, dispatcher, confirmed_offset=offset, authorised_by_offset=offset
+    )
     second = await buffer.drain(
         branch, dispatcher, confirmed_offset=offset, authorised_by_offset=offset
     )
-    assert second.count(EffectOutcome.SKIPPED_DEDUPE) == 1
-    assert len(world.mutations) == 1
+    assert first.count(EffectOutcome.DISPATCHED) == 1
+    assert second.outcomes == (), "a settled effect is not re-walked on a later pass"
+    assert second.ok and second.undrained == ()
+    assert len(world.mutations) == 1, "the world must not receive the effect twice"
 
 
 async def test_a_speculative_branch_cannot_drain(tmp_path: Path) -> None:
@@ -576,10 +580,14 @@ async def test_a_write_staged_from_a_resumed_node_body_still_reaches_the_world(
     """The ordinary shape: ack = await charge_card(...); then send_receipt(ack["charge_id"]).
 
     The second write is staged only after the first one's ack arrives, which happens *during*
-    the drain. Against a snapshot of the staged list it is journaled, never dispatched, and
-    produces no ledger row -- an authorised write silently dropped, identically in both the
-    speculative and the sequential arm, so the equivalence test stays green while the world
-    never receives it. Nothing else in the suite can see that, which is why it is tested here.
+    the drain. This is the buffer's half of that: a later drain picks up what was staged since
+    the earlier one, and reports nothing left undrained. The scheduler's half -- knowing when
+    to drain again, because the node needs several event-loop turns to resume and stage -- is
+    covered end to end in tests/integration/test_sequential_run.py.
+
+    An effect staged and never dispatched is an authorised write dropped silently, identically
+    in both arms, so the equivalence test would stay green while the world never received it.
+    Nothing else in the suite can see that, which is why undrained is asserted here.
     """
     import asyncio
 
@@ -604,16 +612,20 @@ async def test_a_write_staged_from_a_resumed_node_body_still_reaches_the_world(
     await asyncio.sleep(0)
 
     offset = await confirm(journal, branch)
-    report = await buffer.drain(
+    first = await buffer.drain(
         branch, dispatcher, confirmed_offset=offset, authorised_by_offset=offset
     )
-    await parked
+    await parked  # the node resumes on the ack and stages its second write
+    second = await buffer.drain(
+        branch, dispatcher, confirmed_offset=offset, authorised_by_offset=offset
+    )
 
-    assert report.undrained == (), f"an authorised write was never dispatched: {report.undrained}"
-    assert report.ok
-    assert report.count(EffectOutcome.DISPATCHED) == 2
+    assert first.count(EffectOutcome.DISPATCHED) == 1
+    assert second.count(EffectOutcome.DISPATCHED) == 1
+    assert second.undrained == (), f"an authorised write was never dispatched: {second.undrained}"
     assert [m.tool for m in world.mutations] == ["charge_card", "post_summary"]
-    assert world.mutations[1].args_hash, "the second write carried the first one's real result"
+    summary = world.mutations[1]
+    assert summary.args_hash, "the second write carried the first one's real result"
 
 
 async def test_two_identical_calls_in_one_node_need_two_step_indices(tmp_path: Path) -> None:
