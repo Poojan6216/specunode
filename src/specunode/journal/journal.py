@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -39,7 +40,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar
 
 from specunode.canonical import JsonValue, canonical, chash
 from specunode.journal.entries import (
@@ -273,6 +274,53 @@ class _SqliteBackend:
         # IMMEDIATE, never deferred: a deferred read-then-write upgrade raises
         # SQLITE_BUSY_SNAPSHOT, which busy_timeout does not retry.
         self._conn.execute("BEGIN IMMEDIATE")
+
+    def commit(self) -> None:
+        self._conn.execute("COMMIT")
+
+    def rollback(self) -> None:
+        self._conn.execute("ROLLBACK")
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+#: SQLite takes ``:name`` parameters and psycopg 3 takes ``%(name)s``. The DML is written once
+#: with the former and rewritten once at import time for the latter, so there is one copy of
+#: every statement and the two backends cannot drift apart in what they execute.
+_PARAM = re.compile(r"(?<![:\w]):([a-z_][a-z0-9_]*)")
+
+
+def _to_postgres(sql: str) -> str:
+    return _PARAM.sub(r"%(\1)s", sql)
+
+
+class _PostgresBackend:
+    """Postgres 16, sharing ``schema.sql`` verbatim.
+
+    Autocommit, so one statement is one commit is one flush, matching the SQLite path's
+    discipline. ``synchronous_commit`` is set explicitly per session because a server
+    configured ``off`` would silently discard the durability the whole design rests on, and the
+    failure would look like a journal that loses its last few entries under load.
+    """
+
+    def __init__(self, dsn: str) -> None:
+        try:
+            import psycopg
+        except ImportError as exc:  # pragma: no cover - exercised by the extras matrix
+            raise JournalConfigError(
+                "the postgres journal needs the optional extra: pip install 'specunode[postgres]'"
+            ) from exc
+        self._conn = psycopg.connect(dsn, autocommit=True)
+        self._conn.execute("SET synchronous_commit = on")
+        for statement in _load_schema_statements():
+            self._conn.execute(statement)
+
+    def execute(self, sql: str, params: Mapping[str, JsonValue] | None = None) -> Any:
+        return self._conn.execute(_to_postgres(sql), dict(params) if params else {})
+
+    def begin_immediate(self) -> None:
+        self._conn.execute("BEGIN")
 
     def commit(self) -> None:
         self._conn.execute("COMMIT")

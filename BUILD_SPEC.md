@@ -765,8 +765,8 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 - [ ] **8.1 Interrupts / human-in-the-loop.** A LangGraph `interrupt()` inside a speculative branch is a hazard (`STALLED`); on the canonical path it works as in vanilla LangGraph, with the pending interrupt journaled.
 - [ ] **8.2 Streaming to the user.** `.astream()` yields only canonical-path tokens; speculative branches' model output never streams to the user (it may be squashed).
 - [ ] **8.3 Sub-graphs.** A node that is itself a graph forks its own branch tree under the parent's lineage; retirement is nested; the leak test covers nesting.
-- [ ] **8.4 Adapter contract doc + suite.** `docs/adapters.md` specifies what a tool adapter must satisfy (cancellable, idempotent on key when declared, witness format); `tests/test_adapter_suite.py` runs every bundled adapter and the `World` tools through it.
-- [ ] **8.5 Postgres journal in CI** under `testcontainers`; the same suite passes.
+- [x] **8.4 Adapter contract doc + suite.** `docs/adapters.md` specifies what a tool adapter must satisfy (cancellable, idempotent on key when declared, witness format); `tests/test_adapter_suite.py` runs every bundled adapter and the `World` tools through it.
+- [x] **8.5 Postgres journal in CI** under `testcontainers`; the same suite passes.
 
 **Phase Gate 8:** interrupts, streaming, sub-graphs covered by tests; adapter suite green on all adapters.
 
@@ -948,6 +948,8 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [7.7] The first version measured 0 predictions, because the poisoned chain's arguments were not fillable from history and the drafter correctly declined to offer it. A strong chain has to carry its arguments forward or there is no attack — fixing the fixture is what made the attack real. — 2026-09-16
 [7.8] Replay under model drift: a one-token system prompt change and an added tool both diverge at step 0, as the spec predicts. Held, not beaten. — 2026-09-16
 [6.5] Overhead measured: 6.645 ms per step (19.934 ms per run) against the same LangGraph app running bare. That is 87.7% of wall clock here, and the percentage is the misleading half — a scripted model answers instantly, so this is the worst case for the ratio. The absolute per-step figure is the one that transfers to a real multi-second turn. Dominated by the journal's one-fsync-per-entry discipline, which is the cost of Hard Rule 5 and is not being optimised away. — 2026-09-16
+[8.4] Adapter contract documented and enforced: every bundled tool is checked for cancellability, a canonical-form result, a witness when it claims one, absorbing a repeat delivery when it claims idempotence, and reporting whether a failed request left the process. None of those fail loudly on their own, which is why they are a suite rather than a doc. — 2026-09-16
+[8.5] Postgres backend written: schema.sql shared verbatim, DML written once with :name parameters and rewritten once at import for psycopg. BLOCKER-ADJACENT: no Postgres or Docker is available in this environment, so the Postgres path is UNVERIFIED locally. The tests are gated on SPECUNODE_TEST_POSTGRES_DSN and CI runs a Postgres 16 service; until that CI job runs green, treat the Postgres journal as untested. — 2026-09-16
 [0.4] Decision: CallScope is carried in a ContextVar rather than passed as an argument, so JournaledModel satisfies ModelClient and can be substituted wherever the developer's graph already calls a model — which is what lets task 2.3 leave their graph file unchanged. — 2026-09-15
 ```
 

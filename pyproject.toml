@@ -81,7 +81,17 @@ disallow_any_explicit = false
 plugins = []
 
 [[tool.mypy.overrides]]
-module = ["ulid.*", "langgraph.*", "langchain_core.*", "mcp.*", "anthropic.*", "datasets.*", "matplotlib.*", "reportlab.*"]
+module = [
+  "ulid.*",
+  "langgraph.*",
+  "langchain_core.*",
+  "mcp.*",
+  "anthropic.*",
+  "psycopg.*",
+  "datasets.*",
+  "matplotlib.*",
+  "reportlab.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
