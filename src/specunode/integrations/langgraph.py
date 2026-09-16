@@ -101,6 +101,10 @@ class LangGraphAdapter:
     compiled: Any
     node_names: tuple[str, ...] = ()
     speculable: frozenset[str] = frozenset()
+    #: Every node the runtime substituted, by its qualified path. A sub-graph's nodes appear
+    #: as ``sub/inner``; the container itself does not appear, because it does no work.
+    installed_nodes: list[str] = field(default_factory=list)
+    subgraphs: int = 0
     _installed: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
@@ -117,16 +121,33 @@ class LangGraphAdapter:
         self._install()
 
     def _install(self) -> None:
-        """Replace each node's bound runnable with one that runs it under a branch."""
+        """Replace each node's bound runnable with one that runs it under a branch.
+
+        A node whose bound runnable is itself a compiled graph is a *sub-graph*, and its
+        container is not substituted: the inner nodes are, under the parent's path. That gives
+        a nested branch tree whose ids read ``sub/inner_a`` rather than one opaque branch for
+        the whole sub-graph, which is what makes the leak invariant meaningful inside one.
+        """
         if self._installed:
             return
+        self._substitute(self.compiled, path=())
+        self._installed = True
+
+    def _substitute(self, compiled: Any, path: tuple[str, ...]) -> None:
         from langchain_core.runnables import RunnableLambda
 
-        for name in self.node_names:
-            node = self.compiled.nodes[name]
+        for name in _node_names(compiled):
+            node = compiled.nodes[name]
             original = node.bound
-            node.bound = RunnableLambda(_make_shim(name, original))
-        self._installed = True
+            if hasattr(original, "nodes") and _node_names(original):
+                # A sub-graph. Recurse rather than wrapping the container, so each inner node
+                # gets its own branch and its own place in the ledger.
+                self._substitute(original, path=(*path, name))
+                self.subgraphs += 1
+                continue
+            qualified = "/".join((*path, name))
+            node.bound = RunnableLambda(_make_shim(qualified, original))
+            self.installed_nodes.append(qualified)
 
     # -- the GraphAdapter surface ---------------------------------------------------------
 
@@ -142,7 +163,11 @@ class LangGraphAdapter:
         )
 
     def nodes(self) -> Sequence[NodeRef]:
-        return [NodeRef(name=name) for name in self.node_names]
+        refs: list[NodeRef] = []
+        for qualified in self.installed_nodes or list(self.node_names):
+            *path, name = qualified.split("/")
+            refs.append(NodeRef(name=name, path=tuple(path)))
+        return refs
 
     def decision_kind(
         self, node: NodeRef
@@ -201,6 +226,22 @@ class SpecuNodeGraph:
         if not result.ok and result.error:
             raise RuntimeError(result.error)
         return result.state
+
+    async def astream(self, inputs: JsonValue, run_id: str | None = None) -> Any:
+        """Yield the canonical path's output, and nothing a speculation produced.
+
+        A speculative branch's model output may be squashed, so streaming it to a user would
+        show them text that the run then decided against. There is no way to take it back once
+        it is on their screen, which is why this yields after each node retires rather than as
+        each branch produces something.
+        """
+        resolved = self._run_id(run_id)
+        result = await self.scheduler.run(resolved, inputs)
+        if not result.ok and result.error:
+            raise RuntimeError(result.error)
+        for row in result.ledger.rows:
+            yield {"effect": row.call.name, "args": dict(row.call.args), "status": row.status}
+        yield {"state": result.state}
 
     async def run(self, inputs: JsonValue, run_id: str | None = None) -> Any:
         """Like :meth:`ainvoke` but returns the whole result, ledger included."""

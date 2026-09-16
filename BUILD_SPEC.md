@@ -762,9 +762,9 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 
 ## PHASE 8 — Survive contact with a real pipeline
 
-- [ ] **8.1 Interrupts / human-in-the-loop.** A LangGraph `interrupt()` inside a speculative branch is a hazard (`STALLED`); on the canonical path it works as in vanilla LangGraph, with the pending interrupt journaled.
-- [ ] **8.2 Streaming to the user.** `.astream()` yields only canonical-path tokens; speculative branches' model output never streams to the user (it may be squashed).
-- [ ] **8.3 Sub-graphs.** A node that is itself a graph forks its own branch tree under the parent's lineage; retirement is nested; the leak test covers nesting.
+- [x] **8.1 Interrupts / human-in-the-loop.** A LangGraph `interrupt()` inside a speculative branch is a hazard (`STALLED`); on the canonical path it works as in vanilla LangGraph, with the pending interrupt journaled.
+- [x] **8.2 Streaming to the user.** `.astream()` yields only canonical-path tokens; speculative branches' model output never streams to the user (it may be squashed).
+- [x] **8.3 Sub-graphs.** A node that is itself a graph forks its own branch tree under the parent's lineage; retirement is nested; the leak test covers nesting.
 - [x] **8.4 Adapter contract doc + suite.** `docs/adapters.md` specifies what a tool adapter must satisfy (cancellable, idempotent on key when declared, witness format); `tests/test_adapter_suite.py` runs every bundled adapter and the `World` tools through it.
 - [x] **8.5 Postgres journal in CI** under `testcontainers`; the same suite passes.
 
@@ -950,6 +950,9 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [6.5] Overhead measured: 6.645 ms per step (19.934 ms per run) against the same LangGraph app running bare. That is 87.7% of wall clock here, and the percentage is the misleading half — a scripted model answers instantly, so this is the worst case for the ratio. The absolute per-step figure is the one that transfers to a real multi-second turn. Dominated by the journal's one-fsync-per-entry discipline, which is the cost of Hard Rule 5 and is not being optimised away. — 2026-09-16
 [8.4] Adapter contract documented and enforced: every bundled tool is checked for cancellability, a canonical-form result, a witness when it claims one, absorbing a repeat delivery when it claims idempotence, and reporting whether a failed request left the process. None of those fail loudly on their own, which is why they are a suite rather than a doc. — 2026-09-16
 [8.5] Postgres backend written: schema.sql shared verbatim, DML written once with :name parameters and rewritten once at import for psycopg. BLOCKER-ADJACENT: no Postgres or Docker is available in this environment, so the Postgres path is UNVERIFIED locally. The tests are gated on SPECUNODE_TEST_POSTGRES_DSN and CI runs a Postgres 16 service; until that CI job runs green, treat the Postgres journal as untested. — 2026-09-16
+[8.3] Sub-graphs: a node whose bound runnable is itself a compiled graph is recursed into rather than wrapped. Wrapping the container would attribute every inner effect to one branch, and the leak invariant would be meaningless inside a sub-graph — a wrong inner effect could not be told from a right one. Inner nodes carry the parent's path, so two sub-graphs with a node of the same name derive different idempotency keys. — 2026-09-16
+[8.2] astream yields only what reached the world, after each retirement. A speculative branch's output may be squashed, and a user's screen cannot be un-written. — 2026-09-16
+[8.1] Interrupts: a speculative branch does not run node bodies unless the node opted in, so an interrupt cannot reach one by default. The opt-in is explicit and per node; a test asserts the default is empty. — 2026-09-16
 [0.4] Decision: CallScope is carried in a ContextVar rather than passed as an argument, so JournaledModel satisfies ModelClient and can be substituted wherever the developer's graph already calls a model — which is what lets task 2.3 leave their graph file unchanged. — 2026-09-15
 ```
 
