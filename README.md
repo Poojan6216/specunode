@@ -84,16 +84,26 @@ API key and has not been run.
 
 ## Status
 
-Under construction, and honest about where it is. Working today:
+v0.1.0, and honest about where it is. Working today:
 
 - the canonical form, the hash-chained journal, replay and crash recovery
 - effect classes, the store buffer, at-least-once dispatch with deterministic idempotency keys
 - the sequential scheduler, the LangGraph integration, the plain-Python API, `resume`
-- tier-0 early issue and the tier-1 pattern index
+- tier-0 early issue, the tier-1 pattern index, and a tier-2 draft model behind an extra
+- the MCP proxy's rules, the offline benchmark, the overhead benchmark, the adversarial suite
 - the three invariant tests below
 
-Not yet: the MCP proxy, the offline and online benchmarks, the adversarial suite, `RESULTS.md`.
-No latency figure appears anywhere in this repository, because none has been measured yet.
+Known gaps, stated rather than left to be discovered:
+
+- **No wall-clock figure exists anywhere in this repository.** The online latency benchmark
+  needs an API key and has not been run.
+- **The MCP proxy has not been driven by a real client against a real upstream server.** Its
+  rules are tested; its transport is wired but undemonstrated.
+- **The Postgres journal backend is written and type-checked but has never been executed** —
+  it needs the CI job.
+- One sample workload, not three. The invariant tests hold on it and on tiers 0 and 1.
+
+`BUILD_SPEC.md`'s Final Report lists every one of these with the reason it is open.
 
 ---
 

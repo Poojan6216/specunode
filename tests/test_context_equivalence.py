@@ -12,6 +12,11 @@ same way and still agree with each other: an implementation that hashes a clean 
 a dirty one goes to the wire reports zero divergences forever and passes any test written
 against its own bookkeeping. ``RecordingModel`` sits at the wire and keeps the projection of
 every request, and that is what is compared.
+
+It runs over every workload in ``bench/workloads/``, at tier 0 and tier 1. That matters most
+for ``ops_agent``, which is the one workload that hands its turn to the runtime and therefore
+the only one where a speculative branch exists to send a prompt at all -- on the others the
+comparison is still made, and still has to hold, but it is the easy direction.
 """
 
 from __future__ import annotations
@@ -19,12 +24,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from examples.support_agent.agent import build
+from bench.workloads import WORKLOADS, Workload
 
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
 from specunode.core.branch import Branch, BranchStatus, ResultSlot, SlotStatus, TurnFrame
-from specunode.core.effects import ToolRegistry
 from specunode.core.hazards import Hazard, analyse_model_request, handle_for
 from specunode.core.model import (
     ContextDivergence,
@@ -39,22 +43,39 @@ from specunode.core.model import (
 )
 from specunode.core.policy import Policy
 from specunode.core.scheduler import Scheduler
+from specunode.drafters.t1_pattern import PatternDrafter, PatternIndex
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
-from specunode.testing.models import RecordingModel, ScriptedModel, tool_turn
+from specunode.testing.models import RecordingModel
 from specunode.testing.world import World, standard_world
 
-CHARGE = ("charge_card", {"customer_id": "cus-1", "amount": 25.0})
 ATTESTED = frozenset({"br-1", "br-2"})
+TIERS = ("t0", "t1")
+
+
+def _cases() -> list[object]:
+    return [
+        pytest.param(w, tier, id=f"{w.name}-{tier}") for w in WORKLOADS for tier in TIERS
+    ]
 
 
 def run_with(
-    tmp_path: Path, world: World, *, speculation: bool, db: str
+    tmp_path: Path,
+    workload: Workload,
+    world: World,
+    *,
+    speculation: bool,
+    tier: str = "t0",
+    db: str,
 ) -> tuple[Scheduler, RecordingModel, str]:
-    adapter, registry = build(world)
-    assert isinstance(registry, ToolRegistry)
+    adapter, registry = workload.make(world)
     journal = Journal(tmp_path / db)
-    recorder = RecordingModel(ScriptedModel(turns=[tool_turn(CHARGE, turn=0)]))
+    recorder = RecordingModel(workload.model())
+    predictor = None
+    if speculation and tier == "t1":
+        index = PatternIndex(order=2)
+        index.train([workload.decisions()])
+        predictor = PatternDrafter(index=index)
     scheduler = Scheduler(
         graph=adapter,
         registry=registry,
@@ -63,23 +84,34 @@ def run_with(
         dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
         target=JournaledModel(recorder, journal, provider="scripted"),
         policy=Policy(speculation=speculation),
+        predictor=predictor,
     )
     return scheduler, recorder, new_ulid()
 
 
+@pytest.mark.parametrize(("workload", "tier"), _cases())
 async def test_the_speculative_arm_asks_the_same_questions_as_the_sequential_one(
-    tmp_path: Path,
+    tmp_path: Path, workload: Workload, tier: str
 ) -> None:
     """The claim, asserted at the wire on both arms."""
     sequential, seq_recorder, seq_run = run_with(
-        tmp_path, standard_world(), speculation=False, db="seq.db"
+        tmp_path,
+        workload,
+        standard_world(),
+        speculation=False,
+        db=f"{workload.name}-{tier}-seq.db",
     )
     speculative, spec_recorder, spec_run = run_with(
-        tmp_path, standard_world(), speculation=True, db="spec.db"
+        tmp_path,
+        workload,
+        standard_world(),
+        speculation=True,
+        tier=tier,
+        db=f"{workload.name}-{tier}-spec.db",
     )
 
-    seq_result = await sequential.run(seq_run, {"customer_id": "cus-1"})
-    spec_result = await speculative.run(spec_run, {"customer_id": "cus-1"})
+    seq_result = await sequential.run(seq_run, dict(workload.seed))
+    spec_result = await speculative.run(spec_run, dict(workload.seed))
     assert seq_result.ok and spec_result.ok
 
     assert seq_recorder.digests, "the run asked the model nothing, so this proves nothing"
@@ -88,12 +120,20 @@ async def test_the_speculative_arm_asks_the_same_questions_as_the_sequential_one
     )
 
 
-async def test_no_request_ever_carried_a_placeholder(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("workload", "tier"), _cases())
+async def test_no_request_ever_carried_a_placeholder(
+    tmp_path: Path, workload: Workload, tier: str
+) -> None:
     """A model conditioned on a placeholder is deciding on a premise no real run had."""
     scheduler, recorder, run_id = run_with(
-        tmp_path, standard_world(), speculation=True, db="handles.db"
+        tmp_path,
+        workload,
+        standard_world(),
+        speculation=True,
+        tier=tier,
+        db=f"{workload.name}-{tier}-handles.db",
     )
-    await scheduler.run(run_id, {"customer_id": "cus-1"})
+    await scheduler.run(run_id, dict(workload.seed))
     assert recorder.calls
     for call in recorder.calls:
         assert "$specunode.handle:" not in str(call.projection)

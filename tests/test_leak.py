@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from bench.workloads import WORKLOADS, Workload
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -414,3 +415,162 @@ async def _durability_attempt(tmp_path: Path) -> None:
     with pytest.raises(BranchClosed, match="durable"):
         await buffer.drain(branch, dispatcher, confirmed_offset=999, authorised_by_offset=999)
     assert world.mutations == []
+
+
+
+
+_TIERS = ("t0", "t1")
+
+
+def _workload_cases() -> list[object]:
+    return [pytest.param(w, tier, id=f"{w.name}-{tier}") for w in WORKLOADS for tier in _TIERS]
+
+
+async def _run_workload(
+    tmp_path: Path, workload: Workload, world: World, *, tier: str, db: str
+) -> tuple[object, Journal, str]:
+    from specunode.core.model import JournaledModel
+    from specunode.core.policy import Policy
+    from specunode.core.scheduler import Scheduler
+    from specunode.drafters.t1_pattern import PatternDrafter, PatternIndex
+
+    adapter, registry = workload.make(world)
+    journal = Journal(tmp_path / db)
+    predictor = None
+    if tier == "t1":
+        index = PatternIndex(order=2)
+        index.train([workload.decisions()])
+        predictor = PatternDrafter(index=index)
+    scheduler = Scheduler(
+        graph=adapter,
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(workload.model(), journal, provider="scripted"),
+        policy=Policy(speculation=True),
+        predictor=predictor,
+    )
+    run_id = new_ulid()
+    result = await scheduler.run(run_id, dict(workload.seed))
+    return result, journal, run_id
+
+# -- the same invariant, over the real runtime on the real workloads ----------------------------
+#
+# Everything above drives a purpose-built simulator, which is what lets hypothesis explore 500
+# branch trees a real workload would take hours to reach. The cost is that it proves Rule 3 about
+# the simulator. These two assert the same invariant about the actual scheduler running the actual
+# sample apps, at both drafter tiers -- narrow coverage, but of the thing that ships.
+
+
+@pytest.mark.parametrize(("workload", "tier"), _workload_cases())
+async def test_the_real_runtime_leaks_nothing_on_a_real_workload(
+    tmp_path: Path, workload: Workload, tier: str
+) -> None:
+    """Hard Rule 3, over a run of a shipped workload rather than a generated tree."""
+    world = standard_world()
+    result, journal, run_id = await _run_workload(
+        tmp_path, workload, world, tier=tier, db=f"leak-{workload.name}-{tier}.db"
+    )
+    assert result.ok
+
+    retired = {
+        str(entry.payload["branch_id"])
+        for entry in journal.read(run_id, kinds=["branch_resolved"])
+        if entry.payload.get("status") == "retired"
+    }
+    touched = world.mutating_branches()
+    assert touched, "the workload changed nothing, so the invariant would hold vacuously"
+    assert touched <= retired, (
+        f"Hard Rule 3 violated: {sorted(touched - retired)} touched the world without retiring"
+    )
+    # And the count is the workload's declared one, so a run that dispatched less than it
+    # should cannot pass by leaking nothing.
+    assert len(world.mutations) == workload.expect_effects
+
+
+@pytest.mark.parametrize(("workload", "tier"), _workload_cases())
+async def test_a_squashed_branch_on_a_real_workload_leaves_nothing_behind(
+    tmp_path: Path, workload: Workload, tier: str
+) -> None:
+    """Every branch that was squashed must be absent from the world's mutation log.
+
+    Stated separately from the subset above because the subset holds vacuously when nothing was
+    squashed, and on these workloads that is usually what happens: two of them never speculate
+    at all, and on ``ops_agent`` the index is trained on the run's own trace, so it is right.
+    The non-vacuous case -- a prediction that is actually wrong -- is the test below, which
+    forces one rather than hoping for it.
+    """
+    world = standard_world()
+    result, journal, run_id = await _run_workload(
+        tmp_path, workload, world, tier=tier, db=f"squash-{workload.name}-{tier}.db"
+    )
+    assert result.ok
+
+    squashed = {
+        str(entry.payload["branch_id"])
+        for entry in journal.read(run_id, kinds=["branch_resolved"])
+        if entry.payload.get("status") == "squashed"
+    }
+    assert not (world.mutating_branches() & squashed)
+
+
+async def test_a_deliberately_wrong_prediction_on_a_real_workload_leaks_nothing(
+    tmp_path: Path,
+) -> None:
+    """The non-vacuous leak case: a real workload, a real drafter, and a guess that is wrong.
+
+    The index is trained on a trace that restarts a *different* job, so the prediction is
+    well-formed, fillable and wrong. That is the shape that matters: a branch that got far
+    enough to stage a write before the model contradicted it. A prediction that never forms
+    tests the policy that refused it, not the store buffer.
+    """
+    from specunode.core.model import JournaledModel
+    from specunode.core.policy import Policy
+    from specunode.core.scheduler import Scheduler
+    from specunode.drafters.t1_pattern import PatternDrafter, PatternIndex
+
+    workload = next(w for w in WORKLOADS if w.tier_1_can_predict)
+    world = standard_world()
+    adapter, registry = workload.make(world)
+
+    # Same shape, wrong target: the drafter will predict restart_job with the job_id it finds
+    # in the status read, which the seeded row makes etl-2 -- so we train it to expect the
+    # restart at a point where the model instead asks for something else entirely.
+    wrong = [
+        ToolCall("get_pipeline_status", {"pipeline_id": "etl-2"}),
+        ToolCall("restart_job", {"job_id": "etl-2"}),
+    ]
+    index = PatternIndex(order=2)
+    index.train([wrong])
+
+    journal = Journal(tmp_path / "wrong-prediction.db")
+    scheduler = Scheduler(
+        graph=adapter,
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(workload.model(), journal, provider="scripted"),
+        policy=Policy(speculation=True),
+        predictor=PatternDrafter(index=index),
+    )
+    run_id = new_ulid()
+    result = await scheduler.run(run_id, dict(workload.seed))
+    assert result.ok
+
+    resolutions = [
+        entry.payload
+        for entry in journal.read(run_id, kinds=["branch_resolved"])
+    ]
+    squashed = {
+        str(payload["branch_id"])
+        for payload in resolutions
+        if payload.get("status") == "squashed"
+    }
+    assert squashed, "the mistrained index still guessed right; this proves nothing"
+
+    # Hard Rule 3: nothing the squashed branch did reached the world.
+    assert not (world.mutating_branches() & squashed)
+    # And the run still did its whole job -- a squash must not cost the run an effect.
+    assert len(world.mutations) == workload.expect_effects

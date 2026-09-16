@@ -61,6 +61,7 @@ ENTRY_KINDS: Final[tuple[str, ...]] = (
     "tool_result",
     "branch_forked",
     "branch_resolved",
+    "effect_adopted",
     "effect_staged",
     "effect_dispatched",
     "effect_dead_lettered",
@@ -86,6 +87,8 @@ REQUIRED_FIELDS: Final[Mapping[str, frozenset[str]]] = {
     "tool_result": frozenset({"step", "branch_id", "call_id", "ok", "reached_upstream"}),
     "branch_forked": frozenset({"branch_id", "lineage", "fork_step", "predicted_hash", "tier"}),
     "branch_resolved": frozenset({"branch_id", "step", "status"}),
+    # A confirmed speculation's staged effects moving to the branch that retires.
+    "effect_adopted": frozenset({"branch_id", "from_branch_id", "effect_ids"}),
     # key_inputs lets normalise_for_equivalence re-derive the key from journaled facts alone.
     "effect_staged": frozenset(
         {"effect_id", "branch_id", "step", "tool", "args_hash", "key", "nkey", "stage_index"}

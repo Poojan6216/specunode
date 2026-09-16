@@ -26,7 +26,7 @@ a handle could never normalise equal to the sequential run's row showing the rea
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TypeAlias
 
@@ -144,6 +144,10 @@ class StoreBuffer:
 
     _staged: dict[str, list[StagedEffect]] = field(default_factory=dict)
     _lineages: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: child branch id -> the branch its staged effects were adopted into, once a
+    #: prediction was confirmed. Kept so a late stage on an adopted child lands where
+    #: it will actually be drained rather than in a list nothing reads.
+    _adopted_into: dict[str, str] = field(default_factory=dict)
     _closed: set[str] = field(default_factory=set)
     _drained: set[str] = field(default_factory=set)
     #: Effects that already reached a terminal outcome, so a second drain of the same branch
@@ -304,6 +308,72 @@ class StoreBuffer:
                     effect_id=effect.id,
                 )
         return ForwardMiss()
+
+    # -- adoption ---------------------------------------------------------------------------
+
+    async def adopt(self, child: Branch, parent: Branch) -> int:
+        """Move a confirmed speculation's staged effects onto the branch that will retire.
+
+        When the model emits exactly what was predicted, the speculative branch stops being a
+        guess: the call it staged is the call the run was always going to make. But only the
+        canonical branch retires, and :meth:`drain` dispatches by ``branch.id`` -- so without
+        this the effect sits in the child's list forever. The node body awaiting its ack never
+        wakes, and the run deadlocks rather than failing, which is the worst of the three
+        possible outcomes because nothing reports it.
+
+        That was a real defect: a tier-1 drafter that correctly predicted a *write* hung the
+        run. It survived because the only confirmed predictions any test had ever made were
+        reads, which stage nothing.
+
+        The effect is re-attributed to the parent's ``branch_id`` and lineage, because that is
+        what it would have carried had it been staged without speculation -- and Hard Rule 3's
+        audit asks that every effect in the world trace to a branch that *retired*, which the
+        child never does. What deliberately does **not** change is ``nkey``: it is the token
+        the tool is handed, and an idempotency key that shifted when a guess turned out right
+        would make a retry after adoption look like a different call.
+
+        ``stage_index`` is renumbered onto the end of the parent's list, preserving order: the
+        adoption happens mid-stream, before the parent stages anything the turn's later blocks
+        ask for, so appending is the order the sequential run would have produced.
+        """
+        moved = self._staged.pop(child.id, [])
+        if not moved:
+            # Nothing staged -- a predicted read, which is the common case. Still record the
+            # adoption so the child's lineage does not silently keep receiving stages.
+            self._adopted_into[child.id] = parent.id
+            return 0
+
+        target = self._staged.setdefault(parent.id, [])
+        adopted: list[StagedEffect] = []
+        for offset, effect in enumerate(moved):
+            adopted.append(
+                replace(
+                    effect,
+                    branch_id=parent.id,
+                    lineage=parent.lineage,
+                    stage_index=len(target) + offset,
+                )
+            )
+        target.extend(adopted)
+        self._adopted_into[child.id] = parent.id
+        self._lineages[parent.id] = parent.lineage
+        await self.journal.append_async(
+            self.run_id,
+            "effect_adopted",
+            {
+                "v": 1,
+                "branch_id": parent.id,
+                "from_branch_id": child.id,
+                "step": parent.cursor.step_index,
+                "effect_ids": [effect.id for effect in adopted],
+                "count": len(adopted),
+            },
+        )
+        return len(adopted)
+
+    def adopted_into(self, branch_id: str) -> str | None:
+        """The branch a confirmed speculation's effects were moved to, if any."""
+        return self._adopted_into.get(branch_id)
 
     # -- discard ---------------------------------------------------------------------------
 

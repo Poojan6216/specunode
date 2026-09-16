@@ -97,6 +97,11 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The repo root, so ``examples`` and ``bench.workloads`` import the same way whether
+# pytest is invoked bare or with an explicit file path. Without it the mandatory tests
+# collect under ``pytest`` and fail to import under ``pytest tests/test_equivalence.py``,
+# which is exactly the invocation someone debugging one of them would reach for.
+pythonpath = ["."]
 addopts = "-q --strict-markers"
 markers = [
   "slow: long-running tests",

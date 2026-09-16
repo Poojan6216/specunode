@@ -40,7 +40,7 @@ from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import EffectOutcome, StoreBuffer
 from specunode.canonical import JsonValue, chash
 from specunode.core.branch import Branch, BranchStatus, ReadRecord, StepCursor
-from specunode.core.decision import Decision, ToolCall, is_barrier
+from specunode.core.decision import Decision, ToolCall, decision_key, decision_payload, is_barrier
 from specunode.core.effects import EffectClass, ToolRegistry
 from specunode.core.graph import END, GraphAdapter, NodeRef, RunSession, session_scope
 from specunode.core.hazards import Hazard, analyse
@@ -537,10 +537,15 @@ class Scheduler:
                 "node_id": node_id,
                 "depth": branch.depth,
                 # The canonical branch predicts nothing: it is confirmed by the model's own
-                # output rather than resolved against a guess.
-                "predicted": None,
-                "predicted_hash": "",
-                "tier": None,
+                # output rather than resolved against a guess, and these three stay null for
+                # it. A branch forked *on a prediction* records what was predicted, so the
+                # journal can tell the two apart -- without this, every fork looks canonical
+                # on replay and "how much did this run actually speculate" is unanswerable
+                # from the durable record, which is the only record Hard Rule 12 permits an
+                # answer to come from.
+                "predicted": decision_payload(branch.predicted) if branch.predicted else None,
+                "predicted_hash": decision_key(branch.predicted) if branch.predicted else "",
+                "tier": branch.tier,
             },
         )
 
@@ -1000,6 +1005,38 @@ class SpeculativeTurn:
         if confirmed:
             self.confirmed += 1
             child.confirm()
+            # The guess was right, so the work stops being speculative and becomes the
+            # canonical branch's. Anything the child staged has to move with it: only the
+            # canonical branch retires, and the drain dispatches by branch id, so an effect
+            # left behind here is one no drain will ever find and one whose ack the node body
+            # waits on forever.
+            # The canonical branch is about to *not* make this call -- it takes the child's
+            # completed work instead. It must still take the program position the call would
+            # have occupied, because every later call's idempotency key is derived from the
+            # step index. Without this the same run dispatches the same effects under
+            # different keys depending on whether it happened to speculate, so a resume with
+            # speculation off would not dedupe against a crashed run that had it on, and the
+            # effect would be delivered twice. Hard Rule 9 catches it as a ledger mismatch.
+            self._branch.advance_step()
+            adopted = await scheduler.buffer.adopt(child, self._branch)
+            if adopted:
+                # Park events are keyed by branch id, and the one the child set when it staged
+                # is on the child's key -- which nothing waits on. The canonical branch is the
+                # one whose quiesce loop decides when to drain, so it has to be told that it
+                # now holds an effect a node body is blocked on. Without this the effect moves
+                # to the right list and still never leaves.
+                scheduler.mark_parked(self._branch)
+            await scheduler.journal.append_async(
+                scheduler.run_id,
+                "branch_resolved",
+                {
+                    "v": 1,
+                    "branch_id": child.id,
+                    "step": child.fork_step,
+                    "status": "confirmed",
+                    "adopted_by": self._branch.id,
+                },
+            )
             self._adopted = self._open
             self._open = None
             self._predicted = None

@@ -56,9 +56,16 @@ def journal(tmp_path: Path) -> Journal:
 # -- shape ------------------------------------------------------------------------------------
 
 
-def test_there_are_exactly_fifteen_entry_kinds() -> None:
-    assert len(ENTRY_KINDS) == 15
-    assert len(set(ENTRY_KINDS)) == 15
+def test_every_entry_kind_is_distinct_and_has_required_fields() -> None:
+    """The count is not the property; the correspondence is.
+
+    This used to assert ``len(ENTRY_KINDS) == 15``, which fails whenever a kind is added and
+    says nothing about whether the new kind is usable. What actually matters is that no kind
+    is duplicated and that every one of them declares the fields ``append`` will demand, so a
+    kind cannot be added and then rejected at its first write.
+    """
+    assert len(set(ENTRY_KINDS)) == len(ENTRY_KINDS)
+    assert set(REQUIRED_FIELDS) == set(ENTRY_KINDS)
 
 
 def test_offsets_are_dense_from_zero(tmp_path: Path) -> None:

@@ -71,6 +71,46 @@ A workload shaped `model → write → model(reads the write's result)` therefor
 all from speculating past the write. That is by design, not a gap, and the benchmark reports
 what fraction of each workload has that shape instead of quietly excluding it.
 
+## A drafter cannot use the result of the call it was just asked about
+
+The drafter is consulted immediately after a `tool_use` block finishes parsing. At that instant
+the call in that block has only been *issued* — its task is created and the drafter is asked
+before it has had a chance to run — so the drafter's view of prior results never includes the
+one belonging to the block it is predicting from.
+
+That halves the reach of the data-flow idea SpecuNode borrows from PASTE. An argument the
+previous call *returns* is not available for filling the next call; the earliest usable result
+comes from a block at least two back. In practice a prediction can chain off block *j-1*'s
+result while standing at block *j*, and nothing shorter.
+
+It is a structural property of early issue rather than a tuning problem. Waiting for the read
+before asking the drafter would serialise the exact thing early issue exists to overlap, and
+would make the predictor's latency a function of the tool's. `tests/integration/test_t1_end_to_end.py`
+is shaped around it, with a three-call turn rather than a two-call one.
+
+## A tool call that opens its own model turn cannot be speculated past, and most of them do
+
+The drafter's history is the calls *within the current turn*. A turn that emits exactly one
+tool call therefore offers nothing to predict from — there is no block *j+1* to guess, and the
+next call belongs to a turn that has not started.
+
+This is not a corner case. It is 1.0000 of the tool calls in the offline corpus, and it is why
+the measured speculable span past a write is 0.0000 there. Two of the three sample apps have
+that shape deliberately, so the test suite keeps resembling the thing it is a model of.
+
+## Two of the three sample apps route around speculation entirely
+
+`support_agent` and `research_agent` call the model directly and then issue each tool
+themselves. That is a supported pattern — Demo 1 uses it — but tier-0 early issue and the
+drafters live inside the turn the *runtime* drives, reached through `session.call_turn`. On a
+node that calls `session.model.complete` and then `session.call_tool`, no drafter is ever
+consulted and no read is issued early.
+
+Nothing warns about this. The run is correct, journaled, replayable and equivalent; it is
+simply sequential. `ops_agent` is the one sample app that hands its turn over, and the
+equivalence test asserts the distinction per workload so that "tier 1 declined" and "tier 1 was
+never asked" cannot be confused for one another.
+
 ## Under-declared `forward_keys` silently defeats one hazard check
 
 `forward_keys` is how the runtime knows that a read touches something a staged write touches.

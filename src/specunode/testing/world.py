@@ -681,7 +681,12 @@ def standard_world() -> World:
     for index in range(1, 6):
         world.seed("customers", f"cus-{index}", name=f"Customer {index}", balance=100.0, plan="pro")
     for index, status in enumerate(["running", "failed", "queued", "failed"], start=1):
-        world.seed("jobs", f"etl-{index}", status=status, restarts=0, reserved=0)
+        # ``job_id`` is part of the row, as a status endpoint's response normally is. It is
+        # what lets a predicted ``restart_job`` fill its argument from the status read that
+        # preceded it, which is the data-flow chain the tier-1 drafter exists to follow.
+        world.seed(
+            "jobs", f"etl-{index}", job_id=f"etl-{index}", status=status, restarts=0, reserved=0
+        )
     for section, text in [
         ("restart", "Restart the job, then confirm the status flips to running."),
         ("escalate", "Page the on-call engineer if two restarts fail."),

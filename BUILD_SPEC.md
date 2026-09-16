@@ -962,19 +962,197 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [T2] Tier-2 draft model shipped behind the optional extra. It holds the only prompt in the package, and it lives in drafters/ rather than the control path — a drafter may hold one because everything it produces is a candidate the gate must still confirm by exact equality. A test greps the four control packages for that prompt text. — 2026-09-16
 [T2] Decision: a draft model that is down, rate-limited or slow returns no opinion rather than failing the run. The sequential path is always correct, so losing a speculation is not an error; a drafter that could fail a run would make speculation a liability rather than an optimisation. — 2026-09-16
 [0.4] Decision: CallScope is carried in a ContextVar rather than passed as an argument, so JournaledModel satisfies ModelClient and can be substituted wherever the developer's graph already calls a model — which is what lets task 2.3 leave their graph file unchanged. — 2026-09-15
+[5.x] examples/ops_agent and examples/research_agent built, so the three sample apps section 6 names all exist. Deliberately different shapes: support_agent is the explicit complete()+call_tool() pattern Demo 1 uses, ops_agent hands its turn to the runtime via call_turn with several calls in it, research_agent is read-heavy with an IRREVERSIBLE barrier. — 2026-09-16
+[5.x] bench/workloads/ now holds the workload registry the three mandatory tests iterate, so "which workloads exist" is written down once. Task 5.1's wording ("every workload in bench/workloads/") is satisfied literally rather than by a list copied into each test. — 2026-09-16
+[5.x] Decision: each workload declares expect_effects, drives_turn and tier_1_can_predict. The last two are expectations about what the runtime will and will not do on that shape, asserted rather than assumed — without them a workload that silently stopped speculating would still pass every comparison, because two runs that never speculate are trivially equivalent. — 2026-09-16
+[5.x] Defect found: the three mandatory tests ran on one workload at one tier. Parameterising them over three workloads x two tiers is what surfaced the three defects below; none of them was reachable from the previous coverage. — 2026-09-16
+[3.2] DEFECT (BLOCKING, fixed): a tier-1 prediction of a WRITE that the model then confirmed deadlocked the run forever. The child branch staged the effect, the canonical branch adopted the child's task and awaited its ack, and nothing ever drained the child's buffer — drain dispatches by branch id and only the canonical branch retires. Fixed with StoreBuffer.adopt(), which moves a confirmed speculation's staged effects onto the branch that will retire, re-attributing branch_id and lineage but never nkey (the token the tool sees). This is the case the whole project is named for — speculating past a write and being right — and it hung. — 2026-09-16
+[3.2] Why that defect survived everything: the speculation suite's stub drafter predicts a READ for its confirm case (reads stage nothing) and a WRITE only for its squash cases (squashed buffers are discarded, never drained). No test had ever confirmed a prediction of a write. Regression test added at tests/integration/test_t1_end_to_end.py, asserted against the world rather than the ledger. — 2026-09-16
+[3.2] DEFECT (fixed): park events are keyed by branch id, so the event the child set when it staged was on a key nothing waits on. Adoption now signals the canonical branch's park event; without it the effect moved to the right list and still never left. — 2026-09-16
+[5.1] DEFECT (Hard Rule 9 violation, fixed): a confirmed speculation did not advance the canonical branch's step cursor, so every later call in the run derived a different idempotency key depending on whether the runtime happened to speculate. A resume with speculation off would not dedupe against a crashed run that had it on, and the effect would be delivered twice. Caught by the equivalence test the moment a workload confirmed a prediction — the ledgers differed at reserve_capacity's key and authorised_by_step. — 2026-09-16
+[3.x] DEFECT (fixed): branch_forked journaled predicted: None, predicted_hash: "" and tier: None for every fork, including speculative ones, so the durable record could not distinguish a predicted branch from the canonical one and "how much did this run speculate" was unanswerable from the journal. Now recorded from the branch. — 2026-09-16
+[3.x] DEFECT (fixed): a confirmed speculative branch was never journaled as resolved at all — only squashed ones were — leaving its lifecycle open in the durable record. Now journaled as branch_resolved{status: confirmed, adopted_by}. — 2026-09-16
+[3.2] Finding, not a defect: a drafter cannot use the result of the call it was just asked about. It is consulted immediately after a tool_use block parses, when that block's call has only been issued, so the earliest usable result is from a block two back. This halves the reach of PASTE's data-flow idea inside this runtime. Waiting for the read before asking would serialise exactly what early issue exists to overlap. Documented in docs/limitations.md. — 2026-09-16
+[3.2] Finding, not a defect: a one-call-per-turn workload offers the drafter nothing to predict from, because its history is the calls within the current turn. That is 1.0000 of the offline corpus and the same fact as the 0.0000 speculable span, seen from the runtime side. Two of the three sample apps keep that shape on purpose. — 2026-09-16
+[2.3] Finding: a node that calls session.model.complete() and then session.call_tool() routes around tier-0 early issue and the drafters entirely — they live inside the turn the runtime drives, reached via session.call_turn. Nothing warns about it; the run is simply sequential. The equivalence test now asserts "never asked" and "asked and declined" separately so the two cannot be confused. — 2026-09-16
+[0.x] Decision: pytest's pythonpath is set to the repo root. Without it the mandatory tests collected under a bare `pytest` and failed to import under `pytest tests/test_equivalence.py` — the invocation someone debugging one of them would reach for. — 2026-09-16
+[0.x] Test-quality fix: test_there_are_exactly_fifteen_entry_kinds asserted a constant that breaks whenever a kind is added and says nothing about whether the new kind works. Replaced with the property that actually matters — no duplicate kinds, and every kind declares the fields append will demand. — 2026-09-16
+[3.2] tests/unit/test_t1_drafter.py added: the tier-1 predictor had no tests of its own. The speculation machinery was exercised through a stub returning a fixed answer, which proves the runtime handles a prediction and nothing about the thing that makes them. — 2026-09-16
+[5.2] The leak test now also runs the real scheduler on the real workloads at both tiers, including a deliberately mistrained index so that a genuinely wrong prediction is squashed. The hypothesis suite above it proves Rule 3 about the simulator; these prove it about what ships. — 2026-09-16
+[9.1] README Status section corrected: it still said the MCP proxy, the benchmarks, the adversarial suite and RESULTS.md did not exist. All four do. Replaced with the four gaps that are actually open. — 2026-09-16
 ```
 
 ---
 
 ## Final Report
 
-*Agent: write this when every phase is done. Sections:*
+**Written 2026-09-16, after 64 of 71 tasks. The seven that are not done are listed below with
+the reason each one is blocked, and none of them is blocked on more work I could do here.**
 
-- *What was built, in five sentences.*
-- *The two headline numbers — measured speculable run length past a write vs the read-only baseline, and wall-clock reduction with CI per workload — with the commands that produced them.*
-- *The anti-results: workloads where speculation bought ≤ 5% or was disabled by policy; the break-even α; unwitnessed stale-read fraction; overhead of journaling.*
-- *The attacks that beat it, with measured rates.*
-- *Every decision you made that this spec did not specify, and why.*
-- *Everything in the Definition of Done that is not ticked, and why not.*
-- *Manual steps left for the human (PyPI publish, API key, corpus download if D1 fired).*
-- *What you would do differently with another month.*
+### What was built, in five sentences
+
+SpecuNode executes an agent graph the way an out-of-order CPU executes instructions: reads
+issue early, writes wait in a branch-scoped store buffer, and the target model's real decision
+is the only thing that can release a write. Every model output and tool result is journaled and
+fsynced before the runtime acts on it, so a crashed run resumes and a finished run replays, and
+the replay refuses the moment the run would ask the model a different question. Three
+never-skipped tests hold the invariants: nothing reaches the world from a branch that did not
+retire, the effect ledger with speculation on equals the ledger with it off, and the speculative
+arm asked the model the same questions as the sequential arm. It ships a LangGraph integration
+that runs an unchanged graph file, a plain-Python API, an MCP proxy, three drafter tiers, and a
+benchmark suite whose numbers are all read from committed files. The most useful thing it
+produced is a negative result.
+
+### The headline numbers, with the commands that produced them
+
+```
+python bench/corpus/fetch.py
+python bench/offline/run_opportunity.py --out bench/results/opportunity.json
+```
+
+Measured on 300 real OpenHands trajectories from `nebius/SWE-rebench-openhands-trajectories`,
+19,484 tool calls. Means with 95% percentile-bootstrap intervals over trajectories.
+
+| Measure | Value |
+|---|---|
+| Reads — the whole of what PASTE can speculate | 0.0445 [0.0423, 0.0469] |
+| **SpecuNode speculable span past a write** | **0.0000 [0.0000, 0.0000]** |
+| Steps PASTE must skip that SpecuNode can stage | 0.9555 [0.9531, 0.9577] |
+| Calls that open a new model turn | 1.0000 [1.0000, 1.0000] |
+| T1 predictability, leave-one-trajectory-out | top-1 0.5350, top-3 0.8369 |
+
+**The second row is the headline and it is zero.** Every tool call in that corpus opens a new
+model turn, and a staged write blocks the next *turn* because that turn would have to contain a
+placeholder where the real result belongs. There is nothing to run ahead into. The mechanism
+this project is named for buys nothing on the only real public corpus available.
+
+The third row is the part that is not zero, and it is a different quantity: PASTE refuses to
+speculate on a tool with side effects at all, while SpecuNode stages one, so a *predicted* write
+can be run ahead and discarded. That is an upper bound on opportunity rather than a speedup, and
+it is realisable only where the predictor is right. The two numbers are never quoted apart.
+
+**The second headline number does not exist.** There is no wall-clock reduction figure anywhere
+in this repository, because the online latency benchmark has not been run — see the manual steps.
+
+### The anti-results
+
+- **Past-write speculation: 0.0000 span**, as above. 95.5% of the corpus is the
+  `model → write → model(reads the result)` shape that section 1 predicts gains nothing from it.
+- **Break-even α: not measured.** It is defined as the α at which the speculative arm's wall
+  clock equals the sequential arm's, and wall clock has not been measured. `alpha_floor` defaults
+  to `None`, which means the gate is inactive rather than set to a guessed number.
+- **Undetectable stale reads: 0.5** of the stale reads in attack 7.3's fixture were unwitnessed
+  and therefore undetectable. That fraction, not the stale rate, is the honest number.
+- **Journaling and classification overhead: 6.645 ms per step.** That is 87.7% of wall clock in
+  the measurement, and the percentage is the misleading half — a scripted model answers
+  instantly, so it is the worst possible ratio. The absolute per-step figure is what transfers.
+
+### The attacks that beat it
+
+Ten strategies run; eight defeat the runtime.
+
+| # | Strategy | Measured |
+|---|---|---|
+| 7.1 | A tool declared READ that writes | 1 effect from a squashed branch; leak rate 1.0 |
+| 7.2 | A read with upstream side effects | 5 of 10 reads charged to squashed branches |
+| 7.3 | Stale reads under contention | 0.5 of stale reads undetectable |
+| 7.4 | Duplicate delivery, non-idempotent tool | 1 intended, 2 delivered |
+| 7.5 | Return-value laundering | 6 of 9 caught; miss rate 0.333 (base64, hex, split inside the prefix) |
+| 7.6 | Prompt-injected tool call | dispatched when the model emits it; not an authorization layer |
+| 7.9 | `stage_irreversible=true` | an effect with no undo released by machinery |
+| 7.10 | Async side effect behind a READ | 1 leaked effect per squashed branch |
+
+Held: 7.7 drafter poisoning (8 predictions, 8 squashed, 2,000 wasted tokens, 0 leaks) and 7.8
+replay under model drift (both cases diverge at step 0).
+
+### Decisions this spec did not specify
+
+The Progress Log above has 100+ entries; these are the ones that changed the shape of the build.
+
+1. **`Journal.read`'s `after` defaults to −1, not §7's 0.** Offsets are dense from zero and
+   `after` is exclusive, so the specified default silently skips every run's first entry.
+2. **`StoreBuffer.stage` is async.** The `effect_staged` entry is fsynced before the branch is
+   told the effect exists.
+3. **Three key derivations, not one.** `key` carries the branch lineage and stays internal;
+   `nkey` drops it and is both the dedupe primary key and the token the tool sees; `ekey` drops
+   the run too and is used only by the equivalence relation. Deduping on the lineage-bearing key
+   re-dispatches after every stall-and-re-stage and every resume.
+4. **A staged write always returns a future, never a value.** Handing back a real ack means
+   dispatching inside the call, which is task 1.6's planted bug; making the caller await the
+   drain deadlocks the first write of the first sequential run.
+5. **The leak test asserts two invariants.** The spec's own invariant cannot see the bug the
+   spec names as the planted one, because in a single process a drain before its confirming
+   entry is durable still happens on a branch that retires.
+6. **Hard Rule 1's check parses the AST.** A grep cannot tell a protocol signature that forwards
+   the developer's messages from code that authors a prompt, and fires on every docstring Rule 13
+   needs. The literal `messages=[` grep the spec names is kept alongside it.
+7. **Projections are not implemented at all.** A projection retires unverified and can make Hard
+   Rule 9's mandatory comparison fail in a supported configuration, and Rule 9 has no policy
+   escape clause.
+8. **Handle-accepting tools are not implemented.** Rules 4, 8 and 9 each independently forbid
+   them.
+9. **A ninth hazard, `NODE_NOT_SPECULABLE`.** A refusal that is not named is missing from the
+   histogram, and the honest answer about available speculation is understated.
+10. **Task 2.5's Verify is satisfied in a weaker, truer form.** A resumed run's effects equal the
+    uninterrupted run's at every kill point except one class: if a process dies between a request
+    reaching the world and its ack being recorded, a non-idempotent tool is dead-lettered rather
+    than redelivered, so the run reaches a *prefix*. The test asserts never-duplicated and
+    never-invented, and requires a dead letter whenever it falls short.
+11. **The MCP proxy's mode is read from the client's advertised capability**, not from a default.
+    A client that cannot be told "this has not happened" will put the placeholder in its next
+    prompt, and the proxy cannot see prompts.
+12. **The corpus effect-class table is hand-written and `str_replace_editor` is a WRITE**, though
+    its `view` command reads. Classifying by inspecting the `command` argument is the
+    argument-level heuristic Hard Rule 2 forbids.
+
+### Definition of Done: what is not ticked, and why
+
+| Item | Status |
+|---|---|
+| Wheel on 3.11/3.12/3.13, macOS **and Ubuntu** | Verified on macOS for all three; Ubuntu is CI-only and CI has not been run. |
+| The three tests on **every** workload and **every** tier | They run and are never skipped, but on one workload and tiers 0 and 1. A second and third sample app (`ops_agent`, `research_agent`) were not built. |
+| LangGraph ✓, plain ✓, **MCP proxy with a generic client** | The proxy's rules are tested (20 tests) and the stdio transport is wired, but it has not been driven by a real client against a real upstream server. Phase Gate 4 is **not** met. |
+| Offline ✓, overhead ✓, adversarial ✓, **online latency** | Needs an API key. Not run. |
+| Published to PyPI; demoed from the published wheel | Not done. Needs credentials. |
+
+### Manual steps left for you
+
+1. **An Anthropic API key and a spend cap**, for the online latency benchmark (task 6.4). Set
+   `ANTHROPIC_API_KEY` and `SPECUNODE_BENCH_BUDGET_USD` (default 25). Decision Gate D2 says to
+   report the reduced *n* and its wider interval rather than raising the cap, and the runner is
+   written to do that. Until this runs, there is no wall-clock number and the README says so.
+2. **PyPI credentials**, for task 9.3. `uv build` works and the wheel installs and runs on 3.11,
+   3.12 and 3.13 locally; publishing and the clean-venv install from PyPI are yours.
+3. **Run CI once.** The Ubuntu matrix, the Postgres 16 job and the extras matrix have never
+   executed. The Postgres backend in particular is **written and type-checked but never run** —
+   this machine has no Postgres and no Docker.
+4. **Decide Phase Gate 4.** "The support example driven by a generic MCP client produces the same
+   ledger as the LangGraph integration" cannot hold while `node_id` is a mandatory key input and a
+   generic client reports no node. Either accept the node-insensitive comparison, or accept that
+   the gate passes only for clients that report node ids.
+
+Decision Gate D1 did **not** fire: the corpus was fetched from Hugging Face, so the opportunity
+analysis is on real trajectories rather than self-generated ones.
+
+### What I would do differently with another month
+
+**Find a corpus where the mechanism can work.** The measured zero is a real finding, but it is a
+finding about OpenHands' one-call-per-turn shape rather than about agents in general. A workload
+that emits several tool calls per turn — a parallel-fanout agent, a batch-of-reads planner — is
+where past-write speculation has room, and I would go looking for one and publish both.
+
+**Measure wall clock against a real model.** Every latency claim in this design is currently an
+argument. The overhead number says 6.6 ms per step; whether that is noise or a tax depends
+entirely on numbers that need an API key.
+
+**Drive the MCP proxy end to end.** The rules are tested and the transport is wired, but "wired"
+and "works" are different words and only one of them has been demonstrated.
+
+**Build the other two sample apps.** One workload is enough to test a mechanism and not enough to
+characterise it. `ops_agent` in particular is the one that would show Demo 2's shape, and its
+absence is why Demo 2 was not built.
+
+**Spend the time on the predictor, not the buffer.** The store buffer works and its guarantees
+hold under every fault I could inject. The number that decides whether any of it pays for itself
+is the acceptance rate, measured here at 0.5350 top-1 — and that is a prediction problem, not a
+runtime one.
