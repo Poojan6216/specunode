@@ -447,13 +447,17 @@ class CallScope:
     scribble on another's scope (Hard Rule 6).
     """
 
-    run_id: str
+    run_id: str = ""
     branch_id: str = ""
     lineage: tuple[str, ...] = ()
     step: int = 0
     node_id: str = ""
     speculative: bool = False
     tier: int | None = None
+    #: The idempotency key of the effect being dispatched, when one is. The fake world
+    #: records it, so a duplicate delivery is attributable to a key rather than only to a
+    #: branch.
+    effect_key: str = ""
     #: Hard Rule 13: the branch records (step, request_hash) for every target request it
     #: sends, and retirement rebuilds each one from the canonical context and compares.
     record_prompt: Callable[[int, str], None] | None = None

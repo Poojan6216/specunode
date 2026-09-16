@@ -24,23 +24,39 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Literal
 
+from specunode.buffer.dispatcher import ToolDispatchError
+
 __all__ = ["Faults", "Partitioned", "Timeout", "WorldFault"]
 
 
-class WorldFault(Exception):
-    """Base class for an injected upstream failure."""
+class WorldFault(ToolDispatchError):
+    """An injected upstream failure, spoken in the dispatcher's own vocabulary.
+
+    A subclass of :class:`~specunode.buffer.dispatcher.ToolDispatchError` rather than a
+    parallel hierarchy, because the fake world plays the part of a tool adapter and the
+    adapter contract is where ``sent`` is defined. A fault that did not carry ``sent`` would
+    be classified "maybe" by default, and every partition would be treated as ambiguous --
+    which would make the crash-window tests pass for the wrong reason.
+    """
 
 
 class Partitioned(WorldFault):
-    """The upstream is unreachable. Retryable: the dispatcher should back off."""
+    """The upstream is unreachable: nothing left this process, so a retry is not a duplicate."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, sent="no", retriable=True)
 
 
 class Timeout(WorldFault):
     """The upstream did not answer in time.
 
-    Retryable, and ambiguous by nature: the call may or may not have taken effect upstream.
-    That ambiguity is exactly why dispatch is at-least-once with idempotent dedupe.
+    Ambiguous by nature: the call may or may not have taken effect. That ambiguity is exactly
+    why dispatch is at-least-once with deterministic idempotency keys rather than something
+    stronger, and it is the boundary no amount of bookkeeping removes.
     """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, sent="maybe", retriable=True)
 
 
 @dataclass

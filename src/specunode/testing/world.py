@@ -32,13 +32,13 @@ import os
 import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Literal, TextIO
 
 from specunode.canonical import JsonValue, canonical, chash
+from specunode.core.model import CallScope, call_scope
 from specunode.testing.faults import Faults
 
 __all__ = [
@@ -48,7 +48,7 @@ __all__ = [
     "TrueEffect",
     "World",
     "WorldTool",
-    "call_context",
+    "call_scope",
     "current_call_context",
 ]
 
@@ -91,37 +91,30 @@ class ReadHit:
     speculative: bool
 
 
-@dataclass(frozen=True, slots=True)
-class CallContext:
-    """Who is calling. Set by the runtime around every tool invocation."""
+#: The world reads the *runtime's* call scope rather than keeping its own. One attribution
+#: channel means the dispatcher and the instrument cannot disagree about which branch issued a
+#: call -- and that attribution is the entire quantity the leak test is built on. A ContextVar
+#: because the tool signature belongs to the developer, not to us, and because each asyncio
+#: task gets its own copy, so one branch cannot scribble on another's (Hard Rule 6).
+CallContext = CallScope
 
-    branch_id: str
-    effect_key: str
-    speculative: bool
-
-
-#: The world's attribution channel. A ContextVar rather than an argument because the tool
-#: signature belongs to the developer, not to us; and because each asyncio task -- each
-#: branch -- gets its own copy automatically, so one branch cannot scribble on another's
-#: attribution (Hard Rule 6).
-call_context: ContextVar[CallContext | None] = ContextVar("specunode_call_context", default=None)
-
-#: Attributed to this when a tool is called outside the runtime, e.g. by a test doing setup
-#: or by the "other actor" that mutates rows under attack 7.3.
-EXTERNAL = CallContext(branch_id="<external>", effect_key="", speculative=False)
+#: What a call made outside any run is attributed to: test setup, or the competing writer of
+#: attack 7.3. It must never look like a branch, or seeding a fixture would read as a leak.
+EXTERNAL = CallScope(branch_id="<external>")
 
 
-def current_call_context() -> CallContext:
-    return call_context.get() or EXTERNAL
+def current_call_context() -> CallScope:
+    scope = call_scope.get()
+    return scope if scope is not None and scope.branch_id else EXTERNAL
 
 
 @contextmanager
-def _bound(context: CallContext) -> Iterator[None]:
-    token = call_context.set(context)
+def _bound(context: CallScope) -> Iterator[None]:
+    token = call_scope.set(context)
     try:
         yield
     finally:
-        call_context.reset(token)
+        call_scope.reset(token)
 
 
 @dataclass(frozen=True)
@@ -339,7 +332,9 @@ class World:
         self, *, branch_id: str, effect_key: str = "", speculative: bool = False
     ) -> AbstractContextManager[None]:
         """Attribute every world call inside this block to ``branch_id``."""
-        return _bound(CallContext(branch_id, effect_key, speculative))
+        return _bound(
+            CallScope(branch_id=branch_id, effect_key=effect_key, speculative=speculative)
+        )
 
     # -- the single funnel every state change passes through -----------------------------
 
