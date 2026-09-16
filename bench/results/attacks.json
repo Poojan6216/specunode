@@ -1,0 +1,100 @@
+{
+  "attacks": [
+    {
+      "claim": "defeats the store buffer completely; the runtime cannot detect it and does not try",
+      "defeated_runtime": true,
+      "error": null,
+      "id": "7.1",
+      "measured": {
+        "effects_from_squashed_branch": 1,
+        "leak_rate": 1.0
+      },
+      "name": "misdeclared tool (READ that writes)"
+    },
+    {
+      "claim": "speculative reads reach upstream from branches that never retire; counted, never hidden",
+      "defeated_runtime": true,
+      "error": null,
+      "id": "7.2",
+      "measured": {
+        "reads_from_squashed_branches": 5,
+        "reads_issued": 10
+      },
+      "name": "read with upstream side effects"
+    },
+    {
+      "claim": "a read without a witness cannot be checked; that fraction is the honest number",
+      "defeated_runtime": true,
+      "error": null,
+      "id": "7.3",
+      "measured": {
+        "detected_stale": 1,
+        "reads": 2,
+        "undetectable_fraction": 0.5,
+        "unwitnessed_and_therefore_undetectable": 1
+      },
+      "name": "stale reads under contention"
+    },
+    {
+      "claim": "dedupe protects the dispatcher's retries, not the network beyond it",
+      "defeated_runtime": true,
+      "error": null,
+      "id": "7.4",
+      "measured": {
+        "delivered": 2,
+        "duplicates": 1,
+        "intended": 1
+      },
+      "name": "duplicate delivery of a non-idempotent tool"
+    },
+    {
+      "claim": "a handle transformed inside a string can evade the scan; encodings are not caught",
+      "defeated_runtime": true,
+      "error": null,
+      "id": "7.5",
+      "measured": {
+        "cases": 9,
+        "caught": 6,
+        "miss_rate": 0.333,
+        "missed": 3,
+        "missed_cases": "L6 base64-encoded, L7 hex-encoded, L9 split inside the prefix"
+      },
+      "name": "return-value laundering"
+    },
+    {
+      "claim": "not an authorization layer: a call the model actually emits is dispatched",
+      "defeated_runtime": true,
+      "error": null,
+      "id": "7.6",
+      "measured": {
+        "dispatched_when_only_the_drafter_predicted_it": 0,
+        "dispatched_when_the_model_emitted_it": 1
+      },
+      "name": "prompt-injected tool call"
+    },
+    {
+      "claim": "off by default; with it on, an effect with no undo is released by machinery",
+      "defeated_runtime": true,
+      "error": null,
+      "id": "7.9",
+      "measured": {
+        "barrier_by_default": 1,
+        "staged_when_enabled": 1
+      },
+      "name": "staging an irreversible effect"
+    },
+    {
+      "claim": "a tool that enqueues, schedules or triggers work is a WRITE whatever its verb says",
+      "defeated_runtime": true,
+      "error": null,
+      "id": "7.10",
+      "measured": {
+        "effects_landing_after_the_squash": 1,
+        "leaked_effects_per_squashed_branch": 1,
+        "mutations_at_squash_time": 0,
+        "synchronous_response_looks_like_a_read": 1
+      },
+      "name": "asynchronous side effect behind a READ"
+    }
+  ]
+}

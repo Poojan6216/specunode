@@ -99,8 +99,16 @@ report how much of each workload has that shape.
 
 ## What beats it
 
-These are measured, not argued away. Each is a real hole, and
-[`docs/limitations.md`](docs/limitations.md) explains what it costs.
+Eight strategies, all of which work, with measured rates. This section is generated from
+`bench/adversarial/run_attacks.py` rather than written from memory, and a test fails the build
+if any of them stops defeating the runtime — either a hole was genuinely closed and this list
+should shrink, or the attack stopped exercising what it claims to, and both need looking at.
+
+```
+python bench/adversarial/run_attacks.py --all
+```
+
+[`docs/limitations.md`](docs/limitations.md) explains what each one costs.
 
 - **A tool declared `READ` that writes** defeats the store buffer completely. The effect class is
   your word and nothing checks it.

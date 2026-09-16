@@ -58,9 +58,14 @@ effect, but the scan is what decides.
 | nested inside arrays or objects at any depth | yes |
 | used as an object *key* | yes |
 | prefix case-mangled | yes |
+| split across two arguments *after* the prefix | yes |
 | base64-encoded | **no** |
 | hex- or percent-encoded | **no** |
-| split across two arguments and rejoined | **no** |
+| split across two arguments *inside* the prefix | **no** |
+
+These verdicts are not written from memory. `bench/adversarial/run_attacks.py` runs every case
+and reports the measured miss rate; the table above and that output are checked against each
+other.
 
 A prefix that resolves to no staged effect in this branch's lineage is **still** a hazard. A
 sibling's handle appearing here would be a Hard Rule 6 violation, and swallowing it would hide
