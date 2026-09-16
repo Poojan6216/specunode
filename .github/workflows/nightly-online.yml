@@ -1,0 +1,57 @@
+name: nightly-online
+
+# The online latency benchmark calls a real target model and therefore costs money.
+# It runs only when ANTHROPIC_API_KEY is configured, and halts at the spend cap
+# (SPECUNODE_BENCH_BUDGET_USD, default 25). Decision Gate D2: if the cap is hit before
+# 30 tasks per app, the report records the reduced n and its wider CI. The cap is never
+# raised silently.
+on:
+  schedule: [{ cron: "0 5 * * 0" }]
+  workflow_dispatch:
+    inputs:
+      budget_usd:
+        description: "Spend cap in USD for this run"
+        default: "25"
+
+jobs:
+  online:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    environment: bench
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      SPECUNODE_BENCH_BUDGET_USD: ${{ inputs.budget_usd || '25' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: skip if no key is configured
+        id: gate
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "no ANTHROPIC_API_KEY configured; the online bench cannot run" >> "$GITHUB_STEP_SUMMARY"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: astral-sh/setup-uv@v5
+        if: steps.gate.outputs.run == 'true'
+        with:
+          enable-cache: true
+      - run: uv python install 3.11
+        if: steps.gate.outputs.run == 'true'
+      - run: uv sync --all-extras --dev
+        if: steps.gate.outputs.run == 'true'
+      - name: online latency bench, budget-capped
+        if: steps.gate.outputs.run == 'true'
+        run: uv run python bench/online/run_latency.py --out bench/results/latency.json
+      - name: regenerate RESULTS.md
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          uv run python bench/report.py
+          uv run python bench/check_numbers.py
+      - uses: actions/upload-artifact@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          name: online-results
+          path: |
+            bench/results/latency.json
+            RESULTS.md

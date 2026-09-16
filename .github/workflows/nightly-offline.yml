@@ -1,0 +1,41 @@
+name: nightly-offline
+
+# The offline benchmark: no model API calls, so it is safe to run unattended.
+# Produces bench/results/opportunity.json, chaos.json, concurrency.json, attacks.json.
+on:
+  schedule: [{ cron: "0 4 * * *" }]
+  workflow_dispatch:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.11
+      - run: uv sync --all-extras --dev
+      - name: corpus (cached; falls back to self-generated traces per Decision Gate D1)
+        run: uv run python bench/corpus/fetch.py --verify-manifest
+      - name: opportunity analysis
+        run: uv run python bench/offline/run_opportunity.py --out bench/results/opportunity.json
+      - name: chaos matrix
+        run: uv run python bench/chaos/run_chaos.py --out bench/results/chaos.json
+      - name: concurrency
+        run: uv run python bench/chaos/run_chaos.py --concurrency --out bench/results/concurrency.json
+      - name: adversarial suite
+        run: uv run python bench/adversarial/run_attacks.py --all --out bench/results/attacks.json
+      - name: overhead
+        run: uv run python bench/offline/run_opportunity.py --overhead --out bench/results/overhead.json
+      - name: regenerate RESULTS.md and check README traceability
+        run: |
+          uv run python bench/report.py
+          uv run python bench/check_numbers.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: offline-results
+          path: |
+            bench/results/*.json
+            RESULTS.md

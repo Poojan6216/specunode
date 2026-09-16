@@ -1,0 +1,131 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Hard Rule 11: the runtime makes no network calls the developer did not configure.
+  # CI never has a model API key; every test here runs offline against ScriptedModel/ReplayModel.
+  SPECUNODE_OFFLINE: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.11
+      - run: uv sync --all-extras --dev
+      - name: ruff check
+        run: uv run ruff check src tests bench examples
+      - name: ruff format --check
+        run: uv run ruff format --check src tests bench examples
+      - name: mypy --strict
+        run: uv run mypy
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --all-extras --dev --python ${{ matrix.python }}
+      - name: pytest
+        # -p no:randomly keeps hypothesis/pytest ordering stable across the matrix.
+        run: uv run --python ${{ matrix.python }} pytest -q --timeout=600
+      - name: the three mandatory invariant tests, run explicitly and never skipped
+        # Hard Rules 3, 9 and 13. --runxfail turns a planted xfail marker into a failure,
+        # so these cannot be quietly disabled. -W error::pytest.PytestUnraisableExceptionWarning
+        # catches a leak that only shows up at GC time.
+        run: |
+          uv run --python ${{ matrix.python }} pytest -q --runxfail \
+            tests/test_leak.py \
+            tests/test_equivalence.py \
+            tests/test_context_equivalence.py
+      - name: assert none of the three was skipped
+        run: |
+          uv run --python ${{ matrix.python }} pytest -q --runxfail -rs \
+            tests/test_leak.py tests/test_equivalence.py tests/test_context_equivalence.py \
+            2>&1 | tee /tmp/invariants.txt
+          if grep -qiE '\b(skipped|xfailed|deselected)\b' /tmp/invariants.txt; then
+            echo "::error::a mandatory invariant test was skipped, xfailed or deselected"
+            exit 1
+          fi
+
+  honesty:
+    # Hard Rule 12: no number that was not measured; no absolute claim without its condition.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.11
+      - run: uv sync --all-extras --dev
+      - name: vocabulary check
+        run: uv run pytest -q tests/test_vocabulary.py
+      - name: no LLM in the control path
+        run: uv run pytest -q tests/test_no_llm_in_control_path.py
+      - name: every number in the README traces to a committed results file
+        run: uv run pytest -q tests/test_numbers_traceable.py
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: specunode
+          POSTGRES_USER: specunode
+          POSTGRES_DB: specunode
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      SPECUNODE_TEST_POSTGRES_DSN: postgresql://specunode:specunode@localhost:5432/specunode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.11
+      - run: uv sync --all-extras --dev
+      - name: the same suite, on the Postgres journal
+        run: uv run pytest -q -m postgres
+
+  wheel:
+    # Phase Gate 0 and task 9.3: the wheel must install and run on a clean interpreter.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install ${{ matrix.python }}
+      - run: uv build
+      - name: install the built wheel into a clean venv and run the CLI
+        shell: bash
+        run: |
+          uv venv --python ${{ matrix.python }} /tmp/clean
+          uv pip install --python /tmp/clean dist/*.whl
+          /tmp/clean/bin/specunode --version

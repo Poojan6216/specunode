@@ -1,0 +1,864 @@
+# BUILD SPEC — SpecuNode
+### Agents wait for the world one tool call at a time. SpecuNode lets an agent graph run ahead of its own model — reads execute early, writes wait in a store buffer, and nothing reaches the world until the model has actually decided it. Every effect that leaves the runtime traces to a committed decision, and the whole run replays.
+
+---
+
+## HOW TO USE THIS FILE (read first, agent)
+
+You are building this project end to end. Work through the phases in order. Do not skip ahead, do not ask which phase to start with, do not stop to ask for approval between tasks.
+
+**Your working loop:**
+
+1. Read the phase you're on. Read every task in it.
+2. Implement each task in order.
+3. After each task, run its **Verify** step. If it fails, fix it before moving on.
+4. Tick the checkbox in the task list and append one line to the **Progress Log** at the bottom of this file.
+5. When a phase's **Phase Gate** passes, move to the next phase.
+6. When all phases are done, write the **Final Report** section and stop.
+
+**Rules for the whole build:**
+
+- Do not ask for permission to continue. Keep going until every phase is complete.
+- If a decision isn't specified here, pick the simplest option that satisfies the Hard Rules, and log the decision in the Progress Log. Don't stall on it.
+- If you get genuinely blocked (an API key is missing, a model won't download, a public trace corpus is gone), write the blocker in the Progress Log, implement the closest working alternative that still satisfies the Hard Rules, and continue. Don't halt the whole build over one task.
+- Commit after each completed task. Conventional Commits.
+- Every phase must leave the package in a working, installable state. Never end a phase with a broken build.
+- **Numbers in this file that come from published research are marked `[cited]`. Never invent a number. Any figure that appears in the README or `RESULTS.md` must come from a run you actually executed, and the command that produced it must be in the repo.** The proposal this spec was derived from contained latency and safety figures that were never measured by anyone. None of them appear here and none may appear in any output.
+- **Correctness claims are held to the same standard as benchmark numbers.** If the README says "no effect from a rejected branch ever reaches the world", there must be a test in the repo that runs a fake world with every mutation tagged by branch, injects faults, and asserts it. If the runtime cannot guarantee a property for a class of tool, the docs say so and the receipt for that run says so.
+
+**Do not build:** a SaaS control plane, a hosted service, accounts, telemetry, a "Pro" tier, a Kubernetes operator, a new agent framework, a new LLM orchestration DSL, a vector database, a model-serving system, a CRDT library, an LLM-based judge that decides whether a speculation "matched", an LLM-based context summariser in the runtime path, or a general workflow engine competing with Temporal. If you find yourself writing a login page, a prompt that asks a model "are these two tool calls the same?", or a merge function that reconciles two speculative branches into one, stop — you've misread the spec.
+
+---
+
+## 1. What this is
+
+An agent graph runs in a strictly serial loop: the model thinks, emits a tool call, waits for the tool, thinks again. For a ten-step task where each step is a two-second model turn and a one-second tool, that is thirty seconds of wall clock, most of it spent waiting on one thing at a time.
+
+Two families of work attack this from opposite ends, and each stops exactly where the other starts.
+
+**Speculative tool execution** (PASTE, Microsoft Research, March 2026 — see §3) predicts the next tool call from patterns in prior trajectories and runs it while the model is still generating. It reports a 48.5% reduction in average task completion time `[cited]`. But it can only speculate on tools that have no side effects. The moment the predicted next call is `create_ticket` or `send_email` or `UPDATE accounts`, speculation stops, because running it on a guess would corrupt the world. In a workload where every third tool call writes something, that is a hard ceiling on how far ahead the agent can run.
+
+**Transactional gating** (SagaLLM, ATP, SCOPEGATE — see §3) treats every model-emitted tool call as an untrusted proposal that a deterministic gate must admit before it takes effect. That makes writes safe. But the gate is a checkpoint on the serial path; it does not let anything run early.
+
+**Durable execution** (Temporal, DBOS, Restate, LangGraph checkpointers) journals every model output and tool result so a crashed run resumes without re-asking the model. That makes replay deterministic. But it has no concept of a tool call that has executed and is not yet admitted.
+
+SpecuNode is the combination, and the combination is the contribution:
+
+> An agent graph is executed the way an out-of-order CPU executes instructions. Reads issue early. Writes go into a **store buffer** keyed to the speculative branch that produced them. The **target model's actual output** is the branch-resolution signal: when it matches the speculation, the branch **retires** and the store buffer drains to the world with deterministic idempotency keys; when it does not, the branch is **squashed** and its buffer is discarded, never dispatched. Every model output and tool result is **journaled** before use, so the run replays exactly, speculation on or off. A **hazard** — a downstream call that depends on the value a staged write would have returned, a tool whose effect class is undeclared, a node that emits free text rather than a structured decision — **stalls** the branch to sequential execution. It never guesses.
+
+**What speculation can and cannot hide.** A staged write returns a placeholder handle, and a placeholder must never appear in a prompt: the sequential run would have shown the model the real tool result, and a model conditioned on a placeholder is making its decision on a different premise. So a staged write is a barrier for the branch's *next model call* (hazard `MODEL_TURN_AFTER_STAGED_WRITE`). What speculation past a write buys is that independent tool calls — reads, and further staged writes — run concurrently with the in-flight target turn and the drain, so their latency is hidden. Model latency itself is hidden only in read-only stretches, where the branch's prompt is byte-identical to the sequential prompt and the branch may run the next model call speculatively. A workload of strict `model → write → model(reads the write's result)` chains gets no wall-clock gain from past-write speculation, by design, and the bench reports how much of each workload is that shape.
+
+The claim is narrower than "agents run 3× faster". The claim is: **speculation is now safe past a write, the runtime can say exactly how much speculation a given workload actually exposes, and the effect log of a speculative run is byte-identical to the effect log of the sequential run.** The benchmark measures all three, including the workloads where speculation buys nothing — those are results too.
+
+**What a "branch" is here.** Not a git branch and not a conditional edge. A branch is a speculative continuation of the graph from a *predicted* decision at step *i*: everything the runtime does on the assumption that the model will decide *ŷᵢ*, before the model has actually produced *yᵢ*. Branches fork state and context copy-on-write, share nothing with siblings, and end in exactly one of retired, squashed, or stalled.
+
+**Who this is for.** A developer with a LangGraph app, a plain-Python agent loop, or an MCP client, whose tools include writes, who wants the latency of running ahead without the exposure of running ahead. They wrap the graph or point their MCP client at the proxy, declare the effect class of each tool (or rely on MCP tool annotations), and get a run that is faster where the workload allows, identical in effect where it does not, and replayable either way.
+
+---
+
+## 2. The promise: three demos
+
+Everything below has to work from the published package. These are acceptance tests, not marketing.
+
+### Demo 1 — speculation without a store buffer double-charges
+
+`bench/demo.py --demo leak`
+
+A support agent: `lookup_customer` → decide → `charge_card(amount)` → `send_receipt`. Two runtimes execute the same 50 journaled model transcripts. In 10 of the 50, the model's real decision differs from what a pattern drafter predicted.
+
+The naïve runtime (`bench/baselines.py:B_naive_parallel`) runs the predicted `charge_card` early and discards the branch on mismatch. The fake world (`specunode.testing.World`) records every mutation with the branch id that issued it. The output is a table:
+
+```
+runtime              runs  mispredictions  charges reaching world  charges from squashed branches
+naive-parallel         50              10                      60                              10
+specunode              50              10                      50                               0
+sequential             50               0                      50                               0
+```
+
+The numbers must come from the run. The point of the demo is the last column and the fact that the second and third rows are equal.
+
+### Demo 2 — running ahead past a write
+
+`bench/demo.py --demo past-write`
+
+An ops agent: `get_pipeline_status` (read) → decide → `restart_job(id)` (write) → `fetch_runbook(section)` (read, independent of the write) → `post_summary(channel)` (write). Under PASTE-style speculation the runtime must stop before `restart_job`. Under SpecuNode, `restart_job` is staged, `fetch_runbook` runs speculatively while the target's turn 1 is still streaming and the drain is in flight, and both writes retire together when the model confirms. Model turn 2 is *not* hidden: it needs `restart_job`'s real result in its prompt, so it waits for the drain. The demo says so on its output. The demo prints a timeline:
+
+```
+step                   sequential   read-only speculation   specunode
+get_pipeline_status        0.9s         0.9s                  0.9s
+model turn 1               2.1s         2.1s                  2.1s
+restart_job (write)        0.7s         0.7s     [barrier]    staged, 0.0s on path
+fetch_runbook (read)       1.4s         1.4s                  hidden behind turn 1 + drain
+model turn 2               2.0s         2.0s                  2.0s  (not hidden: needs write result)
+post_summary (write)       0.5s         0.5s                  retired with restart_job
+-----------------------------------------------------------------------------
+wall clock                 7.6s         7.6s                  measured
+effects reaching world     2            2                     2 (identical ledger)
+```
+
+The figures in the table above are illustrative placeholders for the *shape*; the demo prints measured values only.
+
+### Demo 3 — the honest one, which is the point of the project
+
+`bench/demo.py --demo replay`
+
+The same ops run is killed with SIGKILL at a random point mid-branch. `specunode resume <run_id>` continues from the journal. The effect ledger after resume is byte-identical to the ledger of the uninterrupted run. Then the run is replayed with a different system prompt: `specunode replay <run_id>` refuses at the first journaled model output that the new prompt would not have produced, with the step index and the diff, instead of silently re-running a divergent trajectory. Finally, the run is replayed with speculation disabled: identical ledger.
+
+The demo ends with the run's **effect ledger**, which is the artifact this project produces:
+
+```
+EFFECT LEDGER  run 01K5…  speculation=on  drafter=pattern  target=<model>
+ #  effect                         key            branch  decided-by(step)  status
+ 1  restart_job {id:"etl-7"}       b2f9…          br-03   step 4 (retired)  DISPATCHED ack=1
+ 2  post_summary {ch:"#ops"}       11ac…          br-03   step 4 (retired)  DISPATCHED ack=1
+squashed branches: 2   staged effects discarded: 3   stalls: 1 (free-text node "draft_reply")
+reads validated at retirement: 4/4 fresh   wasted tokens: 1,842   alpha (window 20): 0.70
+```
+
+Anything can print "done". This says which model decision authorised each effect, what was thrown away, where it had to fall back to sequential, and how much the speculation cost.
+
+---
+
+## 3. Prior art — who is already here, and exactly where they stop
+
+Read this before designing anything. Credit every project below in the README by name. The proposal this spec replaced claimed several of these did not exist or did not solve their problem; they do, and the README must not repeat that mistake.
+
+**PASTE — *Act While Thinking: Accelerating LLM Agents via Pattern-Aware Speculative Tool Execution*** (Sui et al., Microsoft Research, arXiv 2603.18897, March 2026). Characterises agent traces from SWE-bench, MetaGPT and OpenHands and finds strong temporal locality in tool sequences ("strong chains", "refinement loops") and predictable data-flow between tool arguments. Runs as a tool-serving proxy that mines patterns and speculatively pre-executes predicted calls. Reports 48.5% lower average task completion time and 1.8× tool throughput `[cited]`. Has an operator policy per tool for whether speculation is permitted and how side effects are handled.
+*Where it stops:* side effects are handled by *policy exclusion* — a tool with side effects is not speculated. There is no mechanism to hold a write, so speculation ends at the first mutating call. No journal, no replay. **This is the closest prior work and the pattern-mining drafter in §7 is a re-implementation of its idea, credited as theirs.** Follow-ups: *B-PASTE* (arXiv 2604.16469) and *Speculate with Memory* (arXiv 2607.12236) refine the predictor; neither adds a write path.
+
+**Claude Code's streaming tool executor** (described in *Dive into Claude Code*, arXiv 2604.14228, and the *Claude Code from Source* study). Starts each tool the instant its `tool_use` block is fully parsed from the stream, before the response finishes; concurrent for read-only tools, serial for writes; preserves result order.
+*Where it stops:* it is early-issue, not prediction — it only runs what the model has already emitted. Writes are serialised. No cross-step speculation. This is exactly SpecuNode's Tier-0 drafter, and it is credited as such.
+
+**langchain-nvidia-langgraph** (LangChain + NVIDIA, 2026). Compile-time parallelisation of independent nodes plus "speculative execution" that runs both branches of a conditional edge and discards the loser.
+*Where it stops — in its own docs:* speculation is over static routing edges only, and the speculative mode does not support checkpointers, streaming, interrupts or human-in-the-loop. No side-effect handling: both branches' tools run for real. That is the exact failure Demo 1 exhibits.
+
+**ToolAhead** (MCP server). Prefetches read tool results (file reads, searches) before a coding agent asks for them and replays them on request.
+*Where it stops:* reads only; writes execute normally and reset prediction. Single-workspace coding tools. No journal.
+
+**SagaLLM** (Chang & Geng, VLDB 2025, arXiv 2503.11951). Wraps multi-agent planning in the saga pattern with persistent memory, compensating transactions and independent validation agents. Relaxes ACID; ensures workflow-wide recoverability through checkpoints and compensation.
+*Where it stops:* the saga coordinator uses an LLM for state tracking and recovery orchestration, which SpecuNode forbids in the control path (Hard Rule 1). No speculation. Its compensation vocabulary (each transaction declares its compensator) is adopted for the `COMPENSABLE` effect class, credited.
+
+**ATP / Mnemosyne — *Agentic Transaction Processing*** (arXiv 2607.00269, July 2026). A transaction model where a generated action holds no authority until a deterministic gate admits it against an effective-state witness; committed-state correctness is proven independent of the proposer. Explicitly positioned as complementary to SagaLLM: one disciplines the proposer, the other governs the committer.
+*Where it stops:* admission happens on the serial path. It has no concept of an action that executed early and is awaiting admission, which is what a store buffer is. SpecuNode's retirement stage is an ATP-style gate; the store buffer is what sits in front of it.
+
+**SCOPEGATE — *Capability Gates Are Not Authorization*** (arXiv 2606.28679). Audits LangChain/LangGraph, LlamaIndex and the Stripe Agent Toolkit and finds none re-authorises each model-emitted call with its concrete argument values by default; proposes a five-stage deterministic PDP/PEP with scope, authorization, money ceiling, idempotency and default-deny.
+*Where it stops:* authorization only, no execution model. Its point — that tool exposure is not per-call authority — is why SpecuNode's effect classes are declared out of band and never inferred from the model (Hard Rule 2).
+
+**Durable execution** — Temporal (with Pydantic AI and LangGraph integrations), DBOS, Restate, Inngest, Azure Durable Task; LangGraph's own checkpointers. All journal non-deterministic results (model outputs, tool results) so that replay reuses recorded values rather than re-running; idempotency keys derived from (workflow id, step id).
+*Where they stop:* a step is a step. Nothing runs before its predecessor completes, there is no store buffer, and there is no speculative branch to squash. SpecuNode's journal follows the same discipline — recorded first time, reused on replay — and is designed so a run can later be hosted *inside* one of these engines (each retired branch is a deterministic step). The README says plainly that SpecuNode is not a replacement for a durable-execution platform.
+
+**Out-of-order CPU execution** — Tomasulo (1967), store buffers, branch prediction, squash-on-mispredict, retirement in program order. Not LLM work, but the model this design copies deliberately: speculative loads issue, speculative stores wait in a buffer, the branch resolves, the buffer retires or is squashed. The vocabulary of this spec (retire, squash, hazard, stall, store buffer) is taken from there and the README explains the analogy in one paragraph.
+
+**SpecuNode's actual contribution, in three sentences.** It is the first runtime that lets an agent graph speculate *past* a mutating tool call, by holding the call's effect in a branch-scoped store buffer that drains only when the target model's real decision confirms the branch, and is discarded — never dispatched — when it does not. It journals every model output and tool result so that the effect ledger of a speculative run is provably identical to that of the sequential run, and both replay. And it measures, per workload, how much speculation the dependency structure actually exposes past writes, publishing the cases where the answer is "little" with the same prominence as the cases where it is "a lot".
+
+**Naming.** *SpecuNode*: speculation at the granularity of a graph node. The PyPI name `specunode` was free on 15 September 2026; the CLI is `specunode`.
+
+---
+
+## 4. Hard rules — never violate these
+
+These are not preferences. Breaking any one makes the runtime a liability to whoever runs it.
+
+1. **No LLM in the control path.** Which tool calls run, when, and whether a speculation matched are decided by deterministic code. The only models in the runtime are the *target model* (whose output is the ground truth for branch resolution) and the *draft model* (an optional Tier-2 predictor whose output is only ever a guess). There is no prompt anywhere in `src/specunode/core/`, `src/specunode/buffer/`, `src/specunode/verify/`, or `src/specunode/journal/`. A test greps for `messages=` and `prompt` in those packages and fails the build if found.
+2. **Effect classes are declared, never inferred.** Every tool carries exactly one of `READ`, `WRITE`, `COMPENSABLE(compensator)`, `IRREVERSIBLE`, declared by the developer in code or by MCP tool annotations. A tool with no declaration is `WRITE`. No heuristic on the tool's name, description or arguments ever assigns a class. No model ever assigns a class. A tool whose upstream enqueues, schedules or triggers work asynchronously is a `WRITE` regardless of its synchronous response or HTTP verb; the docs say this on the first page.
+3. **Nothing reaches the world from an unretired branch.** A `WRITE`, `COMPENSABLE` or `IRREVERSIBLE` effect is dispatched only by `retire()`, only for a branch in state `CONFIRMED`, only after the journal entry that confirmed it is durable. Speculative execution of a `READ` is permitted; speculative execution of anything else is a bug, and the leak test (Rule 12) catches it.
+4. **Branch resolution is exact canonical equality.** A speculation is confirmed iff `canonical(ŷ) == canonical(y)` where both are `Decision` values (a tool call name plus canonicalised arguments, a route label, or a structured object). Never semantic similarity, never fuzzy argument matching, never an LLM judge. A node whose output is free text is a speculation barrier: nothing speculates on it.
+5. **Journal before use.** Every target-model output and every tool result is written to the journal and fsynced before the runtime acts on it. Replay never calls a model; it reads the journal. A replay that reaches a step whose journaled input does not match what the current code would send raises `ReplayDivergence` with the step and the diff. It never re-asks the model and continues.
+6. **Branch isolation.** A branch reads only (a) the committed state as of its fork point and (b) its own staged effects via declared store-buffer forwarding. It never observes a sibling's staged writes, state deltas, or context. State is forked copy-on-write per branch; the retiring branch's delta is applied to committed state; a squashed branch's delta is dropped. There is no merge of two speculative branches, ever.
+7. **Hazards stall, they never guess.** If a speculative call's arguments depend on the *return value* of a staged write, or the tool is undeclared, or the node emits free text, or the read's key is one a staged write in the same branch touches and the tool declares no forwarding, or the branch's next model call would contain a placeholder in its prompt, the branch enters `STALLED` and the runtime proceeds sequentially from the last confirmed decision. `STALLED` is recorded with its reason in the ledger.
+8. **Idempotency keys are deterministic and stable.** `key = blake2b(run_id ‖ branch_lineage ‖ node_id ‖ step_index ‖ tool_name ‖ canonical(args))`, where `step_index` is a per-run monotonically increasing counter that is itself journaled (so it survives resume), and `node_id` disambiguates loop iterations that revisit a node. The same logical effect gets the same key on retry, resume and replay. Dispatch is at-least-once with dedupe on the key. The docs say "at-least-once with idempotent dedupe" and never say "exactly-once" for a tool that has not declared itself idempotent.
+9. **Speculation preserves semantics.** For any journaled run, the effect ledger with speculation enabled equals the effect ledger with speculation disabled, ignoring timestamps and keys' branch components. This is the equivalence test (Phase 5). It runs on every workload in CI. A mismatch is a build failure, not a flaky test.
+10. **Wasted work is bounded and measured.** Every run enforces `max_inflight_branches`, `max_speculation_depth` and `max_wasted_tokens`. The drafter's rolling acceptance rate α is tracked over a fixed window; when it falls below the measured break-even for the workload, speculation is disabled for that run by deterministic policy, and the ledger says so. Speculation must never make a run *slower* than sequential by more than the journaling overhead measured in Phase 6.
+11. **No telemetry, no hosted components, no accounts.** The runtime makes no network calls the developer did not configure. Model calls go to the endpoint the developer named. Model downloads for the optional local drafter happen once, explicitly, at install.
+12. **Never report a number you did not measure.** Every figure in `README.md`, `RESULTS.md` and the report traces to a committed command and a committed JSON file. `RESULTS.md` is generated. A traceability check (`bench/check_numbers.py`) fails CI if a number in the README appears in no results file. A vocabulary check fails CI if "ACID", "exactly-once", "guaranteed", "zero-latency", "eliminates", "100% safe" or "context rot" appears in any output or doc without an adjacent qualifier that names the condition.
+13. **Context identity.** A speculative branch may send a model request only if the prompt it would send is one the sequential run could send: no placeholder anywhere in it, tool results assembled in program order (not completion order), and no message from any squashed sibling. When the canonical run reaches that step, the prompt it constructs from real results must be byte-identical to the one the branch sent; a difference is a `ContextDivergence` fault that squashes the branch before its model output is used. This is the live counterpart of Rule 9: Rule 9 proves the effect plumbing on journaled outputs; Rule 13 proves the model was never asked a different question.
+
+---
+
+## 5. Locked technical decisions
+
+Don't re-litigate these.
+
+| Decision | Choice |
+|---|---|
+| Language | Python 3.11+ (floor enforced in CI matrix 3.11/3.12/3.13; do not raise it), `from __future__ import annotations`, full type hints |
+| Typing | mypy `--strict` on `src/`, no `Any` in public signatures |
+| Packaging | `uv`, `pyproject.toml`, hatchling backend |
+| Lint/format | `ruff` (lint + format), line length 100 |
+| Concurrency | `asyncio` with `TaskGroup`; every branch is a task; cancellation is the squash primitive. No threads except inside tool adapters that need them |
+| Tests | `pytest`, `pytest-asyncio`, `hypothesis` for the store buffer, canonicaliser and journal |
+| Journal | SQLite (`sqlite3` stdlib, WAL mode, `synchronous=FULL`), append-only table, default `./.specunode/journal.db`. Postgres via `psycopg` 3 optional, same DDL. One fsync per entry, never batched: ~100 fsyncs on a 30-step run is tens of milliseconds against multi-second model turns, and batching would open a crash window for nothing |
+| Canonical form | `canonical(obj)` = JSON with sorted keys, no whitespace, NFC-normalised strings, floats via `repr`, `-0.0 → 0.0`, NaN rejected. Hash = blake2b-256 of the canonical bytes |
+| Identifiers | ULID for runs, branches, steps, effects |
+| Decision types | `ToolCall(name, args)`, `Route(label)`, `Structured(schema_id, value)`, `FreeText(hash)` — the last is a barrier |
+| Effect classes | `READ`, `WRITE`, `COMPENSABLE(compensator: str)`, `IRREVERSIBLE`. Tool-level flags: `idempotent: bool`, `forward_keys: Callable[[args], set[str]] | None` (resource keys a call touches, enabling read-after-staged-write forwarding), `witness: bool` (returns a version/ETag with reads) |
+| MCP mapping | `readOnlyHint=true` → `READ`; `destructiveHint=false, idempotentHint=true` → `WRITE(idempotent=True)`; `destructiveHint=true` → `IRREVERSIBLE`; annotations absent → `WRITE(idempotent=False)`. A per-tool override table in `specunode.yaml` takes precedence |
+| Drafters | **T0 early-issue**: parse `tool_use` blocks from the target stream as they complete (Claude Code's pattern, credited). **T1 pattern index**: order-*k* (k ≤ 3) Markov over tool signatures with argument templates that reference prior tool outputs by JSONPath (PASTE's idea, credited); trained per workload from the journal; on disk as JSON. **T2 draft model**: optional extra; any model behind the same `ModelClient` protocol, default `claude-haiku-4-5` when the target is a larger Claude model, or a local `Qwen/Qwen2.5-0.5B-Instruct` via the `[local-draft]` extra |
+| Target model (bench) | `claude-sonnet-5` via the Anthropic API for online workloads; the fake `ReplayModel` for offline and CI. A bench-spend cap `SPECUNODE_BENCH_BUDGET_USD` (default 25) halts the online bench when exceeded and the report says so |
+| State | Committed state is a JSON-serialisable dict. Branch state is a copy-on-write fork (`copy.deepcopy` at fork; delta computed as RFC 6902 JSON Patch at retirement). Per-key reducers declared in config (`append`, `last_write`, `max`, custom callable) apply only when *sequential* nodes write the same key; two speculative siblings never merge |
+| Context | Per-branch message list forked at the branch point. Tool results are appended in *program order* (the order the model requested them), never completion order — Claude Code's ordering rule, credited. A placeholder never enters a message. The retiring branch's context becomes canonical. Squashed branches' messages are discarded entirely. No pruning, no summarisation, no distillation in the runtime |
+| Framework integrations | `specunode.integrations.langgraph`: wraps a compiled `StateGraph` (LangGraph ≥ 0.6) by substituting its node runner and tool executor; the graph definition is unchanged. `specunode.integrations.plain`: a decorator-based API for hand-written loops. Both share one core |
+| MCP proxy | `specunode mcp-proxy --upstream "<cmd>"`, stdio; forwards `tools/list` with annotations, intercepts `tools/call`; protocol versions `2025-11-25` and `2026-07-28` via the official `mcp` SDK |
+| Fake world | `specunode.testing.World`: in-memory tables + HTTP-like endpoints, every mutation recorded with `(branch_id, effect_key, wall_time)`; fault injection: `partition(at=…)`, `timeout`, `duplicate_delivery`, `slow(read|write, ms)` |
+| Offline trace corpus | `nebius/SWE-rebench-openhands-trajectories` (Hugging Face, CC-BY-4.0, 67,074 OpenHands trajectories with per-step `tool_calls` name + JSON arguments and observations; verified available 2026-09-15). A seeded 2,000-trajectory sample by manifest; the manifest and the per-tool effect-class table are committed, the raw data is fetched by `bench/corpus/fetch.py`. Fallback (Decision Gate D1): traces generated by running the three sample apps with the target model and committed under `bench/corpus/` |
+| Sample apps | `examples/support_agent`, `examples/ops_agent`, `examples/research_agent` — each a LangGraph graph with 4–8 tools of mixed effect class against `World` |
+| Plots | `matplotlib` only. Committed as PNG + the script that made them |
+| License | Apache-2.0 |
+| Package name | `specunode` (PyPI, free as of 2026-09-15). CLI: `specunode` |
+| Config | `./specunode.yaml`, then `$XDG_CONFIG_HOME/specunode/config.yaml`. Pydantic v2, schema versioned |
+
+**Why a store buffer and not a saga:** a saga runs a write and undoes it if something later fails. Compensation is a *second* effect that reaches the world, and for many tools (send email, charge card, POST webhook) it is imperfect or impossible. A store buffer never lets the first effect out. Compensation is kept — as the `COMPENSABLE` class for retired effects that later need undoing — but it is not the mechanism that makes speculation safe.
+
+**Why not CRDTs:** speculative branches are mutually exclusive alternatives, not concurrent collaborators. At most one of them is right. Merging them would be merging a decision the model made with one it did not make. Isolation is the correct primitive; the branch that retires wins wholesale.
+
+**Why exact equality and not similarity for resolution (Hard Rule 4):** a speculative branch has already executed reads and staged writes based on *ŷ*. If *y* differs in any argument — a different ticket id, a different amount, a different file path — every downstream call was computed on the wrong premise. There is no useful notion of "close enough" for a tool call, and any tolerance is a way for a wrong branch's effects to retire.
+
+**Why a placeholder never enters a prompt:** the tempting alternative — let a tool declare a "projected" result such as `{"ok": true}` so the branch's next model call can proceed — still conditions the model on synthetic context wherever the real result would have carried an id, a timestamp or a status. The prompt would differ from the sequential run's, and the model's decision would be made on a different premise even if it happened to match. Rule 13 makes that a fault, not a feature.
+
+**Why free text is a barrier:** a node that emits prose which feeds the next prompt cannot be predicted token-for-token, so it cannot be confirmed by equality. Speculating on it would mean retiring branches on approximate matches, which Hard Rule 4 forbids. The bench measures how much of each workload is behind free-text barriers, because that is part of the honest answer about how much speculation is available.
+
+**Why Python 3.11 and not 3.12:** the previous project shipped with a 3.12 floor and its first two installs failed on 3.11 interpreters with a misleading pip error. Nothing here needs 3.12 syntax. The floor is 3.11 and the CI matrix enforces it.
+
+**Why Sonnet as the bench target and Haiku as a draft:** the online bench needs a target turn slow enough that hiding tool latency behind it is visible, and a draft cheap enough that a miss costs little. Sonnet/Haiku is the pairing the bench can actually afford under the spend cap. The claim is about the runtime, not the models; the config makes both swappable.
+
+---
+## 6. Project structure
+
+Create exactly this. Don't reorganise.
+
+```
+specunode/
+├── pyproject.toml
+├── README.md                      # generated numbers only; see Hard Rule 12
+├── RESULTS.md                     # generated by bench/report.py — never hand-edited
+├── LICENSE
+├── specunode.yaml.example
+├── src/specunode/
+│   ├── __init__.py                # lazy public API: run, resume, replay, tool, World
+│   ├── api.py                     # the three convenience entry points over one core
+│   ├── cli.py                     # typer app: init, run, resume, replay, ledger, mcp-proxy, bench
+│   ├── config.py                  # pydantic models, schema_version, loader
+│   ├── ids.py                     # ULID
+│   ├── canonical.py               # canonical(), chash()  — Hard Rule 4, Rule 8
+│   ├── core/
+│   │   ├── decision.py            # ToolCall | Route | Structured | FreeText
+│   │   ├── effects.py             # EffectClass, ToolSpec, registry, MCP annotation mapping
+│   │   ├── branch.py              # Branch, BranchState, fork/retire/squash/stall
+│   │   ├── state.py               # committed state, COW fork, JSON Patch delta, reducers
+│   │   ├── scheduler.py           # the run loop: sequential mode + speculative mode
+│   │   ├── hazards.py             # dependency analysis over staged effects
+│   │   ├── policy.py              # budgets, alpha window, break-even gate (Rule 10)
+│   │   └── model.py               # ModelClient protocol, streaming, journaled wrapper
+│   ├── buffer/
+│   │   ├── store_buffer.py        # stage(), forward(), drain(), discard()
+│   │   ├── idempotency.py         # key derivation (Rule 8), dedupe table
+│   │   ├── dispatcher.py          # at-least-once dispatch, ack, dead-letter
+│   │   └── compensation.py        # COMPENSABLE undo of already-retired effects
+│   ├── journal/
+│   │   ├── schema.sql             # one DDL for sqlite + postgres
+│   │   ├── journal.py             # append, read, fsync discipline (Rule 5)
+│   │   ├── replay.py              # ReplayModel, ReplayDivergence
+│   │   └── ledger.py              # effect ledger rendering, signing
+│   ├── verify/
+│   │   ├── gate.py                # resolve(ŷ, y) → CONFIRMED | SQUASHED (Rule 4)
+│   │   ├── witness.py             # read-set validation at retirement (OCC)
+│   │   └── equivalence.py         # ledger(spec=on) == ledger(spec=off)  (Rule 9)
+│   ├── drafters/
+│   │   ├── base.py                # Drafter protocol
+│   │   ├── t0_stream.py           # early-issue from partial stream
+│   │   ├── t1_pattern.py          # PASTE-style pattern index (credited)
+│   │   └── t2_model.py            # draft model, optional extra
+│   ├── integrations/
+│   │   ├── langgraph.py           # wrap a compiled StateGraph
+│   │   ├── plain.py               # @specunode.tool, @specunode.node, run_loop()
+│   │   └── mcp_proxy.py           # stdio proxy, tools/list + tools/call interception
+│   └── testing/
+│       ├── world.py               # fake external world with branch-tagged mutation log
+│       ├── faults.py              # partition / timeout / duplicate / slow
+│       └── models.py              # ScriptedModel, ReplayModel
+├── tests/
+│   ├── unit/ … integration/ … property/ … chaos/
+│   ├── test_no_llm_in_control_path.py     # Hard Rule 1
+│   ├── test_leak.py                       # Hard Rule 3 — never skipped
+│   ├── test_equivalence.py                # Hard Rule 9 — never skipped
+│   ├── test_vocabulary.py                 # Hard Rule 12
+│   └── test_numbers_traceable.py          # Hard Rule 12
+├── bench/
+│   ├── corpus/                    # committed offline traces + manifest
+│   ├── workloads/                 # synthetic generators + the three sample apps as workloads
+│   ├── baselines.py               # B_seq, B_readonly_spec (PASTE-style), B_naive_parallel, B_specunode
+│   ├── offline/run_opportunity.py # how much speculation a trace exposes (no model calls)
+│   ├── online/run_latency.py      # wall clock with real target model, budget-capped
+│   ├── chaos/run_chaos.py         # crash/partition/duplicate under load
+│   ├── adversarial/run_attacks.py # §PHASE 7 strategies
+│   ├── demo.py
+│   ├── report.py                  # → RESULTS.md
+│   ├── check_numbers.py
+│   ├── plots/make_plots.py
+│   └── make_report_pdf.py
+├── examples/
+│   ├── support_agent/  ops_agent/  research_agent/
+│   └── mcp_client_config.json
+├── docs/
+│   ├── effect-classes.md  hazards.md  replay.md  mcp-proxy.md  adapters.md  limitations.md
+└── .github/workflows/ci.yml  nightly-offline.yml  nightly-online.yml
+```
+
+---
+
+## 7. Core contracts
+
+These signatures are the spec. Implement to them. Changing a public signature requires a Progress Log entry saying why.
+
+### Decisions and canonical form
+
+```python
+# src/specunode/core/decision.py
+@dataclass(frozen=True)
+class ToolCall:
+    name: str
+    args: Mapping[str, JsonValue]
+
+@dataclass(frozen=True)
+class Route:
+    label: str
+
+@dataclass(frozen=True)
+class Structured:
+    schema_id: str
+    value: JsonValue
+
+@dataclass(frozen=True)
+class FreeText:
+    content_hash: str          # blake2b of NFC text; the text itself lives in the journal
+
+Decision = ToolCall | Route | Structured | FreeText
+
+# src/specunode/canonical.py
+def canonical(obj: JsonValue) -> bytes: ...     # sorted keys, no whitespace, NFC, repr floats
+def chash(obj: JsonValue) -> str: ...           # blake2b-256 hex of canonical(obj)
+def decisions_equal(a: Decision, b: Decision) -> bool:
+    """Exact canonical equality. FreeText never equals anything, including itself,
+    for the purpose of branch resolution (it is a barrier)."""
+```
+
+### Effect classes and tools
+
+```python
+# src/specunode/core/effects.py
+class EffectClass(Enum):
+    READ = "read"
+    WRITE = "write"
+    COMPENSABLE = "compensable"
+    IRREVERSIBLE = "irreversible"
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    effect: EffectClass
+    fn: Callable[..., Awaitable[JsonValue]]
+    idempotent: bool = False
+    compensator: str | None = None              # required iff effect == COMPENSABLE
+    forward_keys: Callable[[Mapping[str, JsonValue]], frozenset[str]] | None = None
+    witness: bool = False                        # READ returns {"value":…, "witness":…}
+    schema: JsonSchema | None = None
+
+class ToolRegistry:
+    def register(self, spec: ToolSpec) -> None: ...
+    def get(self, name: str) -> ToolSpec:
+        """Unknown tool → ToolSpec(effect=WRITE, idempotent=False) synthesised and
+        logged at WARNING once. Never raises for unknown; never guesses READ."""
+    @classmethod
+    def from_mcp_tools(cls, tools: list[McpTool], overrides: Mapping[str, ToolSpec]) -> "ToolRegistry": ...
+```
+
+### Branches, state, store buffer
+
+```python
+# src/specunode/core/branch.py
+class BranchStatus(Enum):
+    SPECULATIVE = "speculative"    # running on ŷ, unresolved
+    CONFIRMED   = "confirmed"      # y == ŷ, journaled; retirement in progress
+    RETIRED     = "retired"        # store buffer drained, delta applied
+    SQUASHED    = "squashed"       # y != ŷ or parent squashed; buffer discarded
+    STALLED     = "stalled"        # hazard; runtime continues sequentially
+
+@dataclass
+class Branch:
+    id: str
+    parent_id: str | None
+    fork_step: int
+    predicted: Decision
+    lineage: tuple[str, ...]        # branch ids root→self, part of every idempotency key
+    status: BranchStatus
+    reason: str | None              # for STALLED / SQUASHED
+    state: BranchState              # COW fork
+    context: list[Message]          # forked messages
+    read_set: list[ReadRecord]      # (tool, args_hash, result_hash, witness|None, at_step)
+    prompts_sent: list[tuple[int, str]]  # (step, chash(prompt)) for Rule 13 checking at retirement
+    staged: list[StagedEffect]      # ordered
+
+# src/specunode/buffer/store_buffer.py
+@dataclass(frozen=True)
+class StagedEffect:
+    id: str
+    branch_id: str
+    step: int
+    call: ToolCall
+    effect: EffectClass
+    key: str                        # idempotency key, Rule 8
+    depends_on: frozenset[str]      # ids of staged effects whose *return value* this needs
+    placeholder: str | None         # symbolic handle returned to the branch instead of a value
+
+class StoreBuffer:
+    def stage(self, branch: Branch, call: ToolCall, spec: ToolSpec) -> StagedEffect:
+        """Never executes. Returns a StagedEffect whose placeholder stands in for the
+        tool's return value. If a later call's args contain a placeholder, that is a
+        hazard (see hazards.py) unless the tool declares it can accept a handle."""
+    def forward(self, branch: Branch, read: ToolCall, spec: ToolSpec) -> ForwardResult:
+        """Store-to-load forwarding: if a staged WRITE in this branch touches a key
+        this READ touches (both via forward_keys), return HAZARD unless the write's
+        spec provides an in-branch projection. Sibling branches are invisible."""
+    async def drain(self, branch: Branch, dispatcher: Dispatcher) -> DrainReport:
+        """Only callable when branch.status == CONFIRMED and the confirming journal
+        entry is durable. Dispatches in stage order. Each effect: DISPATCHED(ack) |
+        DEAD_LETTER(reason). Idempotent on the key: draining twice sends nothing twice."""
+    def discard(self, branch: Branch) -> int:
+        """Drops every staged effect. Returns the count. Journals the discard."""
+```
+
+### Scheduler, hazards, policy
+
+```python
+# src/specunode/core/scheduler.py
+class Scheduler:
+    def __init__(self, graph: GraphAdapter, registry: ToolRegistry, journal: Journal,
+                 buffer: StoreBuffer, drafters: Sequence[Drafter], policy: Policy,
+                 target: ModelClient) -> None: ...
+    async def run(self, run_id: str, inputs: JsonValue) -> RunResult:
+        """Sequential when policy.speculation is off or the drafter list is empty.
+        Otherwise: at each decision point, ask drafters for ŷ (T0 first, then T1, T2);
+        fork a branch per distinct ŷ up to max_inflight_branches; execute the branch
+        under hazard analysis; when y arrives (journaled), resolve every open branch."""
+
+# src/specunode/core/hazards.py
+class Hazard(Enum):
+    RETURN_VALUE_DEPENDENCY = "depends on staged write's return value"
+    UNDECLARED_TOOL         = "tool has no declared effect class"
+    FREE_TEXT_NODE          = "node emits free text"
+    READ_AFTER_STAGED_WRITE = "read touches a key a staged write touches; no forwarding"
+    BUDGET                  = "speculation budget exhausted"
+    IRREVERSIBLE_ON_PATH    = "irreversible effect would need staging"  # policy-configurable
+    MODEL_TURN_AFTER_STAGED_WRITE = "next model call would contain a placeholder"  # Rule 13
+    READ_BUDGET             = "speculative read budget exhausted"
+
+def analyse(branch: Branch, next_call: ToolCall, spec: ToolSpec, policy: Policy) -> Hazard | None: ...
+
+# src/specunode/core/policy.py
+@dataclass(frozen=True)
+class Policy:
+    speculation: bool = True
+    max_inflight_branches: int = 1          # top-1 by default; top-k multiplies upstream reads
+    max_speculation_depth: int = 3
+    max_wasted_tokens: int = 20_000
+    max_speculative_reads: int = 50         # ReadBudget: upstream reads a squashed branch may have cost
+    alpha_window: int = 20
+    alpha_floor: float | None = None      # None → use break-even measured for the workload
+    stage_irreversible: bool = False      # default: IRREVERSIBLE is a barrier, not staged
+    on_stale_read: Literal["squash", "stall"] = "squash"
+```
+
+### Journal, replay, ledger
+
+```python
+# src/specunode/journal/journal.py
+class Journal:
+    def append(self, entry: Entry) -> int:
+        """Durable before return (fsync). Returns offset. Entries are immutable."""
+    def read(self, run_id: str, after: int = 0) -> Iterator[Entry]: ...
+
+# entry kinds (schema.sql): run_started, model_request, model_response, tool_request,
+#   tool_result, branch_forked, branch_resolved, effect_staged, effect_dispatched,
+#   effect_dead_lettered, effect_discarded, state_delta_applied, read_validated,
+#   policy_event, run_finished
+
+# src/specunode/journal/replay.py
+class ReplayModel(ModelClient):
+    """Serves model_response entries from the journal, in order. If the incoming
+    request's canonical form differs from the journaled model_request at that step,
+    raises ReplayDivergence(step, diff). Never calls a model."""
+
+# src/specunode/journal/ledger.py
+@dataclass(frozen=True)
+class LedgerRow:
+    effect_id: str; call: ToolCall; key: str; branch_id: str
+    authorised_by_step: int             # journal offset of the confirming model_response
+    status: Literal["DISPATCHED", "DEAD_LETTER", "COMPENSATED"]
+    ack: JsonValue | None
+
+@dataclass(frozen=True)
+class Ledger:
+    run_id: str
+    rows: tuple[LedgerRow, ...]
+    squashed_branches: int
+    discarded_effects: int
+    stalls: tuple[tuple[int, Hazard], ...]
+    reads_validated: tuple[int, int]     # (fresh, total)
+    wasted_tokens: int
+    speculative_reads_upstream: int      # reads that reached upstream from squashed branches
+    context_divergences: int             # Rule 13 faults
+    alpha: float | None
+    signature: str                       # Ed25519 over canonical(rows…)
+
+def normalise_for_equivalence(l: Ledger) -> bytes:
+    """Rows in dispatch order with branch ids and timestamps stripped; keys re-derived
+    with an empty lineage. Two runs are equivalent iff these bytes match (Rule 9)."""
+```
+
+### Drafters and the gate
+
+```python
+# src/specunode/drafters/base.py
+class Drafter(Protocol):
+    tier: Literal[0, 1, 2]
+    async def predict(self, ctx: DraftContext) -> list[Decision]:
+        """Zero or more candidate decisions, most likely first. T0 returns only
+        decisions the target has already emitted in-stream (α = 1 by construction).
+        T1/T2 return guesses. Never raises; an empty list means 'no opinion'."""
+
+# src/specunode/verify/gate.py
+def resolve(branch: Branch, actual: Decision) -> BranchStatus:
+    """CONFIRMED iff decisions_equal(branch.predicted, actual). Otherwise SQUASHED.
+    Pure. Deterministic. Tested by property: for all d, resolve(d, d) is CONFIRMED
+    except FreeText; for all d != e, SQUASHED."""
+
+# src/specunode/verify/witness.py
+async def validate_reads(branch: Branch, registry: ToolRegistry) -> ReadValidation:
+    """For each ReadRecord with a witness, re-fetch the witness; stale iff changed.
+    Reads without witnesses are reported as 'unwitnessed', never as 'fresh'."""
+```
+
+### The status lattice
+
+Per staged effect, in resolution order (the order matters, and the first rule that matches wins):
+
+| Rule | Condition | Outcome |
+|---|---|---|
+| E1 | branch SQUASHED (own mismatch or ancestor squashed) | `DISCARDED` — never dispatched |
+| E2 | branch STALLED | `DISCARDED` — the sequential re-execution will re-stage it |
+| E3 | branch CONFIRMED, read validation found a stale witnessed read | branch → SQUASHED (policy `squash`) or STALLED; effect `DISCARDED` |
+| E4 | branch CONFIRMED, dispatch acked | `DISPATCHED` |
+| E5 | branch CONFIRMED, dispatch failed after retries | `DEAD_LETTER(reason)` — run finishes `ok=False` |
+| E6 | previously DISPATCHED, later compensation requested | `COMPENSATED` or `DEAD_LETTER` |
+
+Rule E3 before E4 is the ordering that carries most of the integrity: a branch whose reads went stale between speculation and confirmation must not retire just because the model's decision matched.
+
+### Configuration
+
+```yaml
+# specunode.yaml
+schema_version: 1
+journal:
+  kind: sqlite            # sqlite | postgres
+  path: ./.specunode/journal.db
+target:
+  provider: anthropic
+  model: claude-sonnet-5
+drafters:
+  - tier: 0               # early-issue from stream; always on
+  - tier: 1               # pattern index
+    index_path: ./.specunode/patterns.json
+    order: 2
+  # - tier: 2
+  #   provider: anthropic
+  #   model: claude-haiku-4-5
+policy:
+  max_inflight_branches: 1
+  max_speculative_reads: 50
+  max_speculation_depth: 3
+  max_wasted_tokens: 20000
+  alpha_window: 20
+  stage_irreversible: false
+  on_stale_read: squash
+tools:                    # overrides for effect class when code/MCP annotations are wrong
+  send_email: {effect: irreversible}
+  create_ticket: {effect: write, idempotent: true, forward_keys: "ticket:{args.customer_id}"}
+state:
+  reducers:
+    findings: append
+    summary: last_write
+```
+
+---
+## PHASE 0 — Scaffold, canonical form, journal
+
+Goal: an installable package with a journal that records and replays a scripted run — no speculation, no tools yet.
+
+- [ ] **0.1 Scaffold.** `uv init`, hatchling, ruff, mypy strict, pytest, CI matrix 3.11/3.12/3.13 on Ubuntu + macOS. `specunode --version` works from a built wheel.
+  *Verify:* `uv build && uv tool install dist/*.whl && specunode --version` in a clean venv on 3.11.
+- [ ] **0.2 Canonical form.** `canonical()`, `chash()`, `decisions_equal()`. Property tests: round-trip through `json.loads` is a fixed point; key order and whitespace never change the hash; NFC vs NFD strings hash equal; `-0.0` and `0.0` hash equal; NaN raises; two `FreeText` never resolve equal.
+  *Verify:* `hypothesis` suite passes 2,000 examples per property.
+- [ ] **0.3 Journal.** SQLite WAL, `synchronous=FULL`, one `entries` table (`run_id, offset, kind, payload_json, payload_hash, prev_hash, ts`). `append()` returns only after `fsync`. Hash-chained per run. Same DDL file loads on Postgres 16 under `testcontainers`.
+  *Verify:* a test appends 1,000 entries, kills the process (`os._exit`) mid-append in a subprocess at a random point, reopens, and asserts the chain verifies and the last entry is either fully present or absent — never partial.
+- [ ] **0.4 ModelClient + journaled wrapper.** Protocol with `complete()` and `stream()`. `JournaledModel` writes `model_request` before the call and `model_response` before returning the result to the caller. Anthropic adapter behind an optional extra; `ScriptedModel` for tests.
+  *Verify:* `ReplayModel` fed the journal of a `ScriptedModel` run reproduces every response; a changed request at step *k* raises `ReplayDivergence(k, diff)` and the test asserts no further entries were written.
+- [ ] **0.5 Vocabulary + no-LLM-in-control-path tests.** `tests/test_vocabulary.py` and `tests/test_no_llm_in_control_path.py` exist and pass on the empty packages.
+  *Verify:* planting the word "guaranteed" in `README.md` fails the vocabulary test; planting `messages=[` in `src/specunode/core/policy.py` fails the control-path test.
+
+**Phase Gate 0:** wheel installs on 3.11; journal survives the kill test; replay diverges loudly; both honesty tests fire on planted violations.
+
+---
+
+## PHASE 1 — Effects, store buffer, fake world, the leak test
+
+Goal: writes can be staged and drained, and there is a world that will tell us if one ever escapes.
+
+- [ ] **1.1 Effect classes + registry.** `ToolSpec`, `ToolRegistry`, MCP annotation mapping per §5. Unknown tools synthesise `WRITE(idempotent=False)` and log once.
+  *Verify:* a tool registered with no class is treated as WRITE; an MCP tool with `readOnlyHint=true` maps to READ; one with no annotations maps to WRITE; overrides in config win.
+- [ ] **1.2 Fake world.** `World` with tables (`customers`, `tickets`, `jobs`, `messages`) and endpoint-style tools; every mutation appended to `world.mutations` as `(branch_id, effect_key, tool, args_hash, ts)`. Fault injection per §5. `World.reads_with_witness()` returns `{value, witness}` where witness is a per-row version counter.
+  *Verify:* `world.mutations` is the only way state changes; a test monkeypatches every public write path and asserts each appends exactly one record.
+- [ ] **1.3 Idempotency keys + dedupe.** Rule 8 derivation. Dedupe table in the journal keyed on `key`; dispatch checks it first.
+  *Verify:* property test — same `(run, lineage, step, tool, args)` → same key across processes; any one component changed → different key; draining the same buffer twice sends each effect once (asserted against `world.mutations`).
+- [ ] **1.4 Store buffer.** `stage()`, `forward()`, `drain()`, `discard()` per §7. Placeholders are `"$specunode.handle:<effect_id>"` strings; `hazards.analyse` finds them anywhere in a later call's canonical args.
+  *Verify:* staging a WRITE causes no `world.mutations`; draining a CONFIRMED branch causes exactly one per staged effect, in stage order; `discard()` on a SQUASHED branch causes none and journals the count.
+- [ ] **1.5 Dispatcher + dead-letter.** At-least-once with bounded exponential backoff; on exhaustion `DEAD_LETTER(reason)` and the run finishes `ok=False`. `COMPENSABLE` effects record their compensator call for later.
+  *Verify:* `world.partition(at=2)` during drain: effects 1 dispatched, 2 dead-lettered after retries, 3 not attempted; resume after partition heals dispatches 2 and 3 with no duplicate of 1.
+- [ ] **1.6 THE LEAK TEST.** `tests/test_leak.py`: 500 randomly generated branch trees (hypothesis), random resolution outcomes, random faults; after every run assert `{m.branch_id for m in world.mutations} ⊆ {b.id for b in branches if b.status == RETIRED}`. **Mandatory. Never skipped. Never marked xfail.**
+  *Verify:* the test exists, runs in CI, and a deliberately planted bug (drain on CONFIRMED before the confirming journal entry is durable) makes it fail.
+
+**Phase Gate 1:** leak test green on 500 trees; partition test green; unknown tools are WRITE.
+
+---
+
+## PHASE 2 — State, sequential scheduler, LangGraph integration, resume
+
+Goal: a real graph runs end to end through SpecuNode in sequential mode with journaling, and survives a kill.
+
+- [ ] **2.1 Committed state + COW fork.** `state.py` per §5; JSON Patch delta at retirement; reducers only for sequential same-key writes.
+  *Verify:* property — fork, mutate the fork, assert committed unchanged; retire, assert committed == committed ⊕ patch; two forks of the same parent never see each other.
+- [ ] **2.2 GraphAdapter + sequential scheduler.** `GraphAdapter` protocol (`nodes()`, `next(state) → NodeRef | END`, `run_node(node, state, model, tools) → Decision | FreeText`). `Scheduler.run()` in sequential mode: every model call journaled, every tool call classified, READ executed, WRITE staged then immediately retired (a sequential run is a chain of single-branch retirements — one code path, not two).
+  *Verify:* the support example runs to completion against `World` with `ScriptedModel`; ledger has one row per write; `world.mutations` matches ledger rows exactly.
+- [ ] **2.3 LangGraph integration.** `wrap(compiled_graph, registry, config) → SpecuNodeGraph` with `.ainvoke()` and `.astream()`; nodes' tool calls are routed through `ToolRunner`; the model client inside nodes is replaced by `JournaledModel` via LangGraph's configurable runnable binding — the developer's graph file does not change. Document what is not supported (interrupts inside a speculative branch: stall).
+  *Verify:* `examples/support_agent` runs unchanged under vanilla LangGraph and under `wrap()`; both produce the same final state; only the wrapped one produces a ledger.
+- [ ] **2.4 Plain-Python integration.** `@specunode.tool(effect=…)`, `@specunode.node`, `specunode.run_loop(step_fn, …)`.
+  *Verify:* the ops example implemented both ways yields identical ledgers under `ReplayModel`.
+- [ ] **2.5 Resume.** `specunode resume <run_id>`: reads the journal, restores committed state, re-drives from the last durable entry; effects already `DISPATCHED` are not re-sent (dedupe table); an in-flight drain resumes.
+  *Verify:* `tests/chaos/test_kill_resume.py` — SIGKILL the subprocess at 15 random points across 20 runs; resume; assert the final ledger and `world.mutations` equal the uninterrupted run's, byte for byte after normalisation.
+- [ ] **2.6 Replay CLI.** `specunode replay <run_id> [--speculation on|off]` runs the graph with `ReplayModel`; `specunode ledger <run_id>` prints the ledger.
+  *Verify:* replay of every committed example produces a ledger equal to the original.
+
+**Phase Gate 2:** kill/resume test green at 15 points; LangGraph example unchanged; replay equal.
+
+---
+
+## PHASE 3 — Speculation: drafters, branches, the gate, hazards, policy
+
+Goal: the runtime runs ahead, and everything it runs ahead is either confirmed exactly or thrown away.
+
+- [ ] **3.1 T0 early-issue drafter.** Parse the target's stream; each `tool_use` block that completes becomes a `Decision` immediately available to the scheduler. Reads issue at once; writes stage at once. α is 1 by construction and the ledger records tier 0 separately.
+  *Verify:* with a `ScriptedModel` streaming three tool calls over 300 ms, the READ among them completes before the stream ends (asserted via timestamps); the WRITEs stage and retire only after the stream's end-of-turn entry is journaled.
+- [ ] **3.2 T1 pattern drafter.** Mine the journal's `tool_request` sequences per workload into an order-*k* transition table over tool *signatures* (name + argument shape); argument templates that reference prior outputs by JSONPath; predictions carry the template-instantiated args. This is PASTE's mechanism (credited in the module docstring and README). Deterministic given the index file.
+  *Verify:* trained on 200 scripted ops runs, the index predicts the next call with a measured top-1 rate reported in the test output (no threshold asserted — the number is a result, not a requirement); predictions are byte-identical across three runs.
+- [ ] **3.3 Branch fork/execute.** Scheduler speculative mode: at each decision point collect candidates from T0 → T1 → T2, dedupe by canonical form, fork up to `max_inflight_branches` as `asyncio` tasks with COW state and forked context. Each branch executes under `hazards.analyse` before every call; a hazard sets `STALLED` and cancels the task.
+  *Verify:* with two distinct candidates, two branches run; their `world.mutations` footprint is zero until resolution; a call whose args include a placeholder stalls with `RETURN_VALUE_DEPENDENCY`.
+- [ ] **3.4 The gate.** `resolve()` per §7; scheduler resolves all open branches when the journaled `model_response` for the step arrives; at most one CONFIRMED; the rest SQUASHED with cancellation; the confirmed branch's context becomes canonical, squashed contexts are dropped.
+  *Verify:* property — over random decision pairs, exactly-equal → CONFIRMED else SQUASHED; `FreeText` never confirms; after resolution the canonical context contains no message from a squashed branch (asserted by message ids).
+- [ ] **3.5 Read validation at retirement (E3).** For witnessed reads, re-fetch witnesses before drain; stale → policy. Unwitnessed reads are reported, never counted fresh.
+  *Verify:* mutate a `World` row between the speculative read and confirmation; assert the branch squashes (policy `squash`), no effect dispatches, and the sequential re-execution reads the new value.
+- [ ] **3.6 Policy + budgets.** Rule 10: inflight/depth/wasted-token caps; rolling α over `alpha_window`; `alpha_floor` gate; when speculation is disabled mid-run a `policy_event` is journaled and the ledger states it.
+  *Verify:* a `ScriptedModel` whose decisions never match the drafter drives α to 0 within one window; the scheduler disables speculation; total wasted tokens ≤ `max_wasted_tokens`; wall clock of the run ≤ sequential wall clock + journaling overhead × 1.1 (overhead measured in the same test).
+- [ ] **3.7 Cancellation is squash.** Squashing cancels the branch task; a tool adapter mid-READ is cancelled cooperatively; a tool adapter that cannot be cancelled finishes and its result is discarded. Never a staged write dispatched by a cancelled task.
+  *Verify:* a slow READ (`world.slow(read, 2000)`) on a branch squashed at 100 ms: the read's result never enters the canonical context; `world.mutations` unchanged.
+
+- [ ] **3.8 Context identity (Rule 13).** Before a branch sends a model request: reject if any placeholder appears in the canonical prompt (`MODEL_TURN_AFTER_STAGED_WRITE` → stall); assemble tool results in program order; record `chash(prompt)` on the branch. At retirement, rebuild the prompt for each recorded step from the canonical context and real results and compare hashes; mismatch → `ContextDivergence`, branch squashed, its model output never used, fault journaled.
+  *Verify:* a branch that stages a write and then tries a model call stalls with the named hazard; a scripted world whose read results arrive out of order still produces the program-order prompt; a planted bug that appends results in completion order fails the test.
+- [ ] **3.9 Read budget.** `max_speculative_reads` per run; exhausted → `READ_BUDGET` hazard; ledger reports `speculative_reads_upstream`.
+  *Verify:* a drafter that always guesses reads is capped at the budget and the ledger count equals `world` read calls attributed to squashed branches.
+
+**Phase Gate 3:** leak test still green with speculation on; context-identity check stalls a model call after a staged write; T0/T1 drafters produce measured (not asserted) α on the examples; stale-read squash works; budget gate disables speculation on a hostile script.
+
+---
+
+## PHASE 4 — MCP proxy
+
+Goal: a developer who cannot change their agent's code still gets the store buffer.
+
+- [ ] **4.1 Proxy skeleton.** `specunode mcp-proxy --upstream "<cmd>" --config specunode.yaml`; stdio; forwards `initialize`, `tools/list` (annotations passed through, overrides applied), and everything not tool-related unchanged.
+  *Verify:* a reference MCP client lists tools through the proxy and sees the upstream's list with effect-class annotations merged from config.
+- [ ] **4.2 `tools/call` interception.** READ → forwarded upstream immediately, result journaled. WRITE/COMPENSABLE/IRREVERSIBLE → staged in the run's current branch; the proxy returns the placeholder handle *as the tool result* with `isError=false` and a structured `_specunode: {staged: true, effect_id}` field; drained on retirement.
+  *Verify:* a scripted client issues read, write, read; the upstream receives the two reads immediately and the write only after the proxy receives the `specunode/retire` notification (below).
+- [ ] **4.3 Decision boundary over MCP.** The proxy cannot see the model, so branch resolution needs a signal: the client sends `notifications/specunode/decision` with the step's actual `Decision` (the LangGraph and plain integrations do this automatically; for a foreign client, `specunode retire <run_id> --step N --decision <json>` does it from a terminal). Until a decision arrives, staged writes stay staged and the proxy's `status` tool says so.
+  *Verify:* without the notification, no write ever reaches upstream (timed test, 5 s); with it, the buffer drains in stage order.
+- [ ] **4.4 Six MCP tools of its own.** `specunode.status`, `specunode.ledger`, `specunode.stall` (force sequential), `specunode.discard` (squash current branch — requires elicitation on protocol versions that support it; refused with the terminal command otherwise), `specunode.retire`, `specunode.replay_check`.
+  *Verify:* a client that cannot elicit is refused `discard` with the exact terminal command in the error text.
+- [ ] **4.5 Security posture.** Loopback only for the optional streamable-HTTP mode; per-run token; no cookies; Origin check. Documented in `docs/mcp-proxy.md`.
+  *Verify:* a cross-origin request is rejected; a request without the token is rejected.
+
+**Phase Gate 4:** the support example, driven by a generic MCP client through the proxy, produces the same ledger as the LangGraph integration.
+
+---
+
+## PHASE 5 — Equivalence, chaos, concurrency
+
+Goal: prove Rule 9 and Rule 6 under hostile conditions, not on happy paths.
+
+- [ ] **5.1 THE EQUIVALENCE TEST.** `tests/test_equivalence.py`: for every workload in `bench/workloads/` and every committed corpus trace, run under `ReplayModel` with speculation off and with speculation on (each drafter tier, and all tiers), and assert `normalise_for_equivalence(ledger_off) == normalise_for_equivalence(ledger_on)`. **Mandatory. Never skipped.**
+  *Verify:* a planted bug (retire on `SQUASHED`) fails it; a planted bug (dispatch order reversed) fails it.
+- [ ] **5.2 Chaos.** `bench/chaos/run_chaos.py`: SIGKILL at 25 random points per run × 40 runs with speculation on; partition during drain; duplicate delivery of acks; slow reads that outlive their branch. After each: resume, then assert ledger equivalence with the clean run and the leak invariant.
+  *Verify:* 0 leaks, 0 duplicates, 0 equivalence failures across the matrix; the numbers are written to `bench/results/chaos.json`.
+- [ ] **5.3 Concurrency.** 20 runs sharing one journal file and one `World`; branches interleaved; assert per-run ledgers equal their solo runs and that no branch ever observed a sibling's staged effect (instrumented `forward()` records every lookup).
+  *Verify:* `bench/results/concurrency.json` shows 0 cross-branch observations.
+- [ ] **5.4 Forged / tampered ledgers.** `specunode verify-ledger` checks the Ed25519 signature and the journal chain; a ledger whose rows were edited, and a ledger signed with a key that signs no other ledger in the store, are both rejected, with the reason stated (integrity vs origin).
+  *Verify:* both forgeries rejected; a genuine ledger accepted.
+
+- [ ] **5.5 THE CONTEXT-EQUIVALENCE TEST (live, shadow mode).** `tests/test_context_equivalence.py`: run each sample app with a `ScriptedModel` that records every prompt it receives, once sequentially and once with speculation on; assert the sequence of canonical-step prompts is byte-identical, and that every speculative prompt that was sent equals the canonical prompt at that step. This is the test Q1 needs and the replay-based test cannot provide. **Mandatory. Never skipped.**
+  *Verify:* a planted bug that lets a placeholder reach a prompt fails it; a planted completion-order append fails it.
+
+**Phase Gate 5:** equivalence, context-equivalence and leak tests green across all workloads and tiers; chaos matrix at zero on all three counters.
+
+---
+
+## PHASE 6 — Measurement: how much speculation is really there
+
+Goal: numbers, with the negative ones first.
+
+- [ ] **6.1 Corpus.** `bench/corpus/fetch.py` pulls the seeded sample from `nebius/SWE-rebench-openhands-trajectories`; normalise to `(tool_name, args_shape, effect_class_guess_for_analysis_only, refs_prior_output)` sequences. If unavailable (Decision Gate D1), run the three sample apps with the target model on 60 seeded tasks each and commit the journals. The manifest is byte-identical on rebuild. **Effect classes in the corpus are labelled by a committed hand-written table per tool name, never by heuristic on unlabelled tools; unlabelled tools are `WRITE` in the analysis just as in the runtime.**
+  *Verify:* manifest hash committed; rebuild reproduces it.
+- [ ] **6.2 Offline opportunity analysis.** `bench/offline/run_opportunity.py` (no model calls): for each trace, compute (a) fraction of steps predictable by T1 at top-1/top-3 (leave-one-trace-out); (b) fraction of predicted calls that are READ vs WRITE; (c) fraction of steps blocked by each hazard class; (d) mean/median speculable run length past a write under PASTE-style policy (writes are barriers) vs SpecuNode (writes stage); (e) fraction of steps behind free-text barriers; (f) fraction of steps that are a model call immediately consuming a write's result (`MODEL_TURN_AFTER_STAGED_WRITE` shape — no past-write gain possible). Bootstrap 95% CIs over traces. Output `bench/results/opportunity.json` + plots.
+  *Verify:* runs on the committed corpus in under 10 minutes on CPU; every number carries a CI.
+- [ ] **6.3 Baselines.** `bench/baselines.py`: `B_seq` (sequential through SpecuNode, speculation off), `B_readonly_spec` (speculation on, all non-READ tools are barriers — PASTE's policy, credited), `B_naive_parallel` (speculation on, writes execute for real, branch discarded on mismatch — the langchain-nvidia failure mode), `B_specunode`. All four share the journal so they replay the same model outputs.
+  *Verify:* `B_naive_parallel` leaks on the Demo 1 workload and the leak count is reported, not hidden.
+- [ ] **6.4 Online latency bench.** `bench/online/run_latency.py`: the three sample apps × 30 seeded tasks × {B_seq, B_readonly_spec, B_specunode} with the real target model, budget-capped; per run: wall clock, tokens (target, draft), wasted tokens, α per tier, stalls by hazard, stale reads, effects dispatched, leaks (must be 0). Report the break-even α per workload (the α at which `B_specunode` wall clock equals `B_seq`). Bootstrap CIs over tasks.
+  *Verify:* `bench/results/latency.json`; spend stays under the cap and the report records the spend.
+- [ ] **6.5 Overhead.** Journaling + classification overhead of `B_seq` vs the same graph on vanilla LangGraph with no SpecuNode, same `ReplayModel`. Reported as absolute ms per step and as a fraction of wall clock.
+  *Verify:* `bench/results/overhead.json`.
+- [ ] **6.6 Report generation.** `bench/report.py` → `RESULTS.md`; `bench/plots/make_plots.py` → PNGs; `bench/check_numbers.py` enforces README traceability.
+  *Verify:* `RESULTS.md` regenerates identically from committed JSON; CI fails on a planted untraceable number.
+
+**Phase Gate 6:** opportunity + latency + overhead results committed with CIs; `RESULTS.md` generated; the anti-results (workloads where speculation buys ≤ 5% or is disabled by policy) are in the README with the same prominence as the wins.
+
+---
+
+## PHASE 7 — Break your own runtime
+
+Goal: publish the attacks that beat it, with measured rates. Each strategy is one file that returns a rate; a strategy that fails to run is an error row, never a dropped row.
+
+- [ ] **7.1 Misdeclared tool.** A tool declared READ that actually writes. Measure: effects from squashed branches reaching the world. Expected non-zero — this is the runtime's trust boundary and the README says so.
+- [ ] **7.2 Hidden side effect in a read.** A READ with logging/rate-limit/billing side effects upstream. Measure: upstream calls from squashed branches (they happen; they are reported as "speculative reads that reached upstream" in every ledger, never hidden).
+- [ ] **7.3 Stale reads under contention.** Another actor mutates rows between speculative read and confirmation at rates 1/s, 10/s, 100/s. Measure: stale-read squash rate, and the fraction of stale reads that were *unwitnessed* (undetectable). The second number is the honest one.
+- [ ] **7.4 Non-idempotent tool with duplicate delivery.** `world.duplicate_delivery` on a tool declared `idempotent=False`. Measure: duplicates reaching the world with vs without the dedupe table; document that dedupe protects the *dispatcher's* retries, not the network beyond it.
+- [ ] **7.5 Return-value laundering.** A branch copies a placeholder handle into free text and a later tool receives it inside a string. Measure: does hazard analysis catch placeholders embedded in strings, in nested arrays, base64-encoded? Report the miss rate; fix what can be fixed (substring scan of canonical args), document what cannot (encoded).
+- [ ] **7.6 Prompt-injected tool call.** A READ result contains text instructing the model to call `send_email`. The drafter (T1) predicts it; the target model does not emit it. Measure: 0 dispatches expected (it is a squash). Then the target model *does* emit it: it dispatches, because SpecuNode is not an authorization layer — the README says so and points to SCOPEGATE-style per-call policy as the missing piece.
+- [ ] **7.7 Drafter poisoning.** Train the T1 index on traces with an adversarial "strong chain" that ends in a write. Measure: wasted tokens and stall/squash counts; assert leaks stay 0.
+- [ ] **7.8 Replay under model drift.** Replay a journal after changing the system prompt by one token, and after changing the tool list. Measure: step of first `ReplayDivergence`. Expected: step 1 in both cases.
+- [ ] **7.10 Asynchronous side effect behind a READ.** A tool declared READ whose synchronous response is `{"status": "queued", "job_id": …}` and whose upstream enqueues a background job that writes and notifies. The branch is squashed; the job runs anyway. Measure: leaked effects per squashed branch. Expected non-zero. Document: *a tool that enqueues, schedules or triggers anything asynchronously is not a READ, whatever its HTTP verb.*
+- [ ] **7.9 Speculation past an IRREVERSIBLE with `stage_irreversible=true`.** Measure the latency gain and show the ledger row that says an irreversible effect was retired on a decision the model made — correct, but the docs must say the default is off and why.
+
+*Verify for the phase:* `bench/adversarial/run_attacks.py --all` writes `bench/results/attacks.json` with a row per strategy; `RESULTS.md` has a section "What beats it" placed before "What it does well".
+
+**Phase Gate 7:** every strategy has a measured rate or an error row; README's limitations section lists 7.1, 7.2, 7.3-unwitnessed, 7.4, 7.5-encoded, 7.6 and 7.10 as things the runtime cannot fix.
+
+---
+
+## PHASE 8 — Survive contact with a real pipeline
+
+- [ ] **8.1 Interrupts / human-in-the-loop.** A LangGraph `interrupt()` inside a speculative branch is a hazard (`STALLED`); on the canonical path it works as in vanilla LangGraph, with the pending interrupt journaled.
+- [ ] **8.2 Streaming to the user.** `.astream()` yields only canonical-path tokens; speculative branches' model output never streams to the user (it may be squashed).
+- [ ] **8.3 Sub-graphs.** A node that is itself a graph forks its own branch tree under the parent's lineage; retirement is nested; the leak test covers nesting.
+- [ ] **8.4 Adapter contract doc + suite.** `docs/adapters.md` specifies what a tool adapter must satisfy (cancellable, idempotent on key when declared, witness format); `tests/test_adapter_suite.py` runs every bundled adapter and the `World` tools through it.
+- [ ] **8.5 Postgres journal in CI** under `testcontainers`; the same suite passes.
+
+**Phase Gate 8:** interrupts, streaming, sub-graphs covered by tests; adapter suite green on all adapters.
+
+---
+
+## PHASE 9 — Ship
+
+- [ ] **9.1 README** with: one-paragraph CPU analogy; the three demos with their printed outputs; the opportunity plot; the latency table with CIs; the break-even α per workload; "What beats it"; "What this is not" (not a durable-execution platform, not an authorization layer, not a context manager); credits to PASTE, Claude Code's executor, langchain-nvidia, ToolAhead, SagaLLM, ATP, SCOPEGATE, Temporal/DBOS/Restate.
+- [ ] **9.2 Docs** (`docs/*.md`) complete; `specunode init` writes `specunode.yaml` + `.specunode/`.
+- [ ] **9.3 Release.** Tag `v0.1.0`, `uv build`, publish to PyPI as `specunode`, install from PyPI in a clean 3.11 venv on both OSes and run Demo 1 from the published wheel. Record the exact install command that failed, if any, in the docs the same day.
+- [ ] **9.4 Report.** `bench/make_report_pdf.py` regenerates the technical report from `bench/results/*.json` — every number in the PDF is read from a file.
+
+**Phase Gate 9:** `pip install specunode` works on 3.11; demos run from the published wheel; `check_numbers.py` green against the published README.
+
+---
+
+## Definition of done
+
+- [ ] Wheel installs on Python 3.11, 3.12, 3.13 on macOS and Ubuntu
+- [ ] Leak test (Rule 3), equivalence test (Rule 9) and context-equivalence test (Rule 13) run on every workload, every tier, every CI job; none is skippable
+- [ ] Kill/resume at 15 points and chaos matrix at zero leaks, zero duplicates, zero equivalence failures
+- [ ] LangGraph integration works on an unchanged graph file; plain-Python integration works; MCP proxy works with a generic client
+- [ ] T0, T1 drafters shipped; T2 behind an extra
+- [ ] Offline opportunity analysis, online latency bench (budget-capped), overhead bench, adversarial suite — all with committed JSON, CIs, and commands
+- [ ] `RESULTS.md`, README numbers, and the PDF are generated; `check_numbers.py` and the vocabulary check are green
+- [ ] "What beats it" section in README and report, before the wins
+- [ ] Every prior-art project in §3 credited by name in the README
+- [ ] Published to PyPI; installed and demoed from the published wheel
+
+---
+
+## Known limitations to document, not fix
+
+- The effect class is the developer's word. A READ that writes defeats the store buffer completely (7.1). The runtime cannot detect this and does not try.
+- A READ whose upstream enqueues asynchronous work is a write in disguise (7.10). The synchronous response looks harmless; the side effect happens later. Such tools must be declared WRITE, and the docs say so on the first page.
+- Past-write speculation hides tool latency, not model latency. The model call after a staged write always waits for the real result (Rule 13). Workloads shaped `model → write → model(reads result)` gain nothing from it, and the bench reports that fraction.
+- Speculative reads reach upstream systems even when the branch is squashed (7.2). Any read with billing, rate-limit or audit side effects is a speculative cost, and the ledger counts them.
+- Reads without a witness cannot be validated at retirement (7.3). The ledger reports them as unwitnessed, never as fresh.
+- Idempotency dedupe covers the dispatcher's own retries. Network-level duplication beyond the dispatcher needs the tool's own idempotency (7.4).
+- A placeholder handle encoded or transformed inside a string can evade hazard analysis (7.5).
+- SpecuNode is not authorization. A tool call the target model actually emits is dispatched (7.6).
+- Free-text nodes are barriers. Workloads dominated by prose-to-prose handoffs get little or no speedup, and the bench says how much.
+- The journal is local. Hosting a run inside Temporal/DBOS/Restate is documented as a pattern, not shipped as an integration.
+- Research prototype: one target-model provider adapter, LangGraph + plain Python + MCP, three sample apps.
+
+---
+
+## Decision gates — stop and reassess if any of these fire
+
+- **D1 — Corpus.** If `nebius/SWE-rebench-openhands-trajectories` is unavailable at build time or its license changes, generate the corpus from the sample apps (6.1) and state in the README that the opportunity analysis is on self-generated traces.
+- **D2 — Online bench budget.** If the spend cap is hit before 30 tasks per app, report what completed with the reduced *n* and its wider CI; do not raise the cap silently.
+- **D3 — T1 never beats break-even.** If the measured break-even α exceeds the measured T1 α on every workload, the headline is "T0 early-issue plus the store buffer is the useful part; pattern drafting did not pay for itself on these workloads". That is a publishable result. Do not tune the workloads until it flips.
+- **D4 — LangGraph API drift.** If the node-runner substitution needs private APIs, use them, pin the version, and document the pin; do not fork LangGraph.
+- **D5 — MCP annotations sparse in the wild.** If tested upstream servers ship no annotations, the proxy defaults everything to WRITE (Rule 2) and the docs say the per-tool override table is mandatory for any speedup.
+
+---
+
+## Suggested schedule
+
+| Phase | Days |
+|---|---|
+| 0 Scaffold, canonical, journal | 2 |
+| 1 Effects, store buffer, leak test | 3 |
+| 2 State, scheduler, LangGraph, resume | 4 |
+| 3 Speculation | 5 |
+| 4 MCP proxy | 3 |
+| 5 Equivalence, chaos, concurrency | 3 |
+| 6 Measurement | 4 |
+| 7 Break it | 3 |
+| 8 Real pipeline | 2 |
+| 9 Ship | 2 |
+
+---
+
+## Progress Log
+
+*Agent: append one line per completed task, decision, blocker or defect. Format: `[task-id] what — date`. This is the audit trail the Final Report is written from.*
+
+```
+```
+
+---
+
+## Final Report
+
+*Agent: write this when every phase is done. Sections:*
+
+- *What was built, in five sentences.*
+- *The two headline numbers — measured speculable run length past a write vs the read-only baseline, and wall-clock reduction with CI per workload — with the commands that produced them.*
+- *The anti-results: workloads where speculation bought ≤ 5% or was disabled by policy; the break-even α; unwitnessed stale-read fraction; overhead of journaling.*
+- *The attacks that beat it, with measured rates.*
+- *Every decision you made that this spec did not specify, and why.*
+- *Everything in the Definition of Done that is not ticked, and why not.*
+- *Manual steps left for the human (PyPI publish, API key, corpus download if D1 fired).*
+- *What you would do differently with another month.*

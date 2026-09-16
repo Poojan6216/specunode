@@ -1,0 +1,96 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "specunode"
+version = "0.1.0"
+description = "Speculative out-of-order execution for agent graphs, with a store buffer: reads run early, writes wait until the model's real decision confirms them."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Poojan Patel" }]
+keywords = ["llm", "agents", "speculative-execution", "langgraph", "mcp", "durable-execution"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+  "Typing :: Typed",
+]
+dependencies = [
+  "pydantic>=2.7",
+  "typer>=0.12",
+  "pyyaml>=6.0",
+  "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+langgraph = ["langgraph>=0.6", "langchain-core>=0.3"]
+mcp = ["mcp>=1.2"]
+postgres = ["psycopg[binary]>=3.1"]
+local-draft = ["transformers>=4.44", "torch>=2.2"]
+bench = ["matplotlib>=3.8", "numpy>=1.26", "datasets>=2.20", "reportlab>=4.1"]
+
+[project.urls]
+Homepage = "https://github.com/Poojan6216/specunode"
+Repository = "https://github.com/Poojan6216/specunode"
+
+[project.scripts]
+specunode = "specunode.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.2",
+  "pytest-asyncio>=0.23",
+  "pytest-timeout>=2.3",
+  "hypothesis>=6.100",
+  "mypy>=1.10",
+  "ruff>=0.5",
+  "types-PyYAML",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/specunode"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/specunode", "tests", "bench", "examples", "docs", "README.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "bench", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF", "ASYNC", "PTH", "TID"]
+ignore = ["B008", "RUF012"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/specunode"]
+warn_unreachable = true
+disallow_any_explicit = false
+plugins = []
+
+[[tool.mypy.overrides]]
+module = ["ulid.*", "langgraph.*", "langchain_core.*", "mcp.*", "anthropic.*", "datasets.*", "matplotlib.*", "reportlab.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+  "slow: long-running tests",
+  "postgres: requires a Postgres 16 instance",
+  "online: requires a live model API key",
+]
+filterwarnings = ["error::DeprecationWarning:specunode.*"]
