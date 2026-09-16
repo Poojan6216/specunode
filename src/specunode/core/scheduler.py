@@ -49,6 +49,7 @@ from specunode.core.state import CommittedState, Reducer, patch_payload, resolve
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
 from specunode.journal.ledger import Ledger, build_ledger
+from specunode.journal.replay import recover
 
 __all__ = ["BranchOutcome", "RunResult", "Scheduler", "SchedulerError"]
 
@@ -291,6 +292,10 @@ class Scheduler:
         if self.graph.capabilities().drives_itself:
             return await self._run_driven(run_id, inputs)
 
+        return await self._drive_from_state(run_id)
+
+    async def _drive_from_state(self, run_id: str) -> RunResult:
+        """The scheduler-driven loop, from whatever committed state it was handed."""
         committed = self._committed
         cursor = self._cursor
         reducers = self._reducers
@@ -311,11 +316,12 @@ class Scheduler:
                     ok, error = False, f"node {node.name} failed"
                     break
 
-                report = await self._retire(branch, node_id)
-                if not report:
+                drained, updated = await self._retire(branch, node_id, committed, reducers)
+                if not drained:
                     ok, error = False, f"effects from node {node.name} did not all dispatch"
-
-                committed, cursor = await self._commit(branch, committed, reducers)
+                if updated is not None:
+                    committed = updated
+                cursor = branch.cursor
                 self._committed, self._cursor = committed, cursor
                 steps += 1
                 if not ok:
@@ -334,6 +340,55 @@ class Scheduler:
             steps=steps,
             error=error,
         )
+
+    async def resume(self, run_id: str) -> RunResult:
+        """Continue a run that was interrupted, without re-sending what already went out.
+
+        Nothing is replayed and nothing is re-decided: committed state is rebuilt from the
+        deltas of branches the journal records as RETIRED, the step counter continues above
+        the highest position those branches consumed, and the graph is driven on from there.
+
+        The dedupe table is what makes it safe rather than merely possible. An effect that was
+        acked before the crash is claimed and skipped; one whose request demonstrably never
+        left the dead process is re-sent; and one that may or may not have taken effect is
+        dead-lettered unless the tool declared a repeat harmless. That last case is the
+        two-generals boundary, and guessing at it is how a card gets charged twice.
+
+        Only the retired chain contributes. A branch that was confirmed but never retired had
+        its drain in flight when the process died; its state delta is not applied and its
+        cursor is not adopted, because resuming from it would dispatch effects that were never
+        context-checked or witness-validated.
+        """
+        recovery = recover(self.journal, run_id)
+        self.run_id = run_id
+        self.buffer.run_id = run_id
+        self.buffer.scheduler_task = asyncio.current_task()
+        self._committed = CommittedState(recovery.state)
+        self._cursor = recovery.cursor
+        self._reducers = resolve_reducers(dict(self.reducers))
+        self._steps = 0
+
+        await self.journal.append_async(
+            run_id,
+            "run_started",
+            {
+                "v": 1,
+                "mode": "resume",
+                "resumed_from_offset": recovery.last_offset,
+                "config_hash": chash({"reducers": dict(self.reducers)}),
+                "registry_hash": chash(sorted(self.registry.names())),
+                "policy": {"speculation": self.policy.speculation},
+                "graph": {"adapter": self.graph.capabilities().framework},
+                "target": {"provider": "configured", "model": "configured"},
+                "recovered": {
+                    "retired_branches": len(recovery.retired_branches),
+                    "confirmed_not_retired": list(recovery.confirmed_not_retired),
+                    "unresolved_dispatches": len(recovery.unresolved_dispatches),
+                    "step_index": recovery.step_index,
+                },
+            },
+        )
+        return await self._drive_from_state(run_id)
 
     async def _run_driven(self, run_id: str, inputs: JsonValue) -> RunResult:
         """The framework owns the loop; the runtime is reached from inside each node.
@@ -421,12 +476,13 @@ class Scheduler:
         task: asyncio.Task[JsonValue] = asyncio.create_task(run())
         branch.task = task
         await self._quiesce(branch, task)  # type: ignore[arg-type]
+        # State on this path belongs to the framework's checkpointer, so no delta is journaled
+        # and none is passed here.
         await self._retire(branch, node_id)
         self._cursor = branch.cursor
         self._steps += 1
-        # State on this path belongs to the framework's checkpointer, not to the journal:
-        # LangGraph owns reducers and channel semantics, and a second copy here would be a
-        # second answer to what the run's state is. docs/replay.md says so.
+        # LangGraph owns reducers and channel semantics, and a second copy in the journal would
+        # be a second answer to what the run's state is. docs/replay.md says so.
         return task.result()
 
     # -- the pieces -----------------------------------------------------------------------------
@@ -529,7 +585,13 @@ class Scheduler:
             return BranchOutcome.DONE
         return BranchOutcome.PARKED
 
-    async def _retire(self, branch: Branch, node_id: str) -> bool:
+    async def _retire(
+        self,
+        branch: Branch,
+        node_id: str,
+        committed: CommittedState | None = None,
+        reducers: Mapping[str, Reducer] | None = None,
+    ) -> tuple[bool, CommittedState | None]:
         """R5 through R9: confirm, make it durable, drain, then retire."""
         branch.confirm()
         # Nothing to rebuild in sequential mode: every request this branch sent carried real
@@ -591,12 +653,22 @@ class Scheduler:
                 "waiting on something the runtime never completes"
             )
         if isinstance(task, asyncio.Task) and task.done() and task.exception() is not None:
-            return False
+            return False, committed
         if undrained:
             raise SchedulerError(
                 f"branch {branch.id} staged {len(undrained)} effect(s) that were never "
                 "dispatched; an authorised write cannot be silently dropped"
             )
+        # The state delta is made durable BEFORE the entry that says this branch retired.
+        # The other order loses a crash window with teeth: if the process dies between them,
+        # the branch reads as retired while its state change is gone, so a resume re-runs the
+        # node -- from a *different* program position, deriving different idempotency keys, and
+        # dispatching effects that already went out. It looks like a resume bug and is an
+        # ordering bug.
+        new_committed = committed
+        if committed is not None:
+            new_committed = await self._commit(branch, committed, reducers or {})
+
         branch.retire()
         self._retire_seq += 1
         self.counters.branches_retired += 1
@@ -609,20 +681,28 @@ class Scheduler:
                 "step": branch.fork_step,
                 "status": "retired",
                 "retire_seq": self._retire_seq,
+                # The exact program position this retirement committed. A resume restores it
+                # verbatim rather than inferring it from the highest step it can see: inferring
+                # lands the resumed run at a different position, so every key it derives differs
+                # from the pre-crash one, the dedupe table misses, and the effects go out twice.
+                "cursor_after": {
+                    "step_index": branch.cursor.step_index,
+                    "visits": [[name, count] for name, count in branch.cursor.visits],
+                },
             },
         )
-        return ok
+        return ok, new_committed
 
     async def _commit(
         self,
         branch: Branch,
         committed: CommittedState,
         reducers: Mapping[str, Reducer],
-    ) -> tuple[CommittedState, StepCursor]:
+    ) -> CommittedState:
         """Apply the retiring branch's delta, and journal what it did to committed state."""
         patch = branch.state.delta()
         if not patch:
-            return committed, branch.cursor
+            return committed
         result = committed.commit(patch, reducers=reducers)
         await self.journal.append_async(
             self.run_id,
@@ -640,7 +720,7 @@ class Scheduler:
                 ],
             },
         )
-        return result.state, branch.cursor
+        return result.state
 
     async def _decide(self, decision: Decision) -> Decision:
         """A node reporting its decision. In sequential mode it is simply itself."""

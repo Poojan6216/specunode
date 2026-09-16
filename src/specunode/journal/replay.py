@@ -22,6 +22,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from specunode.canonical import JsonValue
+from specunode.core.branch import StepCursor
 from specunode.core.model import (
     ModelResponse,
     RequestEnvelope,
@@ -36,7 +37,16 @@ from specunode.core.model import (
 )
 from specunode.journal.journal import Journal
 
-__all__ = ["JournaledTurn", "ReplayDivergence", "ReplayExhausted", "ReplayModel", "diff_requests"]
+__all__ = [
+    "JournaledTurn",
+    "Recovery",
+    "ReplayDivergence",
+    "ReplayExhausted",
+    "ReplayModel",
+    "attested_origins",
+    "diff_requests",
+    "recover",
+]
 
 
 class ReplayDivergence(RuntimeError):
@@ -228,3 +238,147 @@ class ReplayModel:
 
 def _as_mapping(value: JsonValue) -> Mapping[str, JsonValue]:
     return value if isinstance(value, Mapping) else {}
+
+
+# -- attestation ------------------------------------------------------------------------------
+
+
+def attested_origins(
+    journal: Journal, run_id: str, lineage: Sequence[str], upto_step: int
+) -> frozenset[str]:
+    """Branch ids whose journaled output may be read back as an *input*.
+
+    Two sets, unioned: branches the journal records as RETIRED at or before ``upto_step``, and
+    this branch's own lineage -- itself and its ancestors, which are unresolved but are its own
+    past rather than somebody else's alternative.
+
+    The union is necessary because ``lineage`` resets at every retirement: it is a
+    key-derivation value, so at step five it names only the current extent, and a filter built
+    on it alone would hide every earlier assistant turn. A rebuild under that filter matches
+    nothing, every branch reports a context divergence, and the step is redone forever.
+
+    The tempting repair, once that is seen, is to admit anything from a branch that is *not*
+    squashed. That admits a sibling that has not resolved yet -- the exact channel Hard Rule 6
+    exists to close -- so the test is membership in this set, never absence from a blacklist.
+    """
+    retired: set[str] = set()
+    for entry in journal.read(run_id, kinds=["branch_resolved"]):
+        payload = entry.payload
+        if payload.get("status") != "retired":
+            continue
+        step = payload.get("step")
+        if isinstance(step, int) and not isinstance(step, bool) and step > upto_step:
+            continue
+        branch_id = payload.get("branch_id")
+        if isinstance(branch_id, str):
+            retired.add(branch_id)
+    return frozenset(retired | set(lineage))
+
+
+# -- recovery ----------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Recovery:
+    """What a crashed run left behind, and what a resumed one may build on.
+
+    Only the **retired chain** contributes. A branch that was confirmed but never journaled as
+    retired, and a branch that was mid-drain when the process died, are both evidence rather
+    than input: their state deltas are not applied and their cursors are not adopted. Resuming
+    from a branch that had a durable ``model_response`` but no confirming entry would dispatch
+    an effect that was never context-checked and never witness-validated, which is Hard Rule 3
+    violated by a crash rather than by a bug.
+    """
+
+    run_id: str
+    #: Committed state, rebuilt by applying the retired branches' deltas in offset order.
+    state: dict[str, JsonValue]
+    #: The program position the last retirement committed, restored verbatim from the journal.
+    #: Inferring it from the highest step visible instead lands the resumed run somewhere else,
+    #: so every idempotency key it derives differs from its pre-crash value, the dedupe table
+    #: misses, and effects that already went out go out again.
+    cursor: StepCursor
+    #: The step index inside that cursor, for the status command.
+    step_index: int
+    retired_branches: frozenset[str]
+    #: Branches with a durable confirming entry but no retirement: their drain was in flight.
+    confirmed_not_retired: tuple[str, ...]
+    #: Dispatch claims left in flight. Each is a two-generals case until it is resolved.
+    unresolved_dispatches: tuple[Mapping[str, JsonValue], ...]
+    last_offset: int
+    finished: bool
+
+    @property
+    def resumable(self) -> bool:
+        return not self.finished or bool(self.confirmed_not_retired)
+
+
+def _cursor_from(payload: JsonValue, fallback: StepCursor) -> StepCursor:
+    """Read a journaled ``cursor_after`` back into a cursor."""
+    if not isinstance(payload, Mapping):
+        return fallback
+    step = payload.get("step_index")
+    raw_visits = payload.get("visits")
+    visits: list[tuple[str, int]] = []
+    if isinstance(raw_visits, Sequence) and not isinstance(raw_visits, str):
+        for item in raw_visits:
+            if isinstance(item, Sequence) and not isinstance(item, str) and len(item) == 2:
+                name, count = item
+                if isinstance(name, str) and isinstance(count, int):
+                    visits.append((name, count))
+    return StepCursor(
+        step_index=step if isinstance(step, int) and not isinstance(step, bool) else 0,
+        visits=tuple(sorted(visits)),
+    )
+
+
+def recover(journal: Journal, run_id: str) -> Recovery:
+    """Read a run's journal and work out what a resume may safely build on."""
+    from specunode.core.state import apply, operation_from_json
+
+    retired: set[str] = set()
+    confirmed: set[str] = set()
+    deltas: list[tuple[int, str, Sequence[JsonValue]]] = []
+    cursor = StepCursor()
+    last_offset = -1
+    finished = False
+
+    for entry in journal.read(run_id):
+        last_offset = entry.offset
+        payload = entry.payload
+        if entry.kind == "run_finished":
+            finished = True
+        elif entry.kind == "branch_resolved":
+            branch_id = payload.get("branch_id")
+            status = payload.get("status")
+            if isinstance(branch_id, str):
+                if status == "retired":
+                    retired.add(branch_id)
+                    confirmed.discard(branch_id)
+                    cursor = _cursor_from(payload.get("cursor_after"), cursor)
+                elif status == "confirmed":
+                    confirmed.add(branch_id)
+        elif entry.kind == "state_delta_applied":
+            branch_id = payload.get("branch_id")
+            patch = payload.get("patch")
+            if isinstance(branch_id, str) and isinstance(patch, Sequence):
+                deltas.append((entry.offset, branch_id, patch))
+
+    state: JsonValue = {}
+    for _offset, branch_id, patch in deltas:
+        if branch_id not in retired:
+            continue
+        operations = [operation_from_json(op) for op in patch if isinstance(op, Mapping)]
+        state = apply(state, operations)
+
+    return Recovery(
+        run_id=run_id,
+        state=dict(state) if isinstance(state, Mapping) else {},
+        cursor=cursor,
+        step_index=cursor.step_index,
+        retired_branches=frozenset(retired),
+        confirmed_not_retired=tuple(sorted(confirmed)),
+        unresolved_dispatches=tuple(journal.unresolved_dispatches(run_id)),
+        last_offset=last_offset,
+        finished=finished,
+    )
