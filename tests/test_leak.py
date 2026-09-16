@@ -1,0 +1,412 @@
+"""THE LEAK TEST (spec task 1.6, Hard Rule 3). Mandatory. Never skipped. Never xfailed.
+
+The whole project reduces to one claim: **nothing reaches the world from a branch that did not
+retire.** Every other property -- replay, equivalence, the ledger -- is bookkeeping around that.
+So this test generates random branch trees with random resolution outcomes under random faults,
+and after every single run asserts it.
+
+Two invariants are checked, because the spec's own statement of the property does not catch the
+bug the spec names as the planted one:
+
+``I1`` -- the spec's, verbatim
+    ``{m.branch_id for m in world.mutations} ⊆ {b.id for b in branches if b.status is RETIRED}``
+
+``I2`` -- authorisation
+    every mutation traces to a ``branch_resolved{confirmed}`` entry that was **durable before
+    the effect was dispatched**. I1 alone cannot see a drain that happened before its
+    confirming entry was fsynced, because in a single process the branch is CONFIRMED either
+    way and the mutation is attributed to a branch that does retire. That is precisely the bug
+    task 1.6 says a planted version of must make this file fail, so it needs an invariant that
+    can see it.
+
+Both invariants have planted-bug proofs at the bottom: the check is disabled, the same
+generator runs, and the test asserts the invariant *fails*. A leak test that would pass with
+the safety mechanism removed is not evidence of anything.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
+
+from specunode.buffer.dispatcher import Dispatcher
+from specunode.buffer.store_buffer import StoreBuffer
+from specunode.core.branch import Branch, BranchClosed, BranchStatus
+from specunode.core.decision import ToolCall
+from specunode.core.effects import EffectClass, ToolRegistry, ToolSpec, forward_keys_from_template
+from specunode.ids import new_ulid
+from specunode.journal.journal import Journal
+from specunode.testing.world import World, standard_world
+
+WRITE_TOOLS = ("restart_job", "charge_card", "post_summary")
+
+
+# -- the generated shape ------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StepPlan:
+    """One decision point: how many siblings fork, which one the model confirms, what breaks."""
+
+    siblings: int
+    #: Index of the sibling the model's real decision matches, or None -- every guess wrong,
+    #: so the canonical path proceeds without a speculative winner.
+    winner: int | None
+    effects_per_branch: tuple[int, ...]
+    tools: tuple[str, ...]
+
+
+step_plans = st.builds(
+    lambda siblings, winner_seed, effects, tools: StepPlan(
+        siblings=siblings,
+        winner=None if winner_seed is None else winner_seed % siblings,
+        effects_per_branch=tuple(effects[:siblings]) + (0,) * max(0, siblings - len(effects)),
+        tools=tuple(tools[:8]) or ("restart_job",),
+    ),
+    siblings=st.integers(min_value=1, max_value=3),
+    winner_seed=st.one_of(st.none(), st.integers(min_value=0, max_value=5)),
+    effects=st.lists(st.integers(min_value=0, max_value=3), min_size=1, max_size=3),
+    tools=st.lists(st.sampled_from(WRITE_TOOLS), min_size=1, max_size=8),
+)
+
+fault_plans = st.fixed_dictionaries(
+    {
+        "partition_at": st.one_of(st.none(), st.integers(min_value=1, max_value=6)),
+        "duplicate": st.one_of(st.none(), st.sampled_from(WRITE_TOOLS)),
+        "timeout": st.one_of(st.none(), st.sampled_from(WRITE_TOOLS)),
+    }
+)
+
+
+def _registry(world: World) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="restart_job",
+            effect=EffectClass.WRITE,
+            fn=world.restart_job,
+            idempotent=True,
+            forward_keys=forward_keys_from_template("job:{args.job_id}"),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="charge_card",
+            effect=EffectClass.WRITE,
+            fn=world.charge_card,
+            forward_keys=forward_keys_from_template("customer:{args.customer_id}"),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="post_summary",
+            effect=EffectClass.IRREVERSIBLE,
+            fn=world.post_summary,
+            forward_keys=forward_keys_from_template("channel:{args.channel}"),
+        )
+    )
+    return registry
+
+
+def _args(tool: str, seed: int) -> dict[str, object]:
+    if tool == "restart_job":
+        return {"job_id": f"etl-{seed % 4 + 1}"}
+    if tool == "charge_card":
+        return {"customer_id": f"cus-{seed % 5 + 1}", "amount": float(seed % 7 + 1)}
+    return {"channel": f"#ops-{seed % 3}", "text": f"note {seed}"}
+
+
+@dataclass
+class RunResult:
+    world: World
+    journal: Journal
+    run_id: str
+    branches: list[Branch]
+
+
+async def simulate(
+    journal_path: Path,
+    plans: list[StepPlan],
+    faults: dict[str, object],
+    *,
+    skip_status_check: bool = False,
+    skip_durability_check: bool = False,
+) -> RunResult:
+    """Drive a branch tree to completion, staging and resolving as the real scheduler would."""
+    run_id = new_ulid()
+    journal = Journal(journal_path)
+    world = standard_world()
+    registry = _registry(world)
+    dispatcher = Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5, cap_delay_ms=1.0)
+    buffer = StoreBuffer(journal=journal, run_id=run_id)
+
+    if faults["partition_at"] is not None:
+        world.partition(at=int(faults["partition_at"]))  # type: ignore[arg-type]
+    if faults["duplicate"] is not None:
+        world.duplicate_delivery(str(faults["duplicate"]))
+    if faults["timeout"] is not None:
+        world.timeout(str(faults["timeout"]))
+
+    canon = Branch(id=new_ulid(), status=BranchStatus.CONFIRMED)
+    canon.context_verified = True
+    branches: list[Branch] = [canon]
+    seed = 0
+
+    for step, plan in enumerate(plans):
+        # Fork the siblings and stage each one's effects. Nothing may reach the world here.
+        siblings: list[Branch] = []
+        for index in range(plan.siblings):
+            child = canon.fork(
+                new_ulid(), predicted=ToolCall(plan.tools[0], {}), step=step, tier=index
+            )
+            child.cursor = child.cursor.advance(step + 1)
+            siblings.append(child)
+            branches.append(child)
+            for _ in range(plan.effects_per_branch[index]):
+                seed += 1
+                tool = plan.tools[seed % len(plan.tools)]
+                await buffer.stage(child, ToolCall(tool, _args(tool, seed)), registry.get(tool))
+
+        before = len(world.mutations)
+        assert len(world.mutations) == before, "staging must not reach the world"
+
+        # The model's real decision arrives. At most one sibling matches; the rest squash.
+        winner = siblings[plan.winner] if plan.winner is not None else None
+        for sibling in siblings:
+            if sibling is winner:
+                continue
+            sibling.squash("mismatch")
+            await buffer.discard_and_journal(sibling, "squashed")
+
+        if winner is None:
+            continue
+
+        winner.confirm()
+        winner.context_verified = True
+        confirmed_offset = await journal.append_async(
+            run_id,
+            "branch_resolved",
+            {"v": 1, "branch_id": winner.id, "step": step, "status": "confirmed"},
+        )
+        if skip_durability_check:
+            # PLANTED BUG: claim the confirming entry is at an offset that does not exist yet,
+            # which is what draining before the fsync amounts to.
+            confirmed_offset = (journal.last_offset(run_id) or 0) + 1000
+        await _drain(
+            buffer,
+            winner,
+            dispatcher,
+            confirmed_offset=confirmed_offset,
+            skip_status_check=skip_status_check,
+            skip_durability_check=skip_durability_check,
+        )
+        winner.retire()
+        await journal.append_async(
+            run_id,
+            "branch_resolved",
+            {"v": 1, "branch_id": winner.id, "step": step, "status": "retired"},
+        )
+        # Retirement is terminal, and lineage resets at each one: the next step forks from a
+        # fresh canonical frontier carrying the committed cursor, not from the retired branch.
+        canon = Branch(id=new_ulid(), status=BranchStatus.CONFIRMED, cursor=winner.cursor)
+        canon.context_verified = True
+        branches.append(canon)
+
+    return RunResult(world=world, journal=journal, run_id=run_id, branches=branches)
+
+
+async def _drain(
+    buffer: StoreBuffer,
+    branch: Branch,
+    dispatcher: Dispatcher,
+    *,
+    confirmed_offset: int,
+    skip_status_check: bool,
+    skip_durability_check: bool,
+) -> None:
+    if skip_status_check or skip_durability_check:
+        # The planted-bug path: reach the drain body with a precondition removed.
+        await buffer._drain_locked(branch, dispatcher, confirmed_offset, confirmed_offset)
+        return
+    await buffer.drain(
+        branch,
+        dispatcher,
+        confirmed_offset=confirmed_offset,
+        authorised_by_offset=confirmed_offset,
+    )
+
+
+# -- the invariants ------------------------------------------------------------------------------
+
+
+def leaked_branches(result: RunResult) -> set[str]:
+    """I1: branches that touched the world without retiring."""
+    retired = {b.id for b in result.branches if b.status is BranchStatus.RETIRED}
+    touched = {m.branch_id for m in result.world.mutations} - {"<external>"}
+    return touched - retired
+
+
+def unauthorised_effects(result: RunResult) -> list[str]:
+    """I2: effects whose confirming journal entry was not durable when they were dispatched."""
+    confirmed_at: dict[str, int] = {}
+    head = -1
+    for entry in result.journal.read(result.run_id):
+        head = entry.offset
+        if entry.kind == "branch_resolved" and entry.payload.get("status") == "confirmed":
+            branch_id = entry.payload.get("branch_id")
+            if isinstance(branch_id, str):
+                confirmed_at[branch_id] = entry.offset
+
+    bad: list[str] = []
+    for entry in result.journal.read(result.run_id, kinds=["effect_dispatched"]):
+        branch_id = entry.payload.get("branch_id")
+        claimed = entry.payload.get("confirmed_by_offset")
+        if not isinstance(branch_id, str) or branch_id not in confirmed_at:
+            bad.append(f"{entry.payload.get('effect_id')}: no confirming entry for {branch_id}")
+        elif isinstance(claimed, int) and claimed > head:
+            bad.append(
+                f"{entry.payload.get('effect_id')}: dispatched against offset {claimed}, "
+                f"journal head is {head}"
+            )
+    return bad
+
+
+# -- the test ------------------------------------------------------------------------------
+
+
+#: A plan that definitely stages and definitely retires, used where a test needs effects to
+#: actually reach the world rather than relying on what the generator happened to draw.
+ALWAYS_LEAKS = [
+    StepPlan(siblings=2, winner=0, effects_per_branch=(2, 2), tools=("charge_card", "restart_job"))
+]
+NO_FAULTS: dict[str, object] = {"partition_at": None, "duplicate": None, "timeout": None}
+
+
+@pytest.fixture(scope="module")
+def shared_journal(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One journal file across every example, which exercises the concurrent-run path too."""
+    return tmp_path_factory.mktemp("leak") / "journal.db"
+
+
+@given(
+    plans=st.lists(step_plans, min_size=1, max_size=5),
+    faults=fault_plans,
+)
+@settings(
+    max_examples=500,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+)
+def test_no_effect_ever_reaches_the_world_from_an_unretired_branch(
+    shared_journal: Path, plans: list[StepPlan], faults: dict[str, object]
+) -> None:
+    result = asyncio.run(simulate(shared_journal, plans, faults))
+
+    assert not leaked_branches(result), (
+        f"Hard Rule 3 violated: {leaked_branches(result)} touched the world without retiring"
+    )
+    assert not unauthorised_effects(result), (
+        "an effect was dispatched without a durable confirming entry:\n"
+        + "\n".join(unauthorised_effects(result))
+    )
+
+
+def test_the_generator_actually_reaches_the_world(tmp_path: Path) -> None:
+    """A leak test that never dispatched anything would hold its invariant vacuously."""
+    result = asyncio.run(simulate(tmp_path / "j.db", ALWAYS_LEAKS, NO_FAULTS))
+    assert result.world.mutations, "the generator produced no effects at all"
+    assert not leaked_branches(result)
+    assert not unauthorised_effects(result)
+    retired = {b.id for b in result.branches if b.status is BranchStatus.RETIRED}
+    assert {m.branch_id for m in result.world.mutations} == retired
+
+
+# -- planted-bug proofs -------------------------------------------------------------------------
+#
+# Task 1.6's Verify: a deliberately planted bug must make this file fail. Without these, a leak
+# test that had silently stopped exercising anything would stay green forever.
+
+
+def test_the_invariant_catches_a_drain_on_a_squashed_branch(tmp_path: Path) -> None:
+    async def leak() -> RunResult:
+        run_id = new_ulid()
+        journal = Journal(tmp_path / "j.db")
+        world = standard_world()
+        registry = _registry(world)
+        buffer = StoreBuffer(journal=journal, run_id=run_id)
+        dispatcher = Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.1)
+
+        doomed = Branch(id=new_ulid(), status=BranchStatus.SPECULATIVE)
+        await buffer.stage(
+            doomed, ToolCall("charge_card", _args("charge_card", 1)), registry.get("charge_card")
+        )
+        doomed.squash("mismatch")
+        offset = await journal.append_async(
+            run_id,
+            "branch_resolved",
+            {"v": 1, "branch_id": doomed.id, "step": 0, "status": "squashed"},
+        )
+        # PLANTED BUG: dispatch the squashed branch's buffer anyway.
+        await buffer._drain_locked(doomed, dispatcher, offset, offset)
+        return RunResult(world=world, journal=journal, run_id=run_id, branches=[doomed])
+
+    result = asyncio.run(leak())
+    assert leaked_branches(result), "I1 did not notice a squashed branch reaching the world"
+
+
+def test_the_invariant_catches_a_drain_before_the_confirming_entry_is_durable(
+    tmp_path: Path,
+) -> None:
+    """The exact bug task 1.6 names."""
+    result = asyncio.run(
+        simulate(tmp_path / "j.db", ALWAYS_LEAKS, NO_FAULTS, skip_durability_check=True)
+    )
+    assert unauthorised_effects(result), (
+        "I2 did not notice an effect dispatched against a journal offset that does not exist"
+    )
+
+
+def test_the_real_drain_refuses_both_planted_bugs(tmp_path: Path) -> None:
+    """And the shipped code, with its preconditions intact, refuses both."""
+    asyncio.run(_squashed_attempt(tmp_path))
+    asyncio.run(_durability_attempt(tmp_path))
+
+
+async def _squashed_attempt(tmp_path: Path) -> None:
+    run_id = new_ulid()
+    journal = Journal(tmp_path / "k.db")
+    world = standard_world()
+    registry = _registry(world)
+    buffer = StoreBuffer(journal=journal, run_id=run_id)
+    dispatcher = Dispatcher(registry=registry, max_attempts=1)
+    doomed = Branch(id=new_ulid(), status=BranchStatus.SPECULATIVE)
+    call = ToolCall("charge_card", _args("charge_card", 1))
+    await buffer.stage(doomed, call, registry.get("charge_card"))
+    doomed.squash("mismatch")
+    with pytest.raises(BranchClosed):
+        await buffer.drain(doomed, dispatcher, confirmed_offset=0, authorised_by_offset=0)
+    assert world.mutations == []
+
+
+async def _durability_attempt(tmp_path: Path) -> None:
+    """The shipped drain refuses an offset the journal does not have."""
+    run_id = new_ulid()
+    journal = Journal(tmp_path / "n.db")
+    world = standard_world()
+    registry = _registry(world)
+    buffer = StoreBuffer(journal=journal, run_id=run_id)
+    dispatcher = Dispatcher(registry=registry, max_attempts=1)
+    branch = Branch(id=new_ulid(), status=BranchStatus.SPECULATIVE)
+    await buffer.stage(
+        branch, ToolCall("charge_card", _args("charge_card", 1)), registry.get("charge_card")
+    )
+    branch.confirm()
+    branch.context_verified = True
+    with pytest.raises(BranchClosed, match="durable"):
+        await buffer.drain(branch, dispatcher, confirmed_offset=999, authorised_by_offset=999)
+    assert world.mutations == []

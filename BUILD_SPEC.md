@@ -623,7 +623,7 @@ Goal: writes can be staged and drained, and there is a world that will tell us i
   *Verify:* staging a WRITE causes no `world.mutations`; draining a CONFIRMED branch causes exactly one per staged effect, in stage order; `discard()` on a SQUASHED branch causes none and journals the count.
 - [x] **1.5 Dispatcher + dead-letter.** At-least-once with bounded exponential backoff; on exhaustion `DEAD_LETTER(reason)` and the run finishes `ok=False`. `COMPENSABLE` effects record their compensator call for later.
   *Verify:* `world.partition(at=2)` during drain: effects 1 dispatched, 2 dead-lettered after retries, 3 not attempted; resume after partition heals dispatches 2 and 3 with no duplicate of 1.
-- [ ] **1.6 THE LEAK TEST.** `tests/test_leak.py`: 500 randomly generated branch trees (hypothesis), random resolution outcomes, random faults; after every run assert `{m.branch_id for m in world.mutations} ⊆ {b.id for b in branches if b.status == RETIRED}`. **Mandatory. Never skipped. Never marked xfail.**
+- [x] **1.6 THE LEAK TEST.** `tests/test_leak.py`: 500 randomly generated branch trees (hypothesis), random resolution outcomes, random faults; after every run assert `{m.branch_id for m in world.mutations} ⊆ {b.id for b in branches if b.status == RETIRED}`. **Mandatory. Never skipped. Never marked xfail.**
   *Verify:* the test exists, runs in CI, and a deliberately planted bug (drain on CONFIRMED before the confirming journal entry is durable) makes it fail.
 
 **Phase Gate 1:** leak test green on 500 trees; partition test green; unknown tools are WRITE.
@@ -890,6 +890,9 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [1.4] Defect found and closed (from the audit): IRREVERSIBLE_ON_PATH must fire only on a SPECULATIVE branch. Firing it unconditionally makes the canonical path refuse to stage an irreversible call it has already been told to make, so the run livelocks and the shipped send_email example could never send anything. — 2026-09-15
 [1.5] Dispatcher: at-least-once, bounded exponential backoff, unjittered by default so a chaos failure reproduces. World faults now subclass ToolDispatchError so a partition reports sent='no' and a timeout sent='maybe'; without that distinction every partition would be treated as ambiguous and the crash-window tests would pass for the wrong reason. — 2026-09-15
 [1.5] Decision: a drain halts at the first dead letter rather than skipping it. The effects after it were staged on the assumption it happened, so sending them anyway would put the world in a state no run ever produced. — 2026-09-15
+[1.6] THE LEAK TEST green: 500 hypothesis-generated branch trees, random outcomes, random faults, ~8s. — 2026-09-15
+[1.6] Decision: the leak test asserts two invariants, not one. The spec's invariant ({mutating branches} subset of {retired branches}) cannot see the planted bug the spec names, because a drain that runs before its confirming entry is fsynced still happens on a branch that is CONFIRMED and does retire. A second invariant checks every dispatched effect against a confirming entry that was durable at dispatch time, and that one does catch it. — 2026-09-15
+[1.6] Decision: the vocabulary test caught an unqualified "exactly-once" in the dispatcher's own docstring during this task and the docstring was rewritten. Recording it because it is evidence the honesty checks work on this project's own code, not only on planted examples. — 2026-09-15
 [0.4] Decision: CallScope is carried in a ContextVar rather than passed as an argument, so JournaledModel satisfies ModelClient and can be substituted wherever the developer's graph already calls a model — which is what lets task 2.3 leave their graph file unchanged. — 2026-09-15
 ```
 

@@ -1,9 +1,10 @@
 """Dispatch: at-least-once, with deterministic idempotency keys.
 
-Not exactly-once. The docs say "at-least-once dispatch with deterministic idempotency keys",
-and the vocabulary test fails the build on an unqualified "exactly-once", because the only
-thing that makes a repeated delivery harmless is the *tool* honouring its key -- and whether
-it does is the developer's word, measured in attack 7.4 rather than assumed.
+The docs say "at-least-once dispatch with deterministic idempotency keys" and never claim
+"exactly-once", because the only thing that makes a repeated delivery harmless is the *tool*
+honouring its key -- and whether it does is the developer's word, measured in attack 7.4
+rather than assumed. The vocabulary test fails the build on an unqualified claim to the
+contrary, including one made here.
 
 Backoff is exponential and **unjittered by default**. Jitter is the usual advice and it is
 wrong here: the chaos matrix has to reproduce a failure it found, and a random delay makes a
