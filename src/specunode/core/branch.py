@@ -197,6 +197,16 @@ class Branch:
     #: branch; reset at each retirement so it measures depth, not run length.
     lineage: tuple[str, ...] = ()
     status: BranchStatus = BranchStatus.SPECULATIVE
+    #: Reads issued for a turn whose model output is not yet journaled. Counted rather than
+    #: flagged, because a turn can have several blocks in flight at once.
+    #:
+    #: This is deliberately *not* ``status``. A read the model actually emitted is not a guess
+    #: -- it is authorised work that is merely not durable yet -- and the two were once the
+    #: same field, with ``_timed_read`` saving and restoring ``status`` around the call. That
+    #: raced with retirement: a read still in flight when the branch was confirmed restored the
+    #: pre-read status afterwards and silently demoted a CONFIRMED branch back to SPECULATIVE.
+    #: The same shape could have promoted a squashed branch, which Hard Rule 3 forbids.
+    unjournaled_reads: int = 0
     reason: str | None = None
     cursor: StepCursor = field(default_factory=StepCursor)
     #: The branch's working copy. A BranchState rather than a plain dict so that the fork is

@@ -183,3 +183,61 @@ async def test_every_emitted_call_is_journaled_once(tmp_path: Path) -> None:
     await scheduler.run(run_id, {})
     requests = [e.payload["tool"] for e in journal.read(run_id, kinds=["tool_request"])]
     assert requests == ["get_pipeline_status", "restart_job", "post_summary"]
+
+
+async def test_a_read_still_in_flight_at_retirement_does_not_demote_the_branch(
+    tmp_path: Path,
+) -> None:
+    """A regression test for a race that early issue reaches by design, not by accident.
+
+    ``_timed_read`` used to mark its read speculative by saving the branch's ``status``,
+    setting it to SPECULATIVE, and restoring the saved value in a ``finally``. A read still
+    running when the scheduler confirmed the branch therefore put SPECULATIVE back afterwards,
+    silently undoing the confirmation; the next drain refused, and the run died with a Hard
+    Rule 3 message about a branch that had in fact been confirmed correctly.
+
+    Overlapping a read with the drain is the whole point of early issue, so this was reachable
+    on the ordinary path rather than under a fault. The same shape could also have promoted: a
+    read that began on a CONFIRMED branch which was then squashed would have restored CONFIRMED
+    over the squash, and a squashed branch that can drain is Rule 3 itself.
+
+    **The read has to be the turn's last block.** A read emitted first finishes long before
+    retirement even when it is slow, and the race never opens -- which is exactly why the first
+    version of this test passed against the unfixed code and had to be rewritten.
+    """
+    world = standard_world()
+    world.slow("read", 300)
+    registry = registry_for(world)
+    journal = Journal(tmp_path / "in-flight-read.db")
+    model = ScriptedModel(
+        # Write first, independent read second: the read is issued as the stream's last block
+        # and is still running while the write is staged, confirmed and drained.
+        turns=[
+            tool_turn(
+                ("restart_job", {"job_id": "etl-1"}),
+                ("get_pipeline_status", {"pipeline_id": "etl-1"}),
+                turn=0,
+            )
+        ],
+        block_delay_ms=20.0,
+    )
+    scheduler = Scheduler(
+        graph=OneTurnGraph(),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(model, journal, provider="scripted"),
+        policy=Policy(speculation=True),
+    )
+    run_id = new_ulid()
+
+    result = await scheduler.run(run_id, {})
+
+    assert result.ok, result.error
+    assert len(result.ledger.rows) == 1, "the write must still have reached the world"
+    # And the read is still reported as speculative: it did reach upstream before any durable
+    # decision authorised it, which is the fact attack 7.2 counts.
+    assert [hit for hit in world.reads if hit.speculative], (
+        "the early-issued read stopped being reported as speculative"
+    )

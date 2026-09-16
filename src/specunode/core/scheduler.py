@@ -239,7 +239,10 @@ class Scheduler:
         """Run a read for real, and record enough to re-check it at retirement."""
         started = time.monotonic()
         tool = self.registry.get(call.name)
-        speculative = branch.status is BranchStatus.SPECULATIVE
+        # Either kind of "not authorised by a durable decision yet": a branch that is still a
+        # guess, or a read issued for a turn whose output is not journaled. Attack 7.2 counts
+        # both, because both reached upstream without a durable decision behind them.
+        speculative = branch.status is BranchStatus.SPECULATIVE or branch.unjournaled_reads > 0
         scope = CallScope(
             run_id=self.run_id,
             branch_id=branch.id,
@@ -1082,17 +1085,22 @@ class SpeculativeTurn:
     async def _timed_read(self, tools: BranchTools, decision: ToolCall, ordinal: int) -> JsonValue:
         """Run a read the model has emitted but whose turn is not yet durable.
 
-        Marked speculative for the duration: the turn that asked for it is still streaming, so
-        if the process died now there would be no journaled decision authorising it. It is
-        counted as a speculative upstream read and re-validated at retirement if it carries a
-        witness.
+        Counted as an unjournaled read for the duration: the turn that asked for it is still
+        streaming, so if the process died now there would be no journaled decision authorising
+        it. It is reported as a speculative upstream read and re-validated at retirement if it
+        carries a witness.
+
+        The counter is incremented rather than the branch's ``status`` being flipped and
+        restored. Flipping raced with retirement -- a read still in flight when the branch was
+        confirmed put the old status back afterwards, demoting a CONFIRMED branch to
+        SPECULATIVE and making the next drain fail. Overlapping the drain is the entire point
+        of early issue, so that race was reachable by design rather than by accident.
         """
-        previous = self._branch.status
-        self._branch.status = BranchStatus.SPECULATIVE
+        self._branch.unjournaled_reads += 1
         try:
             value = await tools.call(decision.name, decision.args)
         finally:
-            self._branch.status = previous
+            self._branch.unjournaled_reads -= 1
         self._results_so_far.append(value)
         while len(self.completed_at) <= ordinal:
             self.completed_at.append(0.0)

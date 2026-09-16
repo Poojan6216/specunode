@@ -68,3 +68,65 @@ def test_the_committed_results_match_a_fresh_run() -> None:
     """Hard Rule 12: the numbers in the repo are the ones the command produces today."""
     committed = json.loads((REPO / "bench" / "results" / "demo_leak.json").read_text())
     assert committed == run_demo()
+
+
+# -- Demo 2 ------------------------------------------------------------------------------------
+#
+# Nothing here asserts a wall-clock figure. Demo 2's timings are measured on the machine that
+# runs it and vary between runs, so pinning one would either be flaky or be a number nobody
+# measured. What is asserted is everything that is *not* a timing: the three arms agree about
+# what reached the world, the specunode arm really overlapped the read, and the two baselines
+# really did not.
+
+
+def run_past_write() -> dict[str, object]:
+    result = subprocess.run(
+        [sys.executable, str(REPO / "bench" / "demo.py"), "--demo", "past-write", "--json"],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    return json.loads(result.stdout)
+
+
+def test_all_three_arms_change_the_world_identically() -> None:
+    """The claim the whole design rests on: faster, and identical in effect."""
+    report = run_past_write()
+    assert report["worlds_identical"] is True
+    digests = {a["world_digest"] for a in report["arms"]}  # type: ignore[union-attr]
+    assert len(digests) == 1
+    for entry in report["arms"]:  # type: ignore[union-attr]
+        assert entry["effects_reaching_world"] == 2
+
+
+def test_the_specunode_arm_really_overlapped_the_read() -> None:
+    """Without this, an arm that simply ran faster by accident would satisfy the table."""
+    report = run_past_write()
+    assert isinstance(report["read_overlapped_ms"], (int, float))
+    assert report["read_overlapped_ms"] > 0, (
+        "no part of the independent read ran while the write was staged, so the demo's "
+        "explanation of where its saving comes from is not what happened"
+    )
+
+
+def test_the_readonly_baseline_did_not_run_ahead() -> None:
+    """PASTE's rule, exercised rather than asserted in prose.
+
+    Turn 1 emits the write first, so a runtime that stops at the first tool with side effects
+    has nothing before it to run ahead into. If the read ever starts before the write finishes
+    in that arm, the baseline is not implementing the rule it is named for.
+    """
+    report = run_past_write()
+    arms = {a["runtime"]: a for a in report["arms"]}  # type: ignore[union-attr]
+    calls = {c["name"]: c for c in arms["readonly-spec"]["calls"]}
+    assert calls["fetch_runbook"]["started_ms"] >= calls["restart_job"]["finished_ms"]
+
+
+def test_the_demo_reports_its_injected_latencies() -> None:
+    """A timeline whose inputs are hidden is a drawing rather than a measurement."""
+    injected = run_past_write()["injected_latency_ms"]
+    assert isinstance(injected, dict)
+    assert set(injected) == {"read", "write", "stream_block", "model_turn"}
+    assert all(value > 0 for value in injected.values())

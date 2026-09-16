@@ -47,6 +47,34 @@ matches a fresh run.
 
 ---
 
+## What running ahead past a write actually buys
+
+```
+python bench/demo.py --demo past-write
+```
+
+One ops workload — `get_pipeline_status` → turn 1 → `restart_job` (write) + `fetch_runbook`
+(read, independent of the write) → turn 2 → `post_summary` (write) — under three execution
+styles, timed at the tool boundary. Turn 1 emits the write first, so a runtime that stops at
+the first tool with side effects has nothing before it to run ahead into.
+
+The demo prints measured durations, so the figures differ between machines and runs and none
+of them is reproduced here. What does not vary is the shape, and the demo asserts it:
+
+- **`readonly-spec` matches `sequential`.** PASTE's rule ends speculation at `restart_job`.
+- **`specunode` is faster by the part of `fetch_runbook` that overlapped the staged write**,
+  and the demo prints that overlap as a measured number rather than inferring it from the
+  wall-clock difference.
+- **All three change the world identically** — same tools, same canonical arguments, same
+  order. The demo prints the digest and fails if they diverge.
+- **Model turn 2 is not hidden.** It needs `restart_job`'s real result in its prompt, so it
+  waits for the drain. The demo says so in its own output.
+
+The saving is one read's latency. That is what speculating past a write buys on this shape, and
+the demo is written to make that hard to mistake for more.
+
+---
+
 ## The measured result, negative half first
 
 Measured on 300 real OpenHands trajectories from
