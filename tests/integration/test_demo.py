@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 
 
@@ -130,3 +132,66 @@ def test_the_demo_reports_its_injected_latencies() -> None:
     assert isinstance(injected, dict)
     assert set(injected) == {"read", "write", "stream_block", "model_turn"}
     assert all(value > 0 for value in injected.values())
+
+
+# -- Demo 3 ------------------------------------------------------------------------------------
+#
+# Demo 3 kills a real subprocess, so it is marked slow. What is asserted is the set of claims
+# the demo makes in prose: the kill landed, the resume neither duplicated nor invented, the
+# journal still verifies, replay refuses a changed prompt *with the diff*, and replay with
+# speculation off completes.
+
+
+def run_replay_demo() -> dict[str, object]:
+    result = subprocess.run(
+        [sys.executable, str(REPO / "bench" / "demo.py"), "--demo", "replay", "--json"],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    return json.loads(result.stdout)
+
+
+@pytest.mark.slow
+def test_the_demo_actually_kills_the_process() -> None:
+    """A kill demo that killed nothing would print every claim below and mean none of them."""
+    report = run_replay_demo()
+    assert report["process_was_killed"] is True
+    delay, work = report["kill_delay_ms"], report["work_ms"]
+    assert isinstance(delay, (int, float)) and isinstance(work, (int, float))
+    assert 0 < delay < work, "the kill was not scheduled inside the run's own work"
+
+
+@pytest.mark.slow
+def test_the_resume_neither_duplicates_nor_invents() -> None:
+    """The two properties that matter, stated the way the chaos suite states them."""
+    report = run_replay_demo()
+    assert report["duplicate_deliveries"] == 0
+    assert report["resumed_is_prefix_of_clean"] is True
+    assert report["journal_chain_verifies_after_kill"] is True
+
+
+@pytest.mark.slow
+def test_replay_refuses_a_changed_prompt_and_says_what_changed() -> None:
+    """Refusing is half of it. The spec asks for the step index and the diff, so check both.
+
+    A refusal that only said "node act failed" would satisfy the boolean and be useless to the
+    operator it exists for -- which is exactly what this reported before the scheduler was
+    changed to carry the branch's failure reason out of the drive loop.
+    """
+    report = run_replay_demo()
+    assert report["replay_with_changed_prompt_refused"] is True
+    refusal = report["replay_refusal"]
+    assert isinstance(refusal, str)
+    assert "diverged at step" in refusal
+    assert "system:" in refusal, "the refusal did not name the field that changed"
+    assert "cautious operator" in refusal, "the refusal did not show the new value"
+
+
+@pytest.mark.slow
+def test_replay_with_speculation_off_completes() -> None:
+    report = run_replay_demo()
+    assert report["replay_with_speculation_off_ok"] is True
+    assert report["replay_ledger_digest"]

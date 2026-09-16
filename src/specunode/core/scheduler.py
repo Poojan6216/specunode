@@ -340,7 +340,12 @@ class Scheduler:
 
                 outcome, decision = await self._run_node(node, branch, node_id, committed)
                 if outcome is BranchOutcome.FAULTED:
-                    ok, error = False, f"node {node.name} failed"
+                    # The reason the node failed is the whole of the diagnostic value here.
+                    # A replay that refuses because the prompt changed reports the step index
+                    # and a field-level diff, and reducing that to "node act failed" throws
+                    # away the one thing the operator needs to answer "what changed?".
+                    ok = False
+                    error = f"node {node.name} failed: {branch.reason or 'no reason recorded'}"
                     break
 
                 drained, updated = await self._retire(branch, node_id, committed, reducers)

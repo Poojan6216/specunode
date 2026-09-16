@@ -8,6 +8,11 @@
     Demo 2. One ops workload under three execution styles, timed at the tool boundary. The
     point is that the saving is exactly one read's latency and the demo says so, rather than
     the shape of the table suggesting more.
+
+``python bench/demo.py --demo replay``
+    Demo 3. The same ops run, SIGKILLed mid-branch and resumed from the journal; then replayed
+    with a different system prompt, which it refuses; then replayed with speculation off. Ends
+    with the effect ledger, which is the artifact the project actually produces.
 """
 
 from __future__ import annotations
@@ -15,6 +20,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import random
+import subprocess
 import sys
 import tempfile
 import time
@@ -37,6 +44,8 @@ from specunode.core.policy import Policy
 from specunode.core.scheduler import Scheduler
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
+from specunode.journal.ledger import build_ledger
+from specunode.journal.replay import ReplayDivergence, ReplayModel, recover
 from specunode.testing.models import ScriptedModel, tool_turn
 from specunode.testing.world import World, standard_world
 from specunode.verify.equivalence import equivalence_digest, normalise_world_mutations
@@ -191,6 +200,10 @@ TURN_1 = (
 )
 TURN_2 = (("post_summary", {"channel": "#incidents", "text": "etl-1 restarted"}),)
 
+#: The system prompt the reference run was journaled with. Demo 3 replays against a different
+#: one and expects to be refused at the first turn rather than quietly re-run.
+SYSTEM_PROMPT = "You are the on-call engineer for a data platform."
+
 
 @dataclass
 class CallRecord:
@@ -287,8 +300,10 @@ class PastWriteGraph:
         is issued as its block parses, and both writes retire together.
     """
 
-    def __init__(self, mode: str) -> None:
+    def __init__(self, mode: str, system: str = SYSTEM_PROMPT) -> None:
         self.mode = mode
+        #: Demo 3 replays this graph with a different one and expects replay to refuse.
+        self.system = system
 
     def capabilities(self) -> AdapterCapabilities:
         return AdapterCapabilities(drives_itself=False, framework="plain")
@@ -309,10 +324,10 @@ class PastWriteGraph:
             return NodeRef(name="report")
         return END
 
-    @staticmethod
-    def _envelope(text: str, *, stream: bool) -> RequestEnvelope:
+    def _envelope(self, text: str, *, stream: bool) -> RequestEnvelope:
         return RequestEnvelope(
             model="scripted",
+            system=(TextBlock(text=self.system),),
             messages=(Message(role="user", content=(TextBlock(text=text),)),),
             max_tokens=128,
             stream=stream,
@@ -534,15 +549,278 @@ async def demo_past_write(as_json: bool = False) -> int:
     return 0 if identical else 1
 
 
+# -- Demo 3's world and tools, shared with bench/_demo3_agent.py -------------------------------
+
+def demo3_world(directory: Path) -> World:
+    """A world backed by a durable log, so a resume can see what the dead process sent."""
+    world = World(log_path=directory / "world.jsonl")
+    if not world.tables["jobs"]:
+        for index in range(1, 4):
+            world.seed(
+                "jobs", f"etl-{index}", job_id=f"etl-{index}", status="failed", restarts=0,
+                reserved=0,
+            )
+        world.seed("docs", "restart", text="Restart the job, then confirm it flips to running.")
+    return world
+
+
+def demo3_registry(world: World) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="get_pipeline_status",
+            effect=EffectClass.READ,
+            fn=world.get_pipeline_status,
+            witness=True,
+        )
+    )
+    registry.register(
+        ToolSpec(name="fetch_runbook", effect=EffectClass.READ, fn=world.fetch_runbook)
+    )
+    registry.register(
+        ToolSpec(
+            name="restart_job",
+            effect=EffectClass.WRITE,
+            fn=world.restart_job,
+            # Declared idempotent, and it is: restarting a job that is already running is a
+            # no-op upstream. That is what lets the ambiguous crash window resolve by
+            # redelivery here, where support_agent's card charge has to dead-letter instead.
+            idempotent=True,
+        )
+    )
+    registry.register(
+        ToolSpec(name="post_summary", effect=EffectClass.WRITE, fn=world.post_summary)
+    )
+    return registry
+
+# -- Demo 3: the honest one -------------------------------------------------------------------
+
+HELPER = Path(__file__).resolve().parent / "_demo3_agent.py"
+
+#: Fixed, so the demo prints the same kill point on every machine and a reader can reproduce
+#: the run they were shown. The point being demonstrated is not that some particular instant
+#: is interesting -- it is that an arbitrary one is survivable.
+KILL_SEED = 20260916
+
+
+def _helper(
+    directory: Path, run_id: str, delay_ms: float, *, resume: bool = False
+) -> tuple[int, str]:
+    """Run the subprocess to completion, or to its own SIGKILL. Returns (returncode, stdout).
+
+    Blocking on purpose, and kept in a synchronous function so it is obvious that it blocks:
+    the demo has nothing else to do while the run it is measuring is running, and an async
+    subprocess here would only add a way for the kill to race the reader.
+    """
+    args = [sys.executable, str(HELPER), str(directory), run_id, f"{delay_ms}"]
+    if resume:
+        args.append("resume")
+    done = subprocess.run(args, capture_output=True, text=True, timeout=180)
+    if delay_ms < 0 and done.returncode != 0:
+        raise SystemExit(f"the helper failed: {done.stderr[-800:]}")
+    return done.returncode, done.stdout
+
+
+def _work_ms(stdout: str) -> float:
+    """How long the run's *work* takes, so a kill delay can land inside it.
+
+    Not the process lifetime: interpreter startup and imports dominate that, and a delay drawn
+    against it almost never lands in the run -- which is how a kill demo ends up killing
+    nothing and reporting success.
+    """
+    for token in stdout.split():
+        if token.startswith("work_ms="):
+            return float(token.split("=", 1)[1])
+    raise SystemExit(f"the helper did not report work_ms: {stdout!r}")
+
+
+def _world_log(directory: Path) -> list[dict[str, JsonValue]]:
+    path = directory / "world.jsonl"
+    if not path.exists():
+        return []
+    events: list[dict[str, JsonValue]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            break  # a torn final line: the process died mid-append, which is the point
+    return events
+
+
+def _delivered(directory: Path) -> list[tuple[str, str]]:
+    """Distinct effects that reached the world, in order, as ``(tool, canonical args hash)``.
+
+    Keyed for dedupe by ``effect_key`` -- the idempotency token, which carries the run id --
+    but *reported* by the argument hash, which does not. The clean run and the resumed run have
+    different run ids, so comparing tokens across them would say every effect differed. What
+    has to match between the two is the call, not the label the runtime gave it.
+    """
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for event in _world_log(directory):
+        if event.get("kind") != "mutation":
+            continue
+        key = str(event.get("effect_key", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((str(event.get("tool")), str(event.get("args_hash"))))
+    return out
+
+
+def _duplicate_deliveries(directory: Path) -> int:
+    """Deliveries of one idempotency token, counted within a single directory's world log."""
+    keys = [
+        str(event.get("effect_key"))
+        for event in _world_log(directory)
+        if event.get("kind") == "mutation" and event.get("effect_key")
+    ]
+    return len(keys) - len(set(keys))
+
+
+async def _replay(
+    directory: Path, run_id: str, *, system: str, speculation: bool
+) -> tuple[bool, str]:
+    """Re-drive the journalled graph against ReplayModel. Returns ``(ok, detail)``."""
+    world = demo3_world(directory / "replay")
+    registry = demo3_registry(world)
+    source = Journal(directory / "journal.db")
+    recovery = recover(source, run_id)
+    target = ReplayModel(
+        journal=source, run_id=run_id, retired_branches=recovery.retired_branches
+    )
+    fresh = Journal(directory / f"replay-{'on' if speculation else 'off'}.db")
+    scheduler = Scheduler(
+        graph=PastWriteGraph("specunode", system=system),  # type: ignore[arg-type]
+        registry=registry,
+        journal=fresh,
+        buffer=StoreBuffer(journal=fresh, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=target,
+        policy=Policy(speculation=speculation),
+    )
+    try:
+        result = await scheduler.run(new_ulid(), {})
+    except ReplayDivergence as divergence:
+        return False, str(divergence)
+    if not result.ok:
+        # The scheduler journals a run fault rather than letting it escape, so a divergence
+        # arrives as text here. Reported either way; the demo's claim is that it refused.
+        return False, str(result.error)
+    return True, equivalence_digest(result.ledger)
+
+
+async def demo_replay(as_json: bool = False) -> int:
+    """Demo 3: killed mid-branch, resumed, and refused when the question changes."""
+    with tempfile.TemporaryDirectory() as root:
+        base = Path(root)
+
+        # 1. The reference run. Nothing is compared to anything until this exists.
+        clean_dir = base / "clean"
+        clean_dir.mkdir()
+        clean_run = "01DEMO3CLEANAAAAAAAAAAAAAA"
+        work_ms = _work_ms(_helper(clean_dir, clean_run, -1)[1])
+        clean = _delivered(clean_dir)
+
+        # 2. Killed mid-branch with SIGKILL, then resumed from the journal.
+        kill_dir = base / "killed"
+        kill_dir.mkdir()
+        kill_run = "01DEMO3KILLEDAAAAAAAAAAAAA"
+        delay_ms = random.Random(KILL_SEED).uniform(work_ms * 0.15, work_ms * 0.85)
+        was_killed = _helper(kill_dir, kill_run, delay_ms)[0] != 0
+        _helper(kill_dir, kill_run, -1, resume=True)
+        resumed = _delivered(kill_dir)
+        chain_ok = Journal(kill_dir / "journal.db").verify_chain(kill_run).ok
+
+        # 3. Replayed with a different system prompt, and 4. with speculation off.
+        changed_ok, changed_detail = await _replay(
+            clean_dir, clean_run, system="You are a cautious operator.", speculation=True
+        )
+        same_ok, same_digest = await _replay(
+            clean_dir, clean_run, system=SYSTEM_PROMPT, speculation=False
+        )
+
+        duplicates = _duplicate_deliveries(kill_dir)
+        prefix = resumed == clean[: len(resumed)]
+        complete = resumed == clean
+
+        ledger_rows = build_ledger(Journal(clean_dir / "journal.db"), clean_run).rows
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "demo": "replay",
+                    "work_ms": round(work_ms, 1),
+                    "kill_delay_ms": round(delay_ms, 1),
+                    "process_was_killed": was_killed,
+                    "clean_effects": [tool for tool, _ in clean],
+                    "resumed_effects": [tool for tool, _ in resumed],
+                    "resumed_is_prefix_of_clean": prefix,
+                    "resumed_is_complete": complete,
+                    "duplicate_deliveries": duplicates,
+                    "journal_chain_verifies_after_kill": chain_ok,
+                    "replay_with_changed_prompt_refused": not changed_ok,
+                    "replay_refusal": changed_detail if not changed_ok else "",
+                    "replay_with_speculation_off_ok": same_ok,
+                    "replay_ledger_digest": same_digest if same_ok else "",
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print()
+    print("DEMO 3 — killed, resumed, and refused when the question changes")
+    print(f"  the run's work takes {work_ms:.0f}ms; SIGKILL sent {delay_ms:.0f}ms in.")
+    print(f"  the process was actually killed: {was_killed}")
+    print()
+    print("  1. kill and resume")
+    print(f"     clean run delivered:   {[tool for tool, _ in clean]}")
+    print(f"     resumed run delivered: {[tool for tool, _ in resumed]}")
+    print(f"     duplicate deliveries:  {duplicates}")
+    print(f"     a prefix of the clean run, in order: {prefix}")
+    print(f"     reached the clean run's last effect:  {complete}")
+    print(f"     journal hash chain verifies after the kill: {chain_ok}")
+    if not complete:
+        print("     The resume fell short rather than guessing. If a process dies between a")
+        print("     request reaching the world and its ack being recorded, nobody can tell")
+        print("     whether it took effect; a tool that has not declared a repeat harmless is")
+        print("     dead-lettered for a human instead of being sent again.")
+    print()
+    print("  2. replayed with a different system prompt")
+    print(f"     refused: {not changed_ok}")
+    for line in changed_detail.splitlines():
+        print(f"       {line}")
+    print()
+    print("  3. replayed with speculation disabled")
+    print(f"     ok: {same_ok}   effect ledger digest: {same_digest}")
+    print()
+    print("  EFFECT LEDGER — the artifact this project produces")
+    print(f"  {'#':>2}  {'tool':<16} {'status':<12} {'node':<10} {'step':>4}  key")
+    for index, row in enumerate(ledger_rows):
+        print(
+            f"  {index:>2}  {row.call.name:<16} {row.status:<12} "
+            f"{row.node_id:<10} {row.step_index:>4}  {row.nkey[:16]}"
+        )
+    print()
+    ok = prefix and duplicates == 0 and chain_ok and not changed_ok and same_ok
+    return 0 if ok else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="SpecuNode demos")
-    parser.add_argument("--demo", choices=["leak", "past-write"], required=True)
+    parser.add_argument("--demo", choices=["leak", "past-write", "replay"], required=True)
     parser.add_argument("--json", action="store_true", help="emit measured values as JSON")
     args = parser.parse_args(argv)
     if args.demo == "leak":
         return asyncio.run(demo_leak(as_json=args.json))
     if args.demo == "past-write":
         return asyncio.run(demo_past_write(as_json=args.json))
+    if args.demo == "replay":
+        return asyncio.run(demo_replay(as_json=args.json))
     return 2
 
 

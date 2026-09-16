@@ -110,6 +110,38 @@ API key and has not been run.
 
 ---
 
+## Killed mid-run, resumed, and refused when the question changes
+
+```
+python bench/demo.py --demo replay
+```
+
+The same ops run, `SIGKILL`ed at a point measured to land inside its own work — not inside the
+interpreter startup that dominates a subprocess's lifetime, which is how a kill demo ends up
+killing nothing and reporting success. Then resumed from the journal, then replayed twice.
+
+The demo asserts, and prints, that:
+
+- the resumed run's effects are a **prefix of the uninterrupted run's, in order** — it can fall
+  short, and can never do something the clean run did not
+- **no idempotency key reached the world twice**
+- the **journal's hash chain still verifies** after a process died mid-append
+- replaying with a different system prompt is **refused at the first turn that would differ**,
+  with the step index and a field-level diff of the request — not a silent re-run down a
+  trajectory the recorded run never took
+- replaying with speculation disabled completes and prints its ledger digest
+
+It ends with the run's **effect ledger**, which is the artifact this project actually produces:
+every effect that reached the world, the node and program position that authorised it, and the
+idempotency token the tool was handed.
+
+Where a resume falls short rather than completing, it is because the process died between a
+request reaching the world and its acknowledgement being recorded. Nobody can tell afterwards
+whether it took effect. A tool that declared a repeat harmless is redelivered; one that did not
+is dead-lettered for a human. The demo says which happened.
+
+---
+
 ## Status
 
 v0.1.0, and honest about where it is. Working today:

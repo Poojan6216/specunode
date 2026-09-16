@@ -79,9 +79,21 @@ class ScriptedModel:
     #: enough that an early-issued read can demonstrably finish before the turn ends.
     block_delay_ms: float = 0.0
     complete_delay_ms: float = 0.0
+    #: Turns already played, so the next call serves ``turns[consumed]``.
+    #:
+    #: A resumed run is a *new process*: its script starts over while the run does not, so a
+    #: node that is the run's second model call becomes the script's first and is handed the
+    #: wrong turn. A real model would simply be asked the new question and would answer it;
+    #: the off-by-one is an artefact of scripting, not of resuming. Set this to the number of
+    #: turns the journal already records so the stand-in behaves like the thing it stands in
+    #: for.
+    consumed: int = 0
     #: Every envelope this model was handed, in order.
     received: list[RequestEnvelope] = field(default_factory=list)
     _calls: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        self._calls = self.consumed
 
     def _next(self, envelope: RequestEnvelope) -> ModelResponse:
         self.received.append(envelope)
