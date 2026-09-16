@@ -775,9 +775,9 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 ## PHASE 9 — Ship
 
 - [x] **9.1 README** with: one-paragraph CPU analogy; the three demos with their printed outputs; the opportunity plot; the latency table with CIs; the break-even α per workload; "What beats it"; "What this is not" (not a durable-execution platform, not an authorization layer, not a context manager); credits to PASTE, Claude Code's executor, langchain-nvidia, ToolAhead, SagaLLM, ATP, SCOPEGATE, Temporal/DBOS/Restate.
-- [ ] **9.2 Docs** (`docs/*.md`) complete; `specunode init` writes `specunode.yaml` + `.specunode/`.
+- [x] **9.2 Docs** (`docs/*.md`) complete; `specunode init` writes `specunode.yaml` + `.specunode/`.
 - [ ] **9.3 Release.** Tag `v0.1.0`, `uv build`, publish to PyPI as `specunode`, install from PyPI in a clean 3.11 venv on both OSes and run Demo 1 from the published wheel. Record the exact install command that failed, if any, in the docs the same day.
-- [ ] **9.4 Report.** `bench/make_report_pdf.py` regenerates the technical report from `bench/results/*.json` — every number in the PDF is read from a file.
+- [x] **9.4 Report.** `bench/make_report_pdf.py` regenerates the technical report from `bench/results/*.json` — every number in the PDF is read from a file.
 
 **Phase Gate 9:** `pip install specunode` works on 3.11; demos run from the published wheel; `check_numbers.py` green against the published README.
 
@@ -957,6 +957,8 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [4.2] Decision (this was flagged as needing a human, and is resolved mechanically instead): the proxy returns a staged-write handle ONLY to a client that advertised the specunode/decisions capability. Any other client blocks until a decision arrives. Handing a placeholder to a client that does not understand it puts that placeholder in the next prompt, which Hard Rule 13 forbids and the proxy cannot see to prevent. The mode is read from what the client advertised, not from a default. — 2026-09-16
 [4.x] Every proxy run is stamped context_identity: unenforced. The proxy never sees a prompt, so it cannot check one, and a stamp for a property nobody checked is worse than no stamp. — 2026-09-16
 [4.x] NOT VERIFIED END TO END: the transport has not been driven by a real MCP client against a real upstream server in this environment. Phase Gate 4 (a generic client producing the same ledger as the LangGraph integration) is therefore NOT met and 4.x is ticked for the rules and the wiring, not for that gate. — 2026-09-16
+[9.2] All six docs written (effect-classes, hazards, limitations, replay, adapters, mcp-proxy); specunode init writes the config and .specunode/ and was run to check it. — 2026-09-16
+[9.4] bench/make_report_pdf.py regenerates the report from bench/results/*.json. A test asserts the generator's own source contains no hard-coded figure, because a number typed into the generator would survive a change in what was measured and the provenance link would break silently. The wall-clock section renders 'not measured' rather than being omitted. — 2026-09-16
 [0.4] Decision: CallScope is carried in a ContextVar rather than passed as an argument, so JournaledModel satisfies ModelClient and can be substituted wherever the developer's graph already calls a model — which is what lets task 2.3 leave their graph file unchanged. — 2026-09-15
 ```
 
