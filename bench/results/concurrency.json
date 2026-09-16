@@ -1,0 +1,11 @@
+{
+  "concurrency": {
+    "cross_branch_observations": 0,
+    "dead_letters": 0,
+    "duplicate_deliveries": 0,
+    "equivalence_failures": 0,
+    "leaks": 0,
+    "notes": [],
+    "runs": 20
+  }
+}
