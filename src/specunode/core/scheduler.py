@@ -43,7 +43,14 @@ from specunode.core.decision import Decision, ToolCall, is_barrier
 from specunode.core.effects import EffectClass, ToolRegistry
 from specunode.core.graph import END, GraphAdapter, NodeRef, RunSession, session_scope
 from specunode.core.hazards import Hazard, analyse
-from specunode.core.model import CallScope, ModelClient, call_scope
+from specunode.core.model import (
+    CallScope,
+    ModelClient,
+    RequestEnvelope,
+    ToolUseComplete,
+    TurnComplete,
+    call_scope,
+)
 from specunode.core.policy import Policy
 from specunode.core.state import CommittedState, Reducer, patch_payload, resolve_reducers
 from specunode.ids import new_ulid
@@ -51,7 +58,7 @@ from specunode.journal.journal import Journal
 from specunode.journal.ledger import Ledger, build_ledger
 from specunode.journal.replay import recover
 
-__all__ = ["BranchOutcome", "RunResult", "Scheduler", "SchedulerError"]
+__all__ = ["BranchOutcome", "RunResult", "Scheduler", "SchedulerError", "SpeculativeTurn"]
 
 
 class SchedulerError(RuntimeError):
@@ -186,6 +193,8 @@ class Scheduler:
     _park_events: dict[str, asyncio.Event] = field(default_factory=dict)
     _stalls: list[tuple[int, Hazard]] = field(default_factory=list)
     _retire_seq: int = 0
+    #: Turns run with early issue, kept so a test can assert on their timings.
+    _turns: list[SpeculativeTurn] = field(default_factory=list)
 
     # -- bookkeeping the ports call back into ------------------------------------------------
 
@@ -237,6 +246,7 @@ class Scheduler:
         branch.read_set.append(
             ReadRecord(
                 tool=call.name,
+                args=dict(call.args),
                 args_hash=chash(dict(call.args)),
                 result_hash=chash(value),
                 witness=witness,
@@ -451,6 +461,7 @@ class Scheduler:
         session = RunSession(
             run_id=self.run_id,
             call_tool=tools.call,
+            call_turn=self._turn_runner(branch, node_id),
             decide=self._decide,
             run_in_node=self._run_in_node,
             model=self.target,
@@ -528,6 +539,7 @@ class Scheduler:
         session = RunSession(
             run_id=self.run_id,
             call_tool=tools.call,
+            call_turn=self._turn_runner(branch, node_id),
             decide=self._decide,
             model=self.target,
             state=branch.state,
@@ -722,6 +734,20 @@ class Scheduler:
         )
         return result.state
 
+    def _turn_runner(
+        self, branch: Branch, node_id: str
+    ) -> Callable[[object], Awaitable[Sequence[JsonValue]]]:
+        """A node's handle on tier-0 early issue."""
+
+        async def call_turn(envelope: object) -> Sequence[JsonValue]:
+            if not isinstance(envelope, RequestEnvelope):
+                raise SchedulerError("call_turn needs a RequestEnvelope")
+            turn = SpeculativeTurn(self, branch, node_id)
+            self._turns.append(turn)
+            return await turn.run(envelope)
+
+        return call_turn
+
     async def _decide(self, decision: Decision) -> Decision:
         """A node reporting its decision. In sequential mode it is simply itself."""
         return decision
@@ -783,3 +809,95 @@ class Scheduler:
                 },
             },
         )
+
+
+class SpeculativeTurn:
+    """One target turn, with its tool calls issued as the stream emits them.
+
+    This is tier-0 early issue, and it is the part of the design that produces wall-clock
+    savings without predicting anything. The model streams its answer; a ``tool_use`` block
+    becomes complete some time before the turn does; the runtime issues that call immediately
+    rather than waiting for the end of the turn. On a turn that emits a read followed by two
+    writes, the read can be finished before the model has stopped talking.
+
+    Nothing is guessed, so nothing can be wrong -- these are calls the target has already
+    emitted. What is speculated is *time*: the turn is not yet durable when the read goes out,
+    so the read is marked speculative, counted in the ledger's upstream-read total, and
+    re-validated at retirement if it carries a witness.
+
+    Writes are staged, not run, exactly as anywhere else. They dispatch when the branch retires,
+    which cannot happen before the turn's ``model_response`` entry is on disk.
+
+    The pattern is Claude Code's streaming tool executor, credited as theirs.
+    """
+
+    def __init__(self, scheduler: Scheduler, branch: Branch, node_id: str) -> None:
+        self._scheduler = scheduler
+        self._branch = branch
+        self._node_id = node_id
+        self.decisions: list[ToolCall] = []
+        #: When each block finished parsing and when its call finished, for task 3.1's
+        #: timestamp assertion that a read completes before the stream ends.
+        self.issued_at: list[float] = []
+        self.completed_at: list[float] = []
+        self.stream_ended_at: float = 0.0
+        self.reads_issued_early = 0
+
+    async def run(self, envelope: RequestEnvelope) -> list[JsonValue]:
+        scheduler = self._scheduler
+        branch = self._branch
+        tools = BranchTools(scheduler, branch, self._node_id)
+
+        # Slots are preallocated as blocks parse, and filled by ordinal. Program order is
+        # structural: a result never appends on completion, because the order the model asked
+        # for its calls is the order it must be shown them in (Hard Rule 13).
+        slots: list[asyncio.Task[JsonValue] | None] = []
+        staged_acks: list[asyncio.Future[JsonValue] | None] = []
+
+        async for event in scheduler.target.stream(envelope):
+            if isinstance(event, ToolUseComplete):
+                decision = ToolCall(name=event.block.name, args=event.block.args)
+                self.decisions.append(decision)
+                self.issued_at.append(time.monotonic())
+                spec = scheduler.registry.get(decision.name)
+                ordinal = len(slots)
+                if spec.effect is EffectClass.READ:
+                    self.reads_issued_early += 1
+                    slots.append(
+                        asyncio.create_task(
+                            self._timed_read(tools, decision, ordinal, speculative=True)
+                        )
+                    )
+                    staged_acks.append(None)
+                else:
+                    slots.append(None)
+                    staged_acks.append(None)
+            elif isinstance(event, TurnComplete):
+                self.stream_ended_at = time.monotonic()
+
+        # The turn is durable now (JournaledModel writes it before yielding TurnComplete), so
+        # the writes it emitted may be staged. They are staged here rather than mid-stream so
+        # that a staged effect never exists for a turn the journal does not yet record.
+        results: list[JsonValue] = []
+        for ordinal, emitted in enumerate(self.decisions):
+            task = slots[ordinal]
+            if task is not None:
+                results.append(await task)
+                continue
+            results.append(await tools.call(emitted.name, emitted.args))
+        return results
+
+    async def _timed_read(
+        self, tools: BranchTools, decision: ToolCall, ordinal: int, *, speculative: bool
+    ) -> JsonValue:
+        previous = self._branch.status
+        if speculative:
+            self._branch.status = BranchStatus.SPECULATIVE
+        try:
+            value = await tools.call(decision.name, decision.args)
+        finally:
+            self._branch.status = previous
+        while len(self.completed_at) <= ordinal:
+            self.completed_at.append(0.0)
+        self.completed_at[ordinal] = time.monotonic()
+        return value

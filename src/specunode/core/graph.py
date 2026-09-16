@@ -128,6 +128,11 @@ class RunSession:
     call_tool: Callable[[str, Mapping[str, JsonValue]], Awaitable[JsonValue]]
     #: Called by an adapter when a node reaches a decision point.
     decide: Callable[[Decision], Awaitable[Decision]]
+    #: Run one model turn and its tool calls, issuing each call as it parses out of the
+    #: stream rather than after the turn ends. This is where the latency actually goes: a read
+    #: the model emitted first can be in flight while it is still writing the rest of its
+    #: answer. Results come back in program order -- the order the model asked for them.
+    call_turn: Callable[[object], Awaitable[Sequence[JsonValue]]] | None = None
     #: How a self-driving framework runs one node under the runtime. The shim hands over the
     #: node's name and a thunk for its body; the runtime mints a branch, runs the body as a
     #: task, retires it, and returns whatever the body returned. It is a thunk rather than a

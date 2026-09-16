@@ -16,7 +16,7 @@ the idempotency key preimage from growing without limit on a long run.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
@@ -109,6 +109,10 @@ class ReadRecord:
     """One read a branch performed, kept so retirement can check it went stale (rule E3)."""
 
     tool: str
+    #: The arguments, kept so retirement can re-issue the read against its witness. Held on
+    #: the record rather than in a lookup keyed by hash: a module-level cache would outlive
+    #: the run, grow without bound, and let one run's arguments answer another's question.
+    args: Mapping[str, JsonValue]
     args_hash: str
     result_hash: str
     witness: JsonValue
