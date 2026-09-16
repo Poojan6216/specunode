@@ -1,0 +1,150 @@
+"""The framework boundary: what the scheduler needs from a graph, and nothing more.
+
+Two adapter shapes share one core, which is what makes the LangGraph integration and the
+plain-Python API produce the same ledger from the same decisions.
+
+``drives_itself = False``
+    The scheduler drives: it asks ``next()`` for the node and ``run_node()`` for the decision.
+    This is the plain-Python loop, and it is section 7's protocol verbatim.
+
+``drives_itself = True``
+    The framework drives, and the scheduler waits inside ``drive()``. This is LangGraph.
+    Driving a compiled graph node by node was tried and rejected: calling a node's bound
+    runnable directly raises ``RuntimeError: Called get_config outside of a runnable context``
+    the moment the body calls ``get_config()``, ``interrupt()`` or ``get_stream_writer()``, and
+    re-deriving routing, reducers and map-reduce outside Pregel would break the promise that a
+    wrapped graph produces the same final state as an unwrapped one.
+
+Both shapes reach the runtime through the same ports, so journal, buffer, keys and ledger have
+exactly one implementation.
+
+**A speculative branch does not run user node bodies by default.** A node body is unbounded
+code: it can touch the filesystem, a socket or a global, none of which the fake world can see,
+so the leak test could not catch a side effect from a squashed branch that did not go through a
+registered tool. Speculation therefore executes *predicted tool calls* and, in read-only
+stretches, the next model turn. A node that opts in with ``speculable=True`` is the developer
+saying its body is safe to run and discard; a predicted route into one that has not opted in
+stalls with :data:`~specunode.core.hazards.Hazard.NODE_NOT_SPECULABLE`, which is named rather
+than silent so the benchmark's hazard histogram stays complete.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Literal, Protocol, TypeAlias, runtime_checkable
+
+from specunode.canonical import JsonValue
+from specunode.core.decision import Decision
+
+__all__ = [
+    "END",
+    "AdapterCapabilities",
+    "GraphAdapter",
+    "NodeRef",
+    "RoutingIsInternal",
+    "RunSession",
+]
+
+
+class RoutingIsInternal(RuntimeError):
+    """Raised by a self-driving adapter asked to expose its routing.
+
+    LangGraph decides its own next node inside Pregel. Reimplementing that outside would mean
+    re-deriving conditional edges, reducers and map-reduce, and the first thing to break would
+    be the property task 2.3 checks: that a wrapped graph reaches the same final state.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class NodeRef:
+    """A node, identified structurally so that a replay reproduces its id exactly.
+
+    Never by object identity, memory address, line number or a framework's own task id --
+    LangGraph's task ids are stable within a run and random across runs, so a key derived from
+    one would not survive a replay.
+    """
+
+    name: str
+    path: tuple[str, ...] = ()
+
+    @property
+    def structural_id(self) -> str:
+        return "/".join((*self.path, self.name))
+
+    def under(self, parent: NodeRef) -> NodeRef:
+        """This node as a child of a sub-graph, for nested branch trees."""
+        return NodeRef(name=self.name, path=(*parent.path, parent.name))
+
+
+class _End:
+    """The terminal marker returned by ``next()``."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "END"
+
+
+END = _End()
+
+NextNode: TypeAlias = NodeRef | _End
+
+
+@dataclass(frozen=True)
+class AdapterCapabilities:
+    """What this adapter can and cannot do, so the scheduler never has to guess."""
+
+    #: True when the framework owns the run loop and the scheduler waits inside ``drive()``.
+    drives_itself: bool = False
+    #: Nodes whose bodies may run on a speculative branch. Empty is the safe default.
+    speculable_nodes: frozenset[str] = frozenset()
+    supports_interrupt: bool = False
+    supports_streaming: bool = False
+    #: Reported so ``docs/adapters.md`` and the ledger can name the framework and its version.
+    framework: str = "plain"
+    version: str | None = None
+
+
+@dataclass
+class RunSession:
+    """Everything a node body reaches the runtime through.
+
+    Deliberately a small, explicit surface: the ports are the only way a node can touch the
+    world or the model, so anything a node does *outside* them is invisible to the leak test --
+    which is why a speculative branch does not run node bodies unless the developer opted in.
+    """
+
+    run_id: str
+    #: Called by an adapter to run one tool call, either executing or staging it.
+    call_tool: Callable[[str, Mapping[str, JsonValue]], Awaitable[JsonValue]]
+    #: Called by an adapter when a node reaches a decision point.
+    decide: Callable[[Decision], Awaitable[Decision]]
+    state: dict[str, JsonValue] = field(default_factory=dict)
+
+
+@runtime_checkable
+class GraphAdapter(Protocol):
+    """What the scheduler needs from a graph."""
+
+    def capabilities(self) -> AdapterCapabilities: ...
+
+    def nodes(self) -> Sequence[NodeRef]: ...
+
+    def decision_kind(
+        self, node: NodeRef
+    ) -> Literal["tool_call", "route", "structured", "free_text", "unknown"]:
+        """What this node emits, so a free-text barrier is known before anything is spent."""
+        ...
+
+    def next(self, state: Mapping[str, JsonValue]) -> NextNode:
+        """The next node. Raises :class:`RoutingIsInternal` on a self-driving adapter."""
+        ...
+
+    async def run_node(self, node: NodeRef, session: RunSession) -> Decision:
+        """Run one node to its decision point. Scheduler-driven adapters only."""
+        ...
+
+    async def drive(self, session: RunSession, inputs: JsonValue) -> JsonValue:
+        """Run the whole graph, calling back into the session. Self-driving adapters only."""
+        ...

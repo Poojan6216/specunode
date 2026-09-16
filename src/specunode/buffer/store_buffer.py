@@ -126,6 +126,10 @@ class DrainReport:
     outcomes: tuple[tuple[str, EffectOutcome], ...]
     ok: bool
     halted_at: int | None = None
+    #: Effects that were staged and never got an outcome. Always empty in a correct run; a
+    #: non-empty value means an authorised write went missing, which is invisible to every
+    #: other check because the world simply never hears about it.
+    undrained: tuple[str, ...] = ()
 
     def count(self, outcome: EffectOutcome) -> int:
         return sum(1 for _, seen in self.outcomes if seen is outcome)
@@ -213,6 +217,16 @@ class StoreBuffer:
             compensator=spec.compensator,
             idempotent=spec.idempotent,
         )
+        if any(existing.nkey == effect.nkey for existing in staged):
+            # Two effects with one key means dedupe will suppress the second at dispatch, and
+            # an effect the run performed never reaches the world -- silently, and identically
+            # in both arms, so no equivalence or leak check can see it. The cause is always a
+            # caller that did not take a fresh step index for this call.
+            raise HazardViolation(
+                f"{call.name} would be staged under a key branch {branch.id} already holds "
+                f"(step {effect.step}, node {node_id!r}). Take a fresh step index per call: "
+                "two calls sharing one key means the second is silently never dispatched."
+            )
         staged.append(effect)
         self._acks[effect.id] = asyncio.get_running_loop().create_future()
         self._lineages[branch.id] = branch.lineage
@@ -386,24 +400,31 @@ class StoreBuffer:
                 "speculating and has not passed the context-identity check; nothing "
                 "downstream of an unverified request may reach the world (Hard Rule 13)"
             )
-        last = self.journal.last_offset(self.run_id)
-        if last is None or confirmed_offset > last:
+        # Not "is the offset <= the head", which any later entry satisfies: read the entry and
+        # check it really is this branch's confirmation. Otherwise a drain that ran before its
+        # own confirming entry was written passes as soon as anything else has been journaled
+        # since, and task 1.6's planted bug walks straight through.
+        confirming = next(
+            iter(self.journal.read(self.run_id, after=confirmed_offset - 1, chunk=1)), None
+        )
+        if (
+            confirming is None
+            or confirming.offset != confirmed_offset
+            or confirming.kind != "branch_resolved"
+            or confirming.payload.get("status") != "confirmed"
+            or confirming.payload.get("branch_id") != branch.id
+        ):
             raise BranchClosed(
-                f"the entry confirming branch {branch.id} (offset {confirmed_offset}) is not "
-                f"durable; the journal head is {last} (Hard Rule 3)"
+                f"offset {confirmed_offset} is not a durable branch_resolved(confirmed) entry "
+                f"for branch {branch.id}; nothing dispatches before it is (Hard Rule 3)"
             )
 
         async with self._lock_for(branch.id):
-            if branch.id in self._drained:
-                return DrainReport(
-                    branch.id,
-                    tuple((e.id, EffectOutcome.SKIPPED_DEDUPE) for e in self.pending(branch.id)),
-                    ok=True,
-                )
-            self._drained.add(branch.id)
-            return await self._drain_locked(
+            report = await self._drain_locked(
                 branch, dispatcher, authorised_by_offset, confirmed_offset
             )
+            self._drained.add(branch.id)
+            return report
 
     async def _drain_locked(
         self,
@@ -415,12 +436,31 @@ class StoreBuffer:
         outcomes: list[tuple[str, EffectOutcome]] = []
         halted_at: int | None = None
         ok = True
-        # Positional, never sorted -- not by key and not by effect id. Effect ids are ULIDs,
-        # so sorting by one usually *reproduces* insertion order, which would make a
-        # reordering bug invisible in testing and surface only under clock skew.
-        effects = self.pending(branch.id)
+        dispatch_index = -1
 
-        for dispatch_index, effect in enumerate(effects):
+        # The list is read live, by index, and never snapshotted. Completing one effect's ack
+        # resumes the node body that was waiting on it, and that body may stage the next write
+        # from the value it just received -- `ack = await charge_card(...)` followed by
+        # `send_receipt(ack["charge_id"])` is the ordinary shape. Against a snapshot, that
+        # second effect is journaled as staged, never dispatched, and produces no ledger row:
+        # an authorised write silently dropped, identically in both arms, so the equivalence
+        # test stays green while the world never receives it.
+        #
+        # Positional, never sorted -- not by key and not by effect id. Effect ids are ULIDs, so
+        # sorting by one usually *reproduces* insertion order, which would make a reordering
+        # bug invisible in testing and surface only under clock skew.
+        while True:
+            dispatch_index += 1
+            live = self._staged.get(branch.id, [])
+            if dispatch_index >= len(live):
+                # Give a node body resumed by the last ack a chance to stage its next write
+                # before concluding the buffer is empty.
+                await asyncio.sleep(0)
+                live = self._staged.get(branch.id, [])
+                if dispatch_index >= len(live):
+                    break
+            effect = live[dispatch_index]
+
             if halted_at is not None:
                 outcomes.append((effect.id, EffectOutcome.NOT_ATTEMPTED))
                 continue
@@ -505,7 +545,18 @@ class StoreBuffer:
             # no run ever produced.
             halted_at, ok = dispatch_index, False
 
-        return DrainReport(branch.id, tuple(outcomes), ok=ok, halted_at=halted_at)
+        # An effect that was staged and never got an outcome is an authorised write that
+        # vanished. Nothing else in the suite can see that, so it is reported here rather than
+        # left to be noticed by its absence from the world.
+        accounted = {effect_id for effect_id, _ in outcomes}
+        undrained = tuple(e.id for e in self.pending(branch.id) if e.id not in accounted)
+        return DrainReport(
+            branch.id,
+            tuple(outcomes),
+            ok=ok and not undrained,
+            halted_at=halted_at,
+            undrained=undrained,
+        )
 
     def _complete_ack(self, effect_id: str, ack: JsonValue) -> None:
         future = self._acks.get(effect_id)

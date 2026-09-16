@@ -568,3 +568,123 @@ def test_no_projection_switch_ships() -> None:
         if "allow_projection" in path.read_text(encoding="utf-8")
     ]
     assert not offenders, f"a projection switch reappeared in {offenders}"
+
+
+async def test_a_write_staged_from_a_resumed_node_body_still_reaches_the_world(
+    tmp_path: Path,
+) -> None:
+    """The ordinary shape: ack = await charge_card(...); then send_receipt(ack["charge_id"]).
+
+    The second write is staged only after the first one's ack arrives, which happens *during*
+    the drain. Against a snapshot of the staged list it is journaled, never dispatched, and
+    produces no ledger row -- an authorised write silently dropped, identically in both the
+    speculative and the sequential arm, so the equivalence test stays green while the world
+    never receives it. Nothing else in the suite can see that, which is why it is tested here.
+    """
+    import asyncio
+
+    buffer, journal, world, dispatcher = build(tmp_path)
+    branch = speculative()
+    first = await buffer.stage(
+        branch,
+        ToolCall("charge_card", {"customer_id": "cus-1", "amount": 10.0}),
+        registry_of(dispatcher, "charge_card"),
+    )
+
+    async def node_body() -> None:
+        ack = await buffer.ack_for(first.id)
+        assert isinstance(ack, dict)
+        await buffer.stage(
+            branch,
+            ToolCall("post_summary", {"channel": "#ops", "text": str(ack["charge_id"])}),
+            registry_of(dispatcher, "post_summary"),
+        )
+
+    parked = asyncio.create_task(node_body())
+    await asyncio.sleep(0)
+
+    offset = await confirm(journal, branch)
+    report = await buffer.drain(
+        branch, dispatcher, confirmed_offset=offset, authorised_by_offset=offset
+    )
+    await parked
+
+    assert report.undrained == (), f"an authorised write was never dispatched: {report.undrained}"
+    assert report.ok
+    assert report.count(EffectOutcome.DISPATCHED) == 2
+    assert [m.tool for m in world.mutations] == ["charge_card", "post_summary"]
+    assert world.mutations[1].args_hash, "the second write carried the first one's real result"
+
+
+async def test_two_identical_calls_in_one_node_need_two_step_indices(tmp_path: Path) -> None:
+    """A node body that issues the same call twice must produce two effects, not one.
+
+    Sharing a step index makes both derive the same idempotency key, so dedupe suppresses the
+    second at dispatch and an effect the sequential run performed never reaches the world.
+    Nothing else in the suite can see that: the leak invariant is a subset over branch ids and
+    cannot see a *missing* effect, and both equivalence arms collide identically. So staging a
+    duplicate key is refused outright rather than quietly accepted.
+    """
+    buffer, _journal, _world, dispatcher = build(tmp_path)
+    branch = speculative()
+    spec = registry_of(dispatcher, "post_summary")
+    call = ToolCall("post_summary", {"channel": "#ops", "text": "retry"})
+
+    branch.advance_step()
+    first = await buffer.stage(branch, call, spec)
+
+    with pytest.raises(HazardViolation, match="fresh step index"):
+        await buffer.stage(branch, call, spec)
+
+    branch.advance_step()
+    second = await buffer.stage(branch, call, spec)
+    assert first.nkey != second.nkey
+    assert first.key != second.key
+
+
+async def test_advancing_the_step_is_what_separates_them(tmp_path: Path) -> None:
+    buffer, _journal, _world, _dispatcher = build(tmp_path)
+    branch = speculative()
+    assert branch.advance_step() == 1
+    assert branch.advance_step() == 2
+    assert branch.cursor.step_index == 2
+    assert buffer.pending(branch.id) == ()
+
+
+async def test_drain_refuses_an_offset_that_is_not_this_branchs_confirmation(
+    tmp_path: Path,
+) -> None:
+    """Comparing the offset to the journal head is satisfied by any later entry at all."""
+    buffer, journal, world, dispatcher = build(tmp_path)
+    branch = speculative()
+    branch.advance_step()
+    await buffer.stage(
+        branch, ToolCall("restart_job", {"job_id": "etl-1"}), registry_of(dispatcher, "restart_job")
+    )
+    branch.confirm()
+    branch.context_verified = True
+    # Some other entry exists at this offset -- under an offset-vs-head check this passes.
+    other = await journal.append_async(
+        RUN, "policy_event", {"v": 1, "event": "alpha_update", "reason": "x"}
+    )
+    with pytest.raises(BranchClosed, match="branch_resolved"):
+        await buffer.drain(branch, dispatcher, confirmed_offset=other, authorised_by_offset=other)
+    assert world.mutations == []
+
+
+async def test_a_branch_with_a_staged_slot_may_not_call_the_model() -> None:
+    """Rule 13's structural half: a staged slot never fills, so no honest turn includes it."""
+    from specunode.core.branch import ResultSlot, SlotStatus, TurnFrame
+    from specunode.core.hazards import Hazard, analyse_model_request
+    from specunode.core.policy import Policy
+
+    branch = Branch(id="br-slot", status=BranchStatus.SPECULATIVE)
+    assert analyse_model_request(branch, b'{"messages":[]}', Policy()) is None
+
+    frame = TurnFrame(step=1, slots=[ResultSlot(ordinal=0, tool_use_id="u1")])
+    frame.slots[0].status = SlotStatus.STAGED
+    branch.frames.append(frame)
+    assert (
+        analyse_model_request(branch, b'{"messages":[]}', Policy())
+        is Hazard.MODEL_TURN_AFTER_STAGED_WRITE
+    )

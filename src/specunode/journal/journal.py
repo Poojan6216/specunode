@@ -618,15 +618,21 @@ class Journal:
         finally:
             backend.close()
 
-    def max_step(self, run_id: str) -> int:
-        """The highest ``step`` any entry recorded, or -1.
+    def max_step(self, run_id: str, *, branches: frozenset[str] | None = None) -> int:
+        """The highest ``step`` recorded, or -1.
 
-        This is how the step counter survives a crash (Hard Rule 8): an idempotency key
-        re-derived after a resume must equal the one derived before it, and the counter it
-        depends on therefore cannot start again from zero.
+        ``branches`` restricts the scan, and a resume must pass the set of branches that
+        reached RETIRED. Counting every entry would include steps consumed by branches whose
+        work was thrown away, so the counter would resume higher than the committed program
+        position, every key derived after the resume would differ from the one derived before
+        it, and the kill/resume comparison would fail intermittently -- at exactly the kill
+        points that landed after a squash.
         """
         highest = -1
         for entry in self.read(run_id):
+            owned = entry.branch_id is None or branches is None or entry.branch_id in branches
+            if not owned:
+                continue
             step = entry.step
             if step is not None and step > highest:
                 highest = step

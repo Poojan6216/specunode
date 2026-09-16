@@ -177,7 +177,12 @@ def analyse_model_request(
     branch: Branch, canonical_request: bytes, policy: Policy
 ) -> Hazard | None:
     """Hard Rule 13's gate, checked before any request leaves the runtime."""
-    if has_handle(canonical_request):
+    # Two predicates, and the second is the structural one. A staged slot never fills -- the
+    # effect cannot dispatch before the branch retires -- so a request that must include it
+    # would either deadlock or carry a synthetic value. Checking only the bytes would miss the
+    # case where the staged result is not rendered into the prompt at all but the turn still
+    # depends on it having happened.
+    if branch.has_staged_slot() or has_handle(canonical_request):
         return Hazard.MODEL_TURN_AFTER_STAGED_WRITE
     return None
 

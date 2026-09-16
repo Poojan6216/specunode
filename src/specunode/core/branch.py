@@ -29,7 +29,10 @@ __all__ = [
     "BranchClosed",
     "BranchStatus",
     "ReadRecord",
+    "ResultSlot",
+    "SlotStatus",
     "StepCursor",
+    "TurnFrame",
 ]
 
 
@@ -109,12 +112,72 @@ class ReadRecord:
     result_hash: str
     witness: JsonValue
     at_step: int
-    speculative: bool
+    #: Whether this read was issued while the branch was still a guess. Only those are
+    #: revalidated at retirement: a read a CONFIRMED branch issued happened *after* the
+    #: model's decision was already durable, so there is no speculation to invalidate -- and
+    #: revalidating it turns a workload with a competing writer into a livelock, on the
+    #: sequential arm, where validation is meaningless.
+    issued_while_speculative: bool = True
+    #: Whether this read overlapped an ancestor's drain. Reported in the ledger rather than
+    #: blocked: blocking would cost exactly the latency past-write speculation exists to buy,
+    #: to close a race that can only arise from under-declared forward_keys -- which is
+    #: already a named developer-side trust boundary.
+    raced_drain: bool = False
 
     @property
     def witnessed(self) -> bool:
         """A read with no witness cannot be validated, and is reported so -- never as fresh."""
         return self.witness is not None
+
+
+class SlotStatus(Enum):
+    """Where a tool result slot is. A staged slot never fills, and that is not a bug."""
+
+    PENDING = "pending"
+    FILLED = "filled"
+    #: The call was staged, so there is no result and there never will be on this branch.
+    #: Any request that would have to include this slot is refused by Hard Rule 13's gate.
+    STAGED = "staged"
+
+
+@dataclass
+class ResultSlot:
+    """One tool result's place in a turn, allocated when the call was *requested*.
+
+    Preallocated at parse time and filled by ordinal, so program order is structural rather
+    than a sort. A sort would leave a window in which an unsorted list could be serialised,
+    and appending on completion produces completion order -- which is the bug spec task 3.8
+    plants.
+    """
+
+    ordinal: int
+    tool_use_id: str
+    call: Decision | None = None
+    status: SlotStatus = SlotStatus.PENDING
+    content: JsonValue = None
+    handle: str | None = None
+    journal_offset: int | None = None
+    future: object = None
+
+
+@dataclass
+class TurnFrame:
+    """One assistant turn and the result slots its tool calls will fill."""
+
+    step: int
+    slots: list[ResultSlot] = field(default_factory=list)
+    complete: bool = False
+
+    def slot(self, ordinal: int) -> ResultSlot:
+        return self.slots[ordinal]
+
+    @property
+    def pending(self) -> list[ResultSlot]:
+        return [s for s in self.slots if s.status is SlotStatus.PENDING]
+
+    @property
+    def staged(self) -> list[ResultSlot]:
+        return [s for s in self.slots if s.status is SlotStatus.STAGED]
 
 
 @dataclass
@@ -146,6 +209,23 @@ class Branch:
     #: Tokens spent on this branch, which are wasted if it squashes (Hard Rule 10).
     tokens: int = 0
     tier: int | None = None
+    #: The structural node this branch is executing, for key derivation and the ledger.
+    node_id: str = ""
+    #: Offset of the ``branch_resolved{confirmed}`` entry. Nothing dispatches before this is
+    #: durable, and a resume resurrects a branch only when this entry exists (Hard Rule 3).
+    confirmed_offset: int | None = None
+    #: Set at R1: no further forks at this step, resolution is under way.
+    frozen: bool = False
+    #: Turn frames, in program order. Never sorted, never appended out of order.
+    frames: list[TurnFrame] = field(default_factory=list)
+    #: Child branch ids, so a squash can cascade without consulting a global index.
+    children: list[str] = field(default_factory=list)
+    #: Tool calls executed after this branch's first staged write. This -- not
+    #: max_speculation_depth -- is what past-write speculation actually buys, because a branch
+    #: can never make another model call after staging, so the benchmark reports it by name.
+    post_write_span: int = 0
+    #: The asyncio task running this branch. Cancellation is the squash primitive.
+    task: object = None
 
     def __post_init__(self) -> None:
         if not self.lineage:
@@ -182,6 +262,20 @@ class Branch:
             tier=tier,
         )
 
+    def advance_step(self) -> int:
+        """Take the next program position for a call this branch is about to make.
+
+        Every port call takes one, not just every model-emitted block. A node body can issue
+        two calls the model never separately emitted -- a fan-out, a retry loop, two writes in
+        one node -- and if they shared a step index, two identical calls would derive an
+        identical idempotency key, dedupe would suppress the second, and an effect the
+        sequential run performed would never reach the world. None of the three mandatory
+        tests can see that: the leak invariant is a subset over branch ids and cannot see a
+        *missing* effect, and both equivalence arms would collide identically.
+        """
+        self.cursor = self.cursor.advance()
+        return self.cursor.step_index
+
     def record_prompt(self, step: int, request_hash: str) -> None:
         self.prompts_sent.append((step, request_hash))
         if self.status is BranchStatus.SPECULATIVE:
@@ -211,3 +305,11 @@ class Branch:
 
     def unwitnessed_reads(self) -> Sequence[ReadRecord]:
         return [record for record in self.read_set if not record.witnessed]
+
+    def reads_to_validate(self) -> Sequence[ReadRecord]:
+        """Reads issued while this branch was still a guess -- the only ones E3 re-checks."""
+        return [record for record in self.read_set if record.issued_while_speculative]
+
+    def has_staged_slot(self) -> bool:
+        """Whether any turn is waiting on a result that will never arrive."""
+        return any(frame.staged for frame in self.frames)

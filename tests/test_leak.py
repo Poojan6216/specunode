@@ -170,6 +170,8 @@ async def simulate(
             for _ in range(plan.effects_per_branch[index]):
                 seed += 1
                 tool = plan.tools[seed % len(plan.tools)]
+                # One program position per call, as the real tool port takes.
+                child.advance_step()
                 await buffer.stage(child, ToolCall(tool, _args(tool, seed)), registry.get(tool))
 
         before = len(world.mutations)
@@ -385,6 +387,7 @@ async def _squashed_attempt(tmp_path: Path) -> None:
     buffer = StoreBuffer(journal=journal, run_id=run_id)
     dispatcher = Dispatcher(registry=registry, max_attempts=1)
     doomed = Branch(id=new_ulid(), status=BranchStatus.SPECULATIVE)
+    doomed.advance_step()
     call = ToolCall("charge_card", _args("charge_card", 1))
     await buffer.stage(doomed, call, registry.get("charge_card"))
     doomed.squash("mismatch")
@@ -402,6 +405,7 @@ async def _durability_attempt(tmp_path: Path) -> None:
     buffer = StoreBuffer(journal=journal, run_id=run_id)
     dispatcher = Dispatcher(registry=registry, max_attempts=1)
     branch = Branch(id=new_ulid(), status=BranchStatus.SPECULATIVE)
+    branch.advance_step()
     await buffer.stage(
         branch, ToolCall("charge_card", _args("charge_card", 1)), registry.get("charge_card")
     )

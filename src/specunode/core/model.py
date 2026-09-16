@@ -32,6 +32,7 @@ still change the hash even though the id itself changes no token the model condi
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -51,13 +52,16 @@ from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
 
 __all__ = [
+    "BuiltRequest",
     "CallScope",
     "ContentBlock",
+    "ContextDivergence",
     "JournaledModel",
     "Message",
     "ModelClient",
     "ModelError",
     "ModelResponse",
+    "PromptBuilder",
     "RequestEnvelope",
     "StreamEvent",
     "TextBlock",
@@ -69,6 +73,7 @@ __all__ = [
     "ToolUseComplete",
     "TurnComplete",
     "Usage",
+    "check_structural",
     "current_scope",
     "decisions_of",
     "project",
@@ -602,3 +607,148 @@ class JournaledModel:
                 latency_ms = int((time.monotonic() - started) * 1000)
                 await self._journal_response(event.response, scope, request_id, digest, latency_ms)
             yield event
+
+
+# -- building a request, and Hard Rule 13's structural check -------------------------------------
+
+
+#: Kept in step with specunode.core.hazards.HANDLE_PREFIX; a test asserts the two agree.
+_HANDLE_SCAN = re.compile(rb"(?i)\$specunode\.handle:")
+
+
+class ContextDivergence(RuntimeError):
+    """A request was, or would have been, different from the one the sequential run would send.
+
+    Carries the step and what differed, because "the context diverged" without saying where is
+    not actionable, and this fault squashes a branch whose model output is then thrown away.
+    """
+
+    def __init__(self, step: int, problems: Sequence[str], *, kind: str = "structural") -> None:
+        self.step = step
+        self.problems = tuple(problems)
+        self.kind = kind
+        super().__init__(f"context divergence at step {step} ({kind}):\n  " + "\n  ".join(problems))
+
+
+@dataclass(frozen=True, slots=True)
+class BuiltRequest:
+    """A request, its identity, and the record of anything the runtime did not derive."""
+
+    envelope: RequestEnvelope
+    request_hash: str
+    #: Indices in the message list of blocks the node supplied rather than the runtime deriving.
+    #: Recorded at build time so the retirement check can compare the derivable part exactly
+    #: and count the rest, instead of failing on material it could never have rebuilt.
+    injected_index: tuple[int, ...] = ()
+    injected_hash: str | None = None
+
+
+def check_structural(envelope: RequestEnvelope, attested: frozenset[str]) -> list[str]:
+    """Hard Rule 13's total check, over the bytes actually being sent.
+
+    Three named fault classes, and this catches all three without needing to rebuild anything:
+
+    1. a placeholder anywhere in the request -- the model would be conditioned on a value that
+       does not exist
+    2. a message from a branch whose output may not be read back -- a squashed sibling, or one
+       that has not resolved yet. The tempting predicate "origin is not a squashed branch"
+       admits the *unresolved* sibling, which is exactly the Hard Rule 6 channel, so the test
+       is membership in the attested set rather than absence from a blacklist
+    3. tool results out of program order, or gapped, or split across several user messages --
+       the model must see results in the order it asked for them, not the order they finished
+
+    None of these can false-positive, so none is ever waived.
+    """
+    problems: list[str] = []
+
+    # The loose, case-insensitive scan over the exact bytes canonical() produced. Defined
+    # here rather than imported from hazards, which imports branch, which imports this module.
+    if _HANDLE_SCAN.search(canonical_request(envelope)):
+        problems.append("a staged write's placeholder appears in the request")
+
+    for index, message in enumerate(envelope.messages):
+        origin = message.origin_branch
+        if origin and origin not in attested:
+            problems.append(
+                f"messages[{index}] came from branch {origin!r}, which is neither retired nor "
+                "in this branch's lineage"
+            )
+
+    for index, message in enumerate(envelope.messages):
+        results = [b for b in message.content if isinstance(b, ToolResultBlock)]
+        if not results:
+            continue
+        if len(results) != len(message.content):
+            problems.append(f"messages[{index}] mixes tool results with other content")
+        others = [
+            other
+            for other in envelope.messages[index + 1 :]
+            if any(isinstance(b, ToolResultBlock) for b in other.content)
+        ]
+        preceding_uses = _tool_use_ids_before(envelope.messages, index)
+        ordered = [b.tool_use_id for b in results]
+        if ordered != preceding_uses[: len(ordered)]:
+            problems.append(
+                f"messages[{index}] returns tool results in completion order "
+                f"{ordered} rather than program order {preceding_uses[: len(ordered)]}"
+            )
+        if others and preceding_uses and len(ordered) < len(preceding_uses):
+            problems.append(
+                f"messages[{index}] carries {len(ordered)} of {len(preceding_uses)} results; "
+                "one turn's results belong in one message"
+            )
+    return problems
+
+
+def _tool_use_ids_before(messages: Sequence[Message], index: int) -> list[str]:
+    """The tool_use ids of the most recent assistant turn before ``index``, in program order."""
+    for message in reversed(messages[:index]):
+        uses = [b.id for b in message.content if isinstance(b, ToolUseBlock)]
+        if uses:
+            return uses
+    return []
+
+
+@dataclass
+class PromptBuilder:
+    """The only code in the runtime that constructs a target-model request.
+
+    One builder for sequential mode, speculative mode, replay and the retirement rebuild, so
+    the four cannot drift apart. Anything a node supplies that the runtime did not derive --
+    a system message assembled from graph state, a retrieved document, a templated turn --
+    must pass through :meth:`inject`, which records it so the retirement check can compare the
+    derivable part exactly and count the rest.
+
+    Without that split, Rule 13 would report a divergence on every step of every ordinary
+    LangGraph app, and the repair an implementer reaches for is to rebuild from the branch's
+    own message list -- which compares the list to itself and can never fail.
+    """
+
+    base: RequestEnvelope
+    _injected: list[tuple[int, ContentBlock]] = field(default_factory=list)
+
+    def inject(self, index: int, block: ContentBlock) -> None:
+        """Declare a block the runtime did not derive, at its position in the message list."""
+        self._injected.append((index, block))
+
+    def build(self, messages: Sequence[Message], *, attested: frozenset[str]) -> BuiltRequest:
+        """Assemble, check, and hash -- in that order.
+
+        The check runs before the hash and before anything leaves, so a request that would
+        violate Rule 13 is never sent rather than being detected after the fact.
+        """
+        envelope = self.base.with_messages(messages)
+        problems = check_structural(envelope, attested)
+        if problems:
+            raise ContextDivergence(-1, problems, kind="structural")
+        indices = tuple(sorted(index for index, _ in self._injected))
+        return BuiltRequest(
+            envelope=envelope,
+            request_hash=request_hash(envelope),
+            injected_index=indices,
+            injected_hash=(
+                chash([block_to_json(block) for _, block in sorted(self._injected)])
+                if self._injected
+                else None
+            ),
+        )
