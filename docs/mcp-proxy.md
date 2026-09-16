@@ -8,6 +8,34 @@ are held until the model's real decision confirms them.
 specunode mcp-proxy --upstream "python my_server.py" --config specunode.yaml
 ```
 
+## What was actually wrong for most of this build
+
+The proxy's rules were tested from the start and its transport was not, on the reasoning that
+the rules carry the correctness claims and the SDK does not. That is defensible right up until
+it is the only thing tested. Driving the whole chain — a generic `mcp` client, the proxy, and a
+real stdio upstream server — found four defects in a row, none of which a rules test could see:
+
+1. **It could not register a single tool.** The forwarding function was annotated with the
+   package's recursive `JsonValue` alias, and the SDK builds each tool's schema by making a
+   pydantic model from the signature. Registration raised `PydanticUserError` and the proxy
+   died before serving one request. The proxy's own six control tools had the same problem.
+2. **It advertised a schema the upstream never declared.** `mcp` 2.x renamed `inputSchema` to
+   `input_schema`, and a `getattr(tool, "inputSchema", None)` went on quietly returning `None`.
+   A missing schema field is now a startup failure with the SDK version in the message.
+3. **It rejected every call made against the schema it advertised.** The SDK parses arguments
+   against a model built from the *signature*, not from the advertised schema, so a bare
+   `**kwargs` forwarder asked clients for a literal `kwargs` field. The forwarder is now given
+   the upstream's parameter names.
+4. **The first forwarded read hung.** `MCPServer.run("stdio")` opens its own event loop, so the
+   served tools ran on one loop and the upstream `ClientSession` on another. `run_stdio_async`
+   keeps them on one.
+
+All four are now covered by `tests/integration/test_mcp_end_to_end.py`, which asserts on what
+the upstream server *received* — from a log it writes itself — rather than on what the proxy
+reports having forwarded. The startup probe checks for each SDK surface these fixes depend on,
+so drift fails loudly rather than degrading into something that forwards writes it should hold.
+
+
 ## The difficulty, stated first
 
 **The proxy cannot see the model.** It sees tool calls arriving and results going back; it never

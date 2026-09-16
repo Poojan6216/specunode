@@ -26,6 +26,7 @@ Neither mode is pretended to be the full runtime. The stamp says which one ran.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -272,13 +273,32 @@ def probe_sdk() -> str:
             "the MCP proxy needs the optional extra: pip install 'specunode[mcp]'"
         ) from exc
     try:
-        from mcp.server.mcpserver import MCPServer  # noqa: F401
+        from mcp.server.mcpserver import MCPServer
     except ImportError as exc:
         raise ProxyUnsupported(
             f"mcp {version} does not expose mcp.server.mcpserver.MCPServer (probed against "
             f"{PROBED_MCP}). Pin the SDK rather than running a proxy that silently forwards "
             "writes it was meant to hold."
         ) from exc
+    # The proxy has to replace each tool's inferred schema with the upstream's, and the public
+    # add_tool neither returns the Tool nor takes a schema. Checked here, at startup, because
+    # the alternative is discovering it on the first tool call -- by which time a client is
+    # connected and believes it is talking to something that holds writes.
+    probe = MCPServer("specunode-probe")
+    if not hasattr(probe, "run_stdio_async"):
+        raise ProxyUnsupported(
+            f"mcp {version} does not expose MCPServer.run_stdio_async (probed against "
+            f"{PROBED_MCP}). The synchronous run() opens its own event loop, which would put "
+            "the served tools and the upstream session on different loops and hang the first "
+            "forwarded call."
+        )
+    manager = getattr(probe, "_tool_manager", None)
+    if manager is None or not hasattr(manager, "add_tool"):
+        raise ProxyUnsupported(
+            f"mcp {version} does not expose MCPServer._tool_manager.add_tool (probed against "
+            f"{PROBED_MCP}), so tool schemas cannot be forwarded from the upstream server. "
+            "Pin the SDK rather than running a proxy that advertises the wrong schema."
+        )
     return version
 
 
@@ -309,15 +329,56 @@ async def serve(
         for tool in listing.tools:
             _register_proxied(server, upstream, state, tool, types)
         _register_control_tools(server, state)
-        # MCPServer.run is sync in mcp 2.x and owns its own event loop for the chosen
-        # transport, so it is handed off to a thread rather than awaited.
-        await asyncio.to_thread(server.run, "stdio")
+        # ``run_stdio_async`` rather than ``run("stdio")`` in a thread. ``run`` opens its own
+        # event loop, which put the served tools on one loop and the upstream ClientSession on
+        # another -- so the first forwarded read awaited a session belonging to a loop that was
+        # not running it, and the proxy hung instead of answering. Everything here has to share
+        # one loop, because every proxied call is a call back out to the upstream.
+        await server.run_stdio_async()
 
+
+#: The attribute an SDK's tool model uses for its JSON Schema, newest spelling first.
+_SCHEMA_ATTRS = ("input_schema", "inputSchema")
+
+
+def _upstream_schema(tool: Any) -> Mapping[str, Any] | None:
+    """The upstream tool's declared argument schema, whatever the SDK calls the field.
+
+    Raises rather than returning ``None`` when the field is absent entirely. ``mcp`` 2.x renamed
+    ``inputSchema`` to ``input_schema``, and a ``getattr(tool, "inputSchema", None)`` went on
+    quietly returning ``None`` -- so the proxy advertised a schema it had inferred rather than
+    the upstream's, and rejected every call made against the schema it advertised. A silent
+    ``None`` on a field this load-bearing is the failure this module's probe exists to prevent,
+    so a missing field is SDK drift and says so.
+    """
+    for attribute in _SCHEMA_ATTRS:
+        if hasattr(tool, attribute):
+            value = getattr(tool, attribute)
+            return value if isinstance(value, Mapping) else None
+    raise ProxyUnsupported(
+        f"the tool {getattr(tool, 'name', '?')!r} has none of {_SCHEMA_ATTRS} (probed against "
+        f"mcp {PROBED_MCP}), so its arguments cannot be forwarded. Pin the SDK rather than "
+        "running a proxy that advertises a schema the upstream did not declare."
+    )
 
 def _register_proxied(server: Any, upstream: Any, state: ProxyState, tool: Any, types: Any) -> None:
-    """Expose one upstream tool, classified and either forwarded or held."""
+    """Expose one upstream tool, classified and either forwarded or held.
 
-    async def proxied(**kwargs: JsonValue) -> JsonValue:
+    Two things here are about the SDK rather than about this proxy.
+
+    ``proxied`` is annotated ``Any`` and not ``JsonValue``. The SDK derives a tool's schema
+    from its function signature by building a pydantic model, and ``JsonValue`` is a recursive
+    alias it cannot resolve in its own namespace -- registration raised ``PydanticUserError``
+    and the proxy never came up at all against a real server. The rules tests could not see
+    that: they exercise :class:`ProxyState` without a transport.
+
+    The schema the client is then shown is the *upstream's*, copied over the one the SDK
+    inferred. A proxy that advertised a free-form schema where the upstream declares typed
+    arguments would push every argument error from the client's validation out to the server's,
+    which is a worse place to find it.
+    """
+
+    async def proxied(**kwargs: Any) -> Any:
         spec = state.classify(tool.name)
         if spec.effect is EffectClass.READ:
             state.reads_forwarded += 1
@@ -336,21 +397,65 @@ def _register_proxied(server: Any, upstream: Any, state: ProxyState, tool: Any, 
             return [block.model_dump() for block in result.content]
         return {"_specunode": {"discarded": True, "effect_id": held.effect_id}}
 
-    server.add_tool(
-        proxied,
+    schema = _upstream_schema(tool)
+    registered = server._tool_manager.add_tool(
+        _with_upstream_signature(proxied, schema),
         name=tool.name,
         description=tool.description,
         annotations=getattr(tool, "annotations", None),
     )
+    if schema is not None:
+        registered.parameters = dict(schema)
 
+
+def _with_upstream_signature(fn: Any, schema: Any) -> Any:
+    """Give a ``**kwargs`` forwarder the upstream tool's parameter names.
+
+    The SDK parses a call's arguments against a model built from the function's *signature*,
+    not from the schema the tool advertises. A bare ``**kwargs`` forwarder therefore advertises
+    the upstream's schema and then rejects every call against it, asking for a literal
+    ``kwargs`` field -- which is what happened, and what a rules-only test suite cannot see.
+
+    Every parameter is typed ``Any`` on purpose. The upstream is the authority on its own
+    argument types, it validates them itself, and a proxy that re-derived Python types from
+    JSON Schema would invent disagreements. The schema the client is shown is still the
+    upstream's, copied over the inferred one by the caller.
+    """
+    if not isinstance(schema, Mapping):
+        return fn
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return fn
+    required = schema.get("required")
+    required_names = set(required) if isinstance(required, Sequence) else set()
+    parameters = [
+        inspect.Parameter(
+            name,
+            inspect.Parameter.KEYWORD_ONLY,
+            default=inspect.Parameter.empty if name in required_names else None,
+            annotation=Any,
+        )
+        for name in properties
+        if name.isidentifier()
+    ]
+    fn.__signature__ = inspect.Signature(parameters)
+    fn.__annotations__ = {name: Any for name in properties if name.isidentifier()}
+    fn.__annotations__["return"] = Any
+    return fn
 
 def _register_control_tools(server: Any, state: ProxyState) -> None:
-    """The proxy's own six tools, so a client can see and steer what is held."""
+    """The proxy's own six tools, so a client can see and steer what is held.
 
-    async def status() -> JsonValue:
+    Annotated with concrete types rather than ``JsonValue`` for the same reason the proxied
+    tools are: the SDK builds each tool's schema by making a pydantic model from the signature,
+    and a recursive alias it cannot resolve in its own namespace raises ``PydanticUserError``
+    at registration time. That took the whole proxy down before it served a single request.
+    """
+
+    async def status() -> dict[str, Any]:
         return dict(state.status())
 
-    async def ledger() -> JsonValue:
+    async def ledger() -> dict[str, Any]:
         return {
             "dispatched": [c.effect_id for c in state.dispatched],
             "discarded": [c.effect_id for c in state.discarded],
@@ -358,25 +463,25 @@ def _register_control_tools(server: Any, state: ProxyState) -> None:
             "context_identity": state.context_identity,
         }
 
-    async def stall() -> JsonValue:
+    async def stall() -> dict[str, Any]:
         state.mode = ClientMode.BLOCKING
         return {"mode": state.mode.value}
 
-    async def discard(confirm: bool = False) -> JsonValue:
+    async def discard(confirm: bool = False) -> dict[str, Any]:
         if not confirm:
             return {
                 "error": "discard drops held writes unsent; call again with confirm=true",
             }
         return {"discarded": state.discard_all()}
 
-    async def retire(tool: str, args: Mapping[str, JsonValue] | None = None) -> JsonValue:
+    async def retire(tool: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         confirmed, dropped = state.retire(ToolCall(name=tool, args=dict(args or {})))
         return {
             "dispatched": [c.effect_id for c in confirmed],
             "discarded": [c.effect_id for c in dropped],
         }
 
-    async def replay_check() -> JsonValue:
+    async def replay_check() -> dict[str, Any]:
         return {
             "held": len(state.staged),
             "note": "The proxy has no journal of its own; a replay check needs the run's journal.",
