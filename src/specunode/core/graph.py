@@ -30,12 +30,15 @@ than silent so the benchmark's hazard histogram stays complete.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, MutableMapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, TypeAlias, runtime_checkable
 
 from specunode.canonical import JsonValue
 from specunode.core.decision import Decision
+from specunode.core.effects import ToolSpec
 from specunode.core.model import ModelClient
 
 __all__ = [
@@ -45,6 +48,10 @@ __all__ = [
     "NodeRef",
     "RoutingIsInternal",
     "RunSession",
+    "active_session",
+    "current_session",
+    "routed",
+    "session_scope",
 ]
 
 
@@ -121,6 +128,15 @@ class RunSession:
     call_tool: Callable[[str, Mapping[str, JsonValue]], Awaitable[JsonValue]]
     #: Called by an adapter when a node reaches a decision point.
     decide: Callable[[Decision], Awaitable[Decision]]
+    #: How a self-driving framework runs one node under the runtime. The shim hands over the
+    #: node's name and a thunk for its body; the runtime mints a branch, runs the body as a
+    #: task, retires it, and returns whatever the body returned. It is a thunk rather than a
+    #: context manager because a node parked on a staged write's result must retire *while its
+    #: body is still suspended* -- wrapping the body in `async with` would only reach the exit
+    #: after the body finished, which is the deadlock the store buffer design exists to avoid.
+    run_in_node: (
+        Callable[[str, Callable[[], Awaitable[JsonValue]]], Awaitable[JsonValue]] | None
+    ) = None
     #: The target model, already wrapped so every request and response is journaled before
     #: the runtime acts on it. A node calls this rather than constructing its own client --
     #: that substitution is what lets a developer's graph file stay unchanged.
@@ -129,6 +145,50 @@ class RunSession:
     #: over a copy-on-write fork that measures its own delta, while a node body still just
     #: reads and writes keys.
     state: MutableMapping[str, JsonValue] = field(default_factory=dict)
+
+
+#: The session a node body is running inside. A ContextVar because a framework's node
+#: signature belongs to the framework, not to us: a LangGraph node is handed state and a
+#: config, with nowhere to pass a runtime handle. Each asyncio task gets its own copy, so one
+#: branch cannot reach another's session (Hard Rule 6).
+active_session: ContextVar[RunSession | None] = ContextVar("specunode_active_session", default=None)
+
+
+def current_session() -> RunSession | None:
+    """The session this node body is running inside, or ``None`` outside a run."""
+    return active_session.get()
+
+
+@contextmanager
+def session_scope(session: RunSession | None) -> Iterator[None]:
+    token = active_session.set(session)
+    try:
+        yield
+    finally:
+        active_session.reset(token)
+
+
+def routed(spec: ToolSpec) -> Callable[..., Awaitable[JsonValue]]:
+    """Wrap a tool so it goes through the runtime when there is one, and runs plainly when not.
+
+    This is what lets one graph file run both wrapped and unwrapped, which spec task 2.3 asks
+    for and task 2.4 compares. Outside a run the call is the developer's own function; inside
+    one it is classified, journaled, and either executed (a READ) or staged (anything else).
+
+    A tool the developer did not route is invisible to the runtime -- which is also why an
+    undeclared tool is a WRITE rather than an error: the runtime cannot make a call it never
+    sees safe, and it says so rather than pretending.
+    """
+
+    async def call(**kwargs: JsonValue) -> JsonValue:
+        session = active_session.get()
+        if session is None:
+            return await spec.fn(**kwargs)
+        return await session.call_tool(spec.name, kwargs)
+
+    call.__name__ = spec.name
+    call.__doc__ = spec.fn.__doc__
+    return call
 
 
 @runtime_checkable

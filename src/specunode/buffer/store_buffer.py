@@ -156,9 +156,9 @@ class StoreBuffer:
     #: Futures a node body awaits for a staged write's real result. Completed only by the
     #: drain, and only after the confirming entry is durable.
     _acks: dict[str, asyncio.Future[JsonValue]] = field(default_factory=dict)
-    #: When set, ``drain`` refuses any caller but this task. Without the guard, the obvious
-    #: repair for "my node body is waiting for an ack" is to drain inline from the branch
-    #: task -- which dispatches before the branch is confirmed.
+    #: Kept for callers that want to name the driving task explicitly. The guard that matters
+    #: is in ``drain`` and is expressed against the *branch's* task, not this one: on a
+    #: framework that owns its own loop the drain legitimately runs on the framework's task.
     scheduler_task: asyncio.Task[object] | None = None
 
     # -- staging ---------------------------------------------------------------------------
@@ -389,11 +389,16 @@ class StoreBuffer:
         branch before the entry that confirmed it is durable -- and a precondition checked only
         at the call site would be planted around.
         """
-        if self.scheduler_task is not None and asyncio.current_task() is not self.scheduler_task:
+        # The invariant is about the *branch*, not about which particular task drives: a node
+        # body waiting on a staged write's result must never be the thing that dispatches it.
+        # The repair that suggests itself when a node is parked -- drain inline from the call
+        # that staged the effect -- dispatches before the branch is confirmed, which is task
+        # 1.6's planted bug. Naming the branch's own task makes that unreachable while still
+        # allowing a framework that owns its run loop to drain from its own driver task.
+        if branch.task is not None and asyncio.current_task() is branch.task:
             raise BranchClosed(
-                "drain was called from a branch task. Dispatch happens on the scheduler's own "
-                "task, after the confirming entry is durable; draining from the branch that "
-                "staged the effect is exactly the bug task 1.6 plants."
+                f"drain was called from branch {branch.id}'s own task. A node cannot dispatch "
+                "the write it is waiting on: that is a dispatch before the branch is confirmed."
             )
         if branch.status is not BranchStatus.CONFIRMED:
             raise BranchClosed(

@@ -527,28 +527,32 @@ async def test_a_dead_lettered_effect_fails_its_ack_rather_than_hanging(tmp_path
         await ack
 
 
-async def test_drain_refuses_a_caller_that_is_not_the_scheduler_task(tmp_path: Path) -> None:
-    """The repair an implementer reaches for -- drain inline so my node gets its ack -- dispatches
-    before the branch is confirmed. The guard makes that unreachable rather than discouraged."""
+async def test_drain_refuses_the_branchs_own_task(tmp_path: Path) -> None:
+    """A node cannot dispatch the write it is waiting on.
+
+    That is the repair an implementer reaches for when a node body is parked -- drain inline so
+    it gets its ack -- and it dispatches before the branch is confirmed, which is task 1.6's
+    planted bug. The guard names the branch's own task, so it holds on a framework that owns
+    its run loop too, where the drain legitimately runs on the framework's driver task.
+    """
     import asyncio
 
     buffer, journal, world, dispatcher = build(tmp_path)
     branch = speculative()
+    branch.advance_step()
     await buffer.stage(
         branch, ToolCall("restart_job", {"job_id": "etl-1"}), registry_of(dispatcher, "restart_job")
     )
     offset = await confirm(journal, branch)
-    current = asyncio.current_task()
-    assert current is not None
-    buffer.scheduler_task = current
 
-    async def from_a_branch_task() -> None:
-        with pytest.raises(BranchClosed, match="branch task"):
+    async def from_the_branch_task() -> None:
+        branch.task = asyncio.current_task()
+        with pytest.raises(BranchClosed, match="own task"):
             await buffer.drain(
                 branch, dispatcher, confirmed_offset=offset, authorised_by_offset=offset
             )
 
-    await asyncio.create_task(from_a_branch_task())
+    await asyncio.create_task(from_the_branch_task())
     assert world.mutations == []
 
 

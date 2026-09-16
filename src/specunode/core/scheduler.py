@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -41,7 +41,7 @@ from specunode.canonical import JsonValue, chash
 from specunode.core.branch import Branch, BranchStatus, ReadRecord, StepCursor
 from specunode.core.decision import Decision, ToolCall, is_barrier
 from specunode.core.effects import EffectClass, ToolRegistry
-from specunode.core.graph import END, GraphAdapter, NodeRef, RunSession
+from specunode.core.graph import END, GraphAdapter, NodeRef, RunSession, session_scope
 from specunode.core.hazards import Hazard, analyse
 from specunode.core.model import CallScope, ModelClient, call_scope
 from specunode.core.policy import Policy
@@ -174,6 +174,10 @@ class Scheduler:
 
     run_id: str = ""
     counters: _Counters = field(default_factory=_Counters)
+    _cursor: StepCursor = field(default_factory=StepCursor)
+    _committed: CommittedState = field(default_factory=CommittedState)
+    _reducers: Mapping[str, Reducer] = field(default_factory=dict)
+    _steps: int = 0
     #: Signalled by the tool port when a branch parks on a staged write's result. An Event
     #: rather than a flag because the scheduler has to wait for the *next* park, not merely
     #: observe that one happened: a node released by a drain may stage again, and spinning on
@@ -273,12 +277,23 @@ class Scheduler:
         siblings beside it; the retirement sequence below does not change.
         """
         self.run_id = run_id
+        # One source of truth for the run id. Letting the buffer carry its own lets the two
+        # disagree, and the failure is silent and confident: effects are journaled under one
+        # run while the ledger is built from another, so the run finishes ok with an empty
+        # ledger and a world that was nonetheless changed.
+        self.buffer.run_id = run_id
         self.buffer.scheduler_task = asyncio.current_task()
-        committed = CommittedState.initial(inputs if isinstance(inputs, Mapping) else {})
-        cursor = StepCursor()
-        reducers = resolve_reducers(dict(self.reducers))
+        self._committed = CommittedState.initial(inputs if isinstance(inputs, Mapping) else {})
+        self._cursor = StepCursor()
+        self._reducers = resolve_reducers(dict(self.reducers))
         await self._journal_run_started(inputs)
 
+        if self.graph.capabilities().drives_itself:
+            return await self._run_driven(run_id, inputs)
+
+        committed = self._committed
+        cursor = self._cursor
+        reducers = self._reducers
         ok, error, steps = True, None, 0
         try:
             while True:
@@ -301,6 +316,7 @@ class Scheduler:
                     ok, error = False, f"effects from node {node.name} did not all dispatch"
 
                 committed, cursor = await self._commit(branch, committed, reducers)
+                self._committed, self._cursor = committed, cursor
                 steps += 1
                 if not ok:
                     break
@@ -318,6 +334,100 @@ class Scheduler:
             steps=steps,
             error=error,
         )
+
+    async def _run_driven(self, run_id: str, inputs: JsonValue) -> RunResult:
+        """The framework owns the loop; the runtime is reached from inside each node.
+
+        LangGraph decides its own next node inside Pregel, and driving it node by node was
+        tried and rejected: a node body that calls ``get_config()``, ``interrupt()`` or
+        ``get_stream_writer()`` raises the moment it runs outside a runnable context, and
+        re-deriving routing, reducers and map-reduce outside Pregel would break the one thing
+        task 2.3 checks -- that a wrapped graph reaches the same final state as an unwrapped one.
+        """
+        ok, error = True, None
+        session = RunSession(
+            run_id=run_id,
+            call_tool=self._orphan_tool_call,
+            decide=self._decide,
+            run_in_node=self._run_in_node,
+            model=self.target,
+            state=self._committed.fork(),
+        )
+        final: JsonValue = None
+        try:
+            with session_scope(session):
+                final = await self.graph.drive(session, inputs)
+        except Exception as exc:
+            ok, error = False, f"{type(exc).__name__}: {exc}"
+
+        await self._journal_run_finished(ok, error, self._steps, self._committed)
+        state = dict(final) if isinstance(final, Mapping) else self._committed.to_dict()
+        return RunResult(
+            run_id=run_id,
+            ok=ok,
+            state=state,
+            ledger=build_ledger(self.journal, run_id),
+            steps=self._steps,
+            error=error,
+        )
+
+    async def _orphan_tool_call(self, name: str, args: Mapping[str, JsonValue]) -> JsonValue:
+        """A routed tool called outside any node scope.
+
+        Refused rather than executed. A call the runtime cannot attribute to a branch cannot be
+        staged, cannot be retired and cannot appear in the ledger, so letting it through would
+        put an effect in the world that no decision authorised.
+        """
+        raise SchedulerError(
+            f"{name} was called outside a node. The runtime attributes every effect to the "
+            "branch that issued it, and a call it cannot attribute cannot be made safe."
+        )
+
+    async def _run_in_node(
+        self, node_name: str, body: Callable[[], Awaitable[JsonValue]]
+    ) -> JsonValue:
+        """Run one framework node under a branch of its own, and retire it."""
+        self._cursor, node_id = self._cursor.visit(node_name)
+        branch = self._fork_canonical(self._cursor, node_id)
+        await self._journal_fork(branch, node_id)
+        branch.state = self._committed.fork()
+
+        tools = BranchTools(self, branch, node_id)
+        session = RunSession(
+            run_id=self.run_id,
+            call_tool=tools.call,
+            decide=self._decide,
+            run_in_node=self._run_in_node,
+            model=self.target,
+            state=branch.state,
+        )
+        scope = CallScope(
+            run_id=self.run_id,
+            branch_id=branch.id,
+            lineage=branch.lineage,
+            step=branch.cursor.step_index,
+            node_id=node_id,
+            record_prompt=branch.record_prompt,
+        )
+
+        async def run() -> JsonValue:
+            token = call_scope.set(scope)
+            with session_scope(session):
+                try:
+                    return await body()
+                finally:
+                    call_scope.reset(token)
+
+        task: asyncio.Task[JsonValue] = asyncio.create_task(run())
+        branch.task = task
+        await self._quiesce(branch, task)  # type: ignore[arg-type]
+        await self._retire(branch, node_id)
+        self._cursor = branch.cursor
+        self._steps += 1
+        # State on this path belongs to the framework's checkpointer, not to the journal:
+        # LangGraph owns reducers and channel semantics, and a second copy here would be a
+        # second answer to what the run's state is. docs/replay.md says so.
+        return task.result()
 
     # -- the pieces -----------------------------------------------------------------------------
 
@@ -377,10 +487,13 @@ class Scheduler:
 
         async def body() -> Decision:
             token = call_scope.set(scope)
-            try:
-                return await self.graph.run_node(node, session)
-            finally:
-                call_scope.reset(token)
+            # The session goes into a ContextVar too, so a tool wrapped by `routed` reaches
+            # the runtime from inside a framework node whose signature has nowhere to pass one.
+            with session_scope(session):
+                try:
+                    return await self.graph.run_node(node, session)
+                finally:
+                    call_scope.reset(token)
 
         task: asyncio.Task[Decision] = asyncio.create_task(body())
         branch.task = task
