@@ -143,8 +143,6 @@ class Branch:
     #: How many requests this branch sent while it was still a guess. Zero means Rule 13 has
     #: nothing to check: every request it sent carried real values.
     speculative_prompts: int = 0
-    #: True once this branch consumed a projected value, which bars every later model call.
-    projected: bool = False
     #: Tokens spent on this branch, which are wasted if it squashes (Hard Rule 10).
     tokens: int = 0
     tier: int | None = None

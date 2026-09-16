@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypeAlias
 
-from specunode.buffer.dispatcher import Dispatcher
+from specunode.buffer.dispatcher import Dispatcher, ToolDispatchError
 from specunode.buffer.idempotency import dedupe_key, idempotency_key
 from specunode.canonical import JsonValue, canonical, chash
 from specunode.core.branch import Branch, BranchClosed, BranchStatus
@@ -51,7 +51,6 @@ __all__ = [
     "DrainReport",
     "EffectOutcome",
     "ForwardHazard",
-    "ForwardHit",
     "ForwardMiss",
     "ForwardResult",
     "StagedEffect",
@@ -89,8 +88,8 @@ class StagedEffect:
     touches: frozenset[str] = frozenset({WILDCARD_KEY})
     #: Always empty in this version; see the module docstring. Kept for the section 7 shape.
     depends_on: frozenset[str] = frozenset()
-    #: The symbolic handle the branch got instead of a value. ``None`` on the canonical path
-    #: in sequential mode, where the caller receives the real ack and no handle is minted.
+    #: The symbolic handle the branch got instead of a value. Always present: a staged effect
+    #: has no value to give, on any branch.
     placeholder: str | None = None
     compensator: str | None = None
     idempotent: bool = False
@@ -109,20 +108,14 @@ class ForwardHazard:
     effect_id: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class ForwardHit:
-    """A value forwarded from a staged write's declared projection.
-
-    Never reachable in this version: projections are off, because unlike a branch prediction a
-    projection has no resolution signal -- there is no later model output to compare it
-    against -- so an enabled projection would retire unverified.
-    """
-
-    value: JsonValue
-    effect_id: str
-
-
-ForwardResult: TypeAlias = ForwardMiss | ForwardHazard | ForwardHit
+#: There is no ``ForwardHit`` in this version, and no policy switch that could produce one.
+#: A projection has no resolution signal -- there is no later model output to compare it
+#: against -- so it would retire unverified. Worse, a tool call whose arguments were computed
+#: from a wrong projection reaches the world with different arguments from the sequential run,
+#: so its equivalence key differs and Hard Rule 9's mandatory test fails *in a supported
+#: configuration*. Rule 9 has no policy escape clause. Deleting the feature is simpler than
+#: every alternative, and it removes the only setting that could void a Hard Rule.
+ForwardResult: TypeAlias = ForwardMiss | ForwardHazard
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +143,13 @@ class StoreBuffer:
     _closed: set[str] = field(default_factory=set)
     _drained: set[str] = field(default_factory=set)
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    #: Futures a node body awaits for a staged write's real result. Completed only by the
+    #: drain, and only after the confirming entry is durable.
+    _acks: dict[str, asyncio.Future[JsonValue]] = field(default_factory=dict)
+    #: When set, ``drain`` refuses any caller but this task. Without the guard, the obvious
+    #: repair for "my node body is waiting for an ack" is to drain inline from the branch
+    #: task -- which dispatches before the branch is confirmed.
+    scheduler_task: asyncio.Task[object] | None = None
 
     # -- staging ---------------------------------------------------------------------------
 
@@ -203,13 +203,18 @@ class StoreBuffer:
             ),
             stage_index=len(staged),
             touches=keys_touched(spec, call.args),
-            placeholder=(
-                handle_for(effect_id) if branch.status is BranchStatus.SPECULATIVE else None
-            ),
+            # Always, with no sequential special case. A node body that writes and then reads
+            # the result -- ack = await charge_card(...); send_receipt(ack["charge_id"]) -- gets
+            # a future here, not a value, and only the drain completes it. Handing back a real
+            # ack instead would mean dispatching inside the call, which is task 1.6's planted
+            # bug; and having the caller await the drain deadlocks the first write of the first
+            # sequential run, before any speculation exists.
+            placeholder=handle_for(effect_id),
             compensator=spec.compensator,
             idempotent=spec.idempotent,
         )
         staged.append(effect)
+        self._acks[effect.id] = asyncio.get_running_loop().create_future()
         self._lineages[branch.id] = branch.lineage
         await self.journal.append_async(
             self.run_id,
@@ -257,7 +262,7 @@ class StoreBuffer:
         return tuple(effect.touches for effect in self.staged_in_lineage(branch))
 
     def forward(self, branch: Branch, read: ToolCall, spec: ToolSpec) -> ForwardResult:
-        """Store-to-load forwarding, which in this version only ever refuses.
+        """Store-to-load forwarding, which in this version can only miss or refuse.
 
         If a staged write in this branch's lineage may touch what this read touches, the read
         cannot be trusted: it would return the pre-write value while the branch goes on to
@@ -299,6 +304,12 @@ class StoreBuffer:
         for branch_id in dict.fromkeys(doomed):
             dropped.extend(self._staged.pop(branch_id, []))
             self._closed.add(branch_id)
+        for effect in dropped:
+            # A node body parked on one of these must not wait forever for a value that is
+            # never coming. Cancelling is what lets squash-by-cancellation actually free it.
+            ack = self._acks.pop(effect.id, None)
+            if ack is not None and not ack.done():
+                ack.cancel()
         return len(dropped)
 
     async def discard_and_journal(self, branch: Branch, reason: str) -> int:
@@ -321,6 +332,18 @@ class StoreBuffer:
 
     def pending(self, branch_id: str) -> tuple[StagedEffect, ...]:
         return tuple(self._staged.get(branch_id, ()))
+
+    def ack_for(self, effect_id: str) -> asyncio.Future[JsonValue]:
+        """The future a node body awaits for a staged write's real result.
+
+        Awaiting one is a barrier for everything except the drain: a branch holding an
+        unresolved ack has a staged write, so its next model request would carry a placeholder
+        and is refused by Hard Rule 13's gate.
+        """
+        ack = self._acks.get(effect_id)
+        if ack is None:
+            raise KeyError(f"no staged effect {effect_id!r}")
+        return ack
 
     # -- drain -------------------------------------------------------------------------------
 
@@ -346,6 +369,12 @@ class StoreBuffer:
         branch before the entry that confirmed it is durable -- and a precondition checked only
         at the call site would be planted around.
         """
+        if self.scheduler_task is not None and asyncio.current_task() is not self.scheduler_task:
+            raise BranchClosed(
+                "drain was called from a branch task. Dispatch happens on the scheduler's own "
+                "task, after the confirming entry is durable; draining from the branch that "
+                "staged the effect is exactly the bug task 1.6 plants."
+            )
         if branch.status is not BranchStatus.CONFIRMED:
             raise BranchClosed(
                 f"drain called on a {branch.status.value} branch; only CONFIRMED branches "
@@ -407,6 +436,7 @@ class StoreBuffer:
                 )
             )
             if claim.outcome is Claim.ALREADY_DISPATCHED:
+                self._complete_ack(effect.id, claim.ack)
                 outcomes.append((effect.id, EffectOutcome.SKIPPED_DEDUPE))
                 continue
             if claim.outcome is Claim.AMBIGUOUS and not effect.idempotent:
@@ -456,6 +486,7 @@ class StoreBuffer:
                         "compensation_for": None,
                     },
                 )
+                self._complete_ack(effect.id, result.ack)
                 outcomes.append((effect.id, EffectOutcome.DISPATCHED))
                 continue
 
@@ -475,6 +506,16 @@ class StoreBuffer:
             halted_at, ok = dispatch_index, False
 
         return DrainReport(branch.id, tuple(outcomes), ok=ok, halted_at=halted_at)
+
+    def _complete_ack(self, effect_id: str, ack: JsonValue) -> None:
+        future = self._acks.get(effect_id)
+        if future is not None and not future.done():
+            future.set_result(ack)
+
+    def _fail_ack(self, effect_id: str, error: str) -> None:
+        future = self._acks.get(effect_id)
+        if future is not None and not future.done():
+            future.set_exception(ToolDispatchError(error, sent="maybe", retriable=False))
 
     async def _dead_letter(
         self,
@@ -504,3 +545,4 @@ class StoreBuffer:
                 "authorised_by_offset": authorised_by_offset,
             },
         )
+        self._fail_ack(effect.id, error)

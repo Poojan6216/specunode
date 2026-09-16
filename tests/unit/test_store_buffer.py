@@ -115,14 +115,20 @@ async def test_a_staged_write_returns_a_handle_not_a_value(tmp_path: Path) -> No
     assert effect.placeholder == handle_for(effect.id)
 
 
-async def test_the_canonical_path_mints_no_handle(tmp_path: Path) -> None:
-    """On the canonical path the caller gets the real ack, so there is nothing to stand in for."""
+async def test_even_the_canonical_path_gets_a_handle_and_a_future(tmp_path: Path) -> None:
+    """A staged effect has no value to give, on any branch.
+
+    Returning a real ack here would mean dispatching inside the call -- task 1.6's planted bug --
+    and making the caller await the drain deadlocks the first write of the first sequential run,
+    before any speculation exists. So the caller gets a future only the drain can complete.
+    """
     buffer, _, _, dispatcher = build(tmp_path)
     branch = Branch(id="br-canon", status=BranchStatus.CONFIRMED)
     effect = await buffer.stage(
         branch, ToolCall("restart_job", {"job_id": "etl-1"}), registry_of(dispatcher, "restart_job")
     )
-    assert effect.placeholder is None
+    assert effect.placeholder == handle_for(effect.id)
+    assert not buffer.ack_for(effect.id).done()
 
 
 async def test_staging_journals_the_effect(tmp_path: Path) -> None:
@@ -463,3 +469,102 @@ async def test_a_partition_reports_that_nothing_left_the_process() -> None:
     """Unreachable and timed-out are different facts, and only one is safe to retry."""
     assert Partitioned("x").sent == "no"
     assert ToolDispatchError("x").sent == "maybe"
+
+
+# -- the staged-ack future (correction C4) ------------------------------------------------------
+
+
+async def test_the_drain_completes_the_ack_a_node_body_is_waiting_on(tmp_path: Path) -> None:
+    """The shape a real node has: ack = await charge_card(...); then use ack["charge_id"]."""
+    buffer, journal, world, dispatcher = build(tmp_path)
+    branch = speculative()
+    effect = await buffer.stage(
+        branch,
+        ToolCall("charge_card", {"customer_id": "cus-1", "amount": 10.0}),
+        registry_of(dispatcher, "charge_card"),
+    )
+    ack = buffer.ack_for(effect.id)
+    assert not ack.done(), "the value must not exist before the branch retires"
+
+    offset = await confirm(journal, branch)
+    await buffer.drain(branch, dispatcher, confirmed_offset=offset, authorised_by_offset=offset)
+
+    assert ack.done()
+    value = await ack
+    assert isinstance(value, dict) and value["charge_id"] == "chg-1"
+    assert len(world.mutations) == 1
+
+
+async def test_a_discarded_branch_cancels_the_acks_it_was_waiting_on(tmp_path: Path) -> None:
+    """Otherwise a squashed branch's node body waits forever for a value never coming."""
+    buffer, _journal, _world, dispatcher = build(tmp_path)
+    branch = speculative()
+    effect = await buffer.stage(
+        branch, ToolCall("restart_job", {"job_id": "etl-1"}), registry_of(dispatcher, "restart_job")
+    )
+    ack = buffer.ack_for(effect.id)
+    branch.squash("mismatch")
+    buffer.discard(branch)
+    assert ack.cancelled()
+
+
+async def test_a_dead_lettered_effect_fails_its_ack_rather_than_hanging(tmp_path: Path) -> None:
+    buffer, journal, world, dispatcher = build(tmp_path)
+    branch = speculative()
+    effect = await buffer.stage(
+        branch, ToolCall("restart_job", {"job_id": "etl-1"}), registry_of(dispatcher, "restart_job")
+    )
+    ack = buffer.ack_for(effect.id)
+    offset = await confirm(journal, branch)
+    world.partition()
+    await buffer.drain(branch, dispatcher, confirmed_offset=offset, authorised_by_offset=offset)
+    assert ack.done()
+    with pytest.raises(ToolDispatchError):
+        await ack
+
+
+async def test_drain_refuses_a_caller_that_is_not_the_scheduler_task(tmp_path: Path) -> None:
+    """The repair an implementer reaches for -- drain inline so my node gets its ack -- dispatches
+    before the branch is confirmed. The guard makes that unreachable rather than discouraged."""
+    import asyncio
+
+    buffer, journal, world, dispatcher = build(tmp_path)
+    branch = speculative()
+    await buffer.stage(
+        branch, ToolCall("restart_job", {"job_id": "etl-1"}), registry_of(dispatcher, "restart_job")
+    )
+    offset = await confirm(journal, branch)
+    current = asyncio.current_task()
+    assert current is not None
+    buffer.scheduler_task = current
+
+    async def from_a_branch_task() -> None:
+        with pytest.raises(BranchClosed, match="branch task"):
+            await buffer.drain(
+                branch, dispatcher, confirmed_offset=offset, authorised_by_offset=offset
+            )
+
+    await asyncio.create_task(from_a_branch_task())
+    assert world.mutations == []
+
+
+def test_forward_never_returns_a_hit() -> None:
+    """Correction C12: there is no ForwardHit in this version and no switch that makes one."""
+    from specunode.buffer import store_buffer
+
+    assert not hasattr(store_buffer, "ForwardHit")
+    assert store_buffer.ForwardResult.__args__ == (  # type: ignore[attr-defined]
+        store_buffer.ForwardMiss,
+        store_buffer.ForwardHazard,
+    )
+
+
+def test_no_projection_switch_ships() -> None:
+    """A projection retires unverified and can void Hard Rule 9 in a supported configuration."""
+    root = Path(__file__).resolve().parents[2] / "src"
+    offenders = [
+        path.name
+        for path in root.rglob("*.py")
+        if "allow_projection" in path.read_text(encoding="utf-8")
+    ]
+    assert not offenders, f"a projection switch reappeared in {offenders}"

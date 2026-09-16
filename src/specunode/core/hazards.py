@@ -177,7 +177,7 @@ def analyse_model_request(
     branch: Branch, canonical_request: bytes, policy: Policy
 ) -> Hazard | None:
     """Hard Rule 13's gate, checked before any request leaves the runtime."""
-    if branch.projected or has_handle(canonical_request):
+    if has_handle(canonical_request):
         return Hazard.MODEL_TURN_AFTER_STAGED_WRITE
     return None
 
