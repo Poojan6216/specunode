@@ -47,6 +47,41 @@ matches a fresh run.
 
 ---
 
+## The measured result, negative half first
+
+Measured on 300 real OpenHands trajectories from
+`nebius/SWE-rebench-openhands-trajectories` — 19,484 tool calls. Full numbers with confidence
+intervals in [`RESULTS.md`](RESULTS.md).
+
+```
+python bench/corpus/fetch.py
+python bench/offline/run_opportunity.py --out bench/results/opportunity.json
+```
+
+**On this corpus, running ahead *past* a write buys nothing at all.** The measured span is
+0.0000, with a bootstrap interval that does not move off zero.
+
+That is not an implementation limitation. Every tool call in these trajectories opens a new
+model turn. A staged write does not block the next tool *call*, but it does block the next
+model *turn*, because that turn would have to contain a placeholder where the real result
+belongs. When there is never a second call inside a turn, the store buffer has nothing to run
+ahead into. 95.5% of this corpus is that shape.
+
+**What the store buffer does unlock is a different quantity, and it is not zero.** PASTE
+excludes a tool with side effects from speculation entirely, so it can speculate on 4.5% of
+steps — the reads. SpecuNode stages a write instead of refusing it, so a *predicted* write can
+be run ahead like any other call and discarded if the model decides otherwise. That covers the
+other 95.5%.
+
+That is an upper bound on opportunity, not a speedup. It is realisable only where the predictor
+is right, which here is 53.5% at top-1 and 83.7% at top-3. Neither number means anything on its
+own, which is why they are never quoted apart.
+
+No wall-clock figure appears anywhere in this repository. The online latency benchmark needs an
+API key and has not been run.
+
+---
+
 ## Status
 
 Under construction, and honest about where it is. Working today:

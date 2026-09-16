@@ -1,0 +1,14 @@
+{
+  "corpus_hash": "377ffc8aeefb002c2350032d5918a69f5f844c9b330a89e88b07615d140b6117",
+  "dataset": "nebius/SWE-rebench-openhands-trajectories",
+  "source": "huggingface",
+  "steps": 19484,
+  "tools": [
+    "execute_bash",
+    "finish",
+    "str_replace_editor",
+    "task_tracker",
+    "think"
+  ],
+  "trajectories": 300
+}

@@ -1,0 +1,60 @@
+{
+  "corpus": {
+    "corpus_hash": "377ffc8aeefb002c2350032d5918a69f5f844c9b330a89e88b07615d140b6117",
+    "dataset": "nebius/SWE-rebench-openhands-trajectories",
+    "source": "huggingface",
+    "steps": 19484,
+    "tools": [
+      "execute_bash",
+      "finish",
+      "str_replace_editor",
+      "task_tracker",
+      "think"
+    ],
+    "trajectories": 300
+  },
+  "opportunity": {
+    "args_referencing_a_prior_result": {
+      "ci95_high": 0.204,
+      "ci95_low": 0.1875,
+      "mean": 0.1957
+    },
+    "calls_opening_a_new_model_turn": {
+      "ci95_high": 1.0,
+      "ci95_low": 1.0,
+      "mean": 1.0
+    },
+    "model_turn_consuming_a_write_result": {
+      "ci95_high": 0.9569,
+      "ci95_low": 0.9523,
+      "mean": 0.9547
+    },
+    "paste_speculable_span": {
+      "ci95_high": 0.0487,
+      "ci95_low": 0.0438,
+      "mean": 0.0462
+    },
+    "predictability": {
+      "sampled_trajectories": 25,
+      "top_1": 0.535,
+      "top_3": 0.8369
+    },
+    "read_fraction": {
+      "ci95_high": 0.0469,
+      "ci95_low": 0.0423,
+      "mean": 0.0445
+    },
+    "specunode_post_write_span": {
+      "ci95_high": 0.0,
+      "ci95_low": 0.0,
+      "mean": 0.0
+    },
+    "steps": 19484,
+    "steps_paste_must_skip_that_specunode_can_stage": {
+      "ci95_high": 0.9577,
+      "ci95_low": 0.9531,
+      "mean": 0.9555
+    },
+    "trajectories": 300
+  }
+}
