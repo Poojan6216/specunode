@@ -24,9 +24,12 @@ from dataclasses import dataclass, field
 from specunode.canonical import JsonValue
 from specunode.core.branch import StepCursor
 from specunode.core.model import (
+    Message,
     ModelResponse,
     RequestEnvelope,
     StreamEvent,
+    TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
     ToolUseComplete,
     TurnComplete,
@@ -45,6 +48,7 @@ __all__ = [
     "ReplayModel",
     "attested_origins",
     "diff_requests",
+    "fold_context",
     "recover",
 ]
 
@@ -382,3 +386,102 @@ def recover(journal: Journal, run_id: str) -> Recovery:
         last_offset=last_offset,
         finished=finished,
     )
+
+
+# -- the context fold (Hard Rule 13's rebuild) --------------------------------------------------
+
+
+def fold_context(
+    journal: Journal, run_id: str, lineage: Sequence[str], upto_step: int
+) -> list[Message]:
+    """Rebuild the message list as of ``upto_step``, from journal entries alone.
+
+    A pure function over the journal, and the purity is the point. Hard Rule 13's check
+    rebuilds each prompt a branch recorded and compares hashes; if the rebuild read the
+    *branch's own* message list instead, it would compare that list to itself and pass every
+    time. That is by far the most likely way to ship Rule 13 dead, and no other test would
+    notice -- the leak, equivalence and kill tests all stay green while the check reports zero
+    divergences forever.
+
+    Entries are admitted by :func:`attested_origins`: the retired chain unioned with this
+    branch's own lineage. An entry from a squashed, stalled or still-unresolved branch is in
+    neither set and is evidence for the ledger rather than an input to anything.
+    """
+    origins = attested_origins(journal, run_id, lineage, upto_step)
+    messages: list[Message] = []
+    #: Result slots for the most recent assistant turn, by ordinal. Preallocated when the turn
+    #: is read and filled by ordinal, never appended on completion -- program order is
+    #: structural, and appending in completion order is the bug task 3.8 plants.
+    pending: list[ToolResultBlock | None] = []
+    pending_ids: list[str] = []
+
+    def flush() -> None:
+        if not pending:
+            return
+        filled = [block for block in pending if block is not None]
+        if filled:
+            messages.append(Message(role="user", content=tuple(filled)))
+        pending.clear()
+        pending_ids.clear()
+
+    for entry in journal.read(run_id):
+        payload = entry.payload
+        branch_id = entry.branch_id
+        if entry.kind == "run_started":
+            inputs = payload.get("inputs")
+            if isinstance(inputs, Mapping) and inputs:
+                messages.append(
+                    Message(role="user", content=(TextBlock(text=_canonical_text(inputs)),))
+                )
+            continue
+
+        if branch_id is not None and branch_id not in origins:
+            continue
+        step = payload.get("step")
+        if isinstance(step, int) and not isinstance(step, bool) and step > upto_step:
+            continue
+
+        if entry.kind == "model_response" and payload.get("end_of_turn"):
+            if payload.get("role", "target") != "target":
+                continue
+            flush()
+            response = payload.get("response")
+            if not isinstance(response, Mapping):
+                continue
+            rebuilt = response_from_json(response)
+            messages.append(
+                Message(
+                    role="assistant",
+                    content=rebuilt.content,
+                    origin_branch=branch_id or "",
+                )
+            )
+            pending.extend([None] * len(rebuilt.tool_uses))
+            pending_ids.extend(block.id for block in rebuilt.tool_uses)
+        elif entry.kind == "tool_result":
+            ordinal = payload.get("program_order")
+            index = ordinal if isinstance(ordinal, int) and not isinstance(ordinal, bool) else None
+            if index is None or index >= len(pending):
+                continue
+            pending[index] = ToolResultBlock(
+                tool_use_id=pending_ids[index],
+                content=payload.get("value"),
+                is_error=not bool(payload.get("ok", True)),
+            )
+        elif entry.kind == "effect_staged":
+            # A staged effect's slot never fills: the write has not happened, and the branch
+            # cannot make it happen before it retires. A turn that would have to include this
+            # slot is refused by Hard Rule 13's gate rather than shown a synthetic value.
+            ordinal = payload.get("program_order")
+            index = ordinal if isinstance(ordinal, int) and not isinstance(ordinal, bool) else None
+            if index is not None and index < len(pending):
+                pending[index] = None
+
+    flush()
+    return messages
+
+
+def _canonical_text(value: JsonValue) -> str:
+    from specunode.canonical import canonical
+
+    return canonical(value).decode("utf-8")
