@@ -1,0 +1,93 @@
+# SpecuNode configuration. Copy to ./specunode.yaml and edit, or run `specunode init`.
+#
+# The section that matters most is `tools:`. Effect classes are declared, never inferred
+# (Hard Rule 2): nothing here reads a tool's name or description to decide whether it writes.
+# A tool with no declaration anywhere is treated as WRITE, which costs you speculation but
+# cannot cost you an effect that escaped.
+
+schema_version: 1
+
+journal:
+  kind: sqlite # sqlite | postgres
+  path: ./.specunode/journal.db
+  # dsn: postgresql://user:pass@host/db   # postgres only; or set SPECUNODE_JOURNAL_DSN
+
+target:
+  # The model whose real output resolves every branch. Requests go to this endpoint and
+  # nowhere else: the runtime makes no network calls you did not configure (Hard Rule 11).
+  provider: anthropic
+  model: claude-sonnet-5
+  # base_url: https://api.anthropic.com
+  max_tokens: 4096
+  temperature: 0.0
+
+drafters:
+  # Tier 0: early-issue. Each tool_use block is dispatched as soon as it finishes parsing
+  # out of the target's stream, before the response ends. These are calls the model has
+  # already emitted, so acceptance is 1 by construction. This is Claude Code's streaming
+  # tool executor, credited as theirs.
+  - tier: 0
+
+  # Tier 1: an order-k Markov index over tool signatures, mined from this run's own journal,
+  # with argument templates that reference earlier tool outputs. This is PASTE's mechanism,
+  # credited as theirs. Deterministic given the index file.
+  - tier: 1
+    index_path: ./.specunode/patterns.json
+    order: 2
+
+  # Tier 2: a small draft model. Optional, and off by default -- a miss costs tokens.
+  # - tier: 2
+  #   provider: anthropic
+  #   model: claude-haiku-4-5
+
+policy:
+  # Top-1 by default. Raising this multiplies the upstream reads a wrong guess pays for,
+  # so it is a decision about money as much as about latency.
+  max_inflight_branches: 1
+  max_speculation_depth: 3
+  max_wasted_tokens: 20000
+  # Upstream reads a squashed branch is allowed to have cost. Speculative reads reach real
+  # systems whether or not the branch retires, and the ledger counts them.
+  max_speculative_reads: 50
+  alpha_window: 20
+  # alpha_floor: null  -> use the break-even acceptance rate measured for this workload,
+  # rather than a number picked in advance. Below it, speculation switches off for the rest
+  # of the run and the ledger records that it did.
+  alpha_floor: null
+  # An irreversible effect is a barrier by default rather than something staged. Setting this
+  # to true is legitimate and measured, but it means an effect with no undo is dispatched on
+  # a decision the model made rather than one it had made when the call was issued.
+  stage_irreversible: false
+  # What to do when a witnessed read went stale between speculation and confirmation.
+  on_stale_read: squash # squash | stall
+
+tools:
+  # Declarations for tools whose own annotations are absent or wrong. This table wins over
+  # MCP annotations and over in-code declarations: you carry the consequences, not the server
+  # author.
+  #
+  # A tool whose upstream enqueues, schedules or triggers work is a WRITE whatever its HTTP
+  # verb says. `{"status": "queued"}` is not a read result.
+  send_email:
+    effect: irreversible
+  create_ticket:
+    effect: write
+    idempotent: true
+    # Resource keys this call touches, so a later read of the same key can be recognised as
+    # a hazard instead of silently returning a value the staged write would have changed.
+    forward_keys: "ticket:{args.customer_id}"
+  lookup_customer:
+    effect: read
+    # A read that returns a version lets staleness be re-checked before the branch retires.
+    # Reads without one are reported as unwitnessed, never as fresh.
+    witness: true
+  reserve_capacity:
+    effect: compensable
+    compensator: release_capacity
+
+state:
+  # Reducers apply only when sequential nodes write the same key. Two speculative siblings
+  # are never merged: at most one of them is right.
+  reducers:
+    findings: append
+    summary: last_write
