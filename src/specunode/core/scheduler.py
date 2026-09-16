@@ -30,6 +30,7 @@ merely discouraged.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -51,12 +52,14 @@ from specunode.core.model import (
     TurnComplete,
     call_scope,
 )
-from specunode.core.policy import Policy
+from specunode.core.policy import Budget, Policy
 from specunode.core.state import CommittedState, Reducer, patch_payload, resolve_reducers
+from specunode.drafters.base import DraftContext, Drafter
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
 from specunode.journal.ledger import Ledger, build_ledger
 from specunode.journal.replay import recover
+from specunode.verify.gate import resolve_decision
 
 __all__ = ["BranchOutcome", "RunResult", "Scheduler", "SchedulerError", "SpeculativeTurn"]
 
@@ -178,6 +181,9 @@ class Scheduler:
     target: ModelClient
     policy: Policy = field(default_factory=Policy)
     drafters: Sequence[object] = ()
+    #: The tier-1 (or tier-2) predictor, if one is configured. Tier 0 needs no object: it is
+    #: the stream itself, and it is always on.
+    predictor: Drafter | None = None
     reducers: Mapping[str, str] = field(default_factory=dict)
 
     run_id: str = ""
@@ -195,8 +201,16 @@ class Scheduler:
     _retire_seq: int = 0
     #: Turns run with early issue, kept so a test can assert on their timings.
     _turns: list[SpeculativeTurn] = field(default_factory=list)
+    _budget: Budget | None = field(default=None, repr=False)
 
     # -- bookkeeping the ports call back into ------------------------------------------------
+
+    @property
+    def budget(self) -> Budget:
+        """What speculation has spent, and what it may still spend (Hard Rule 10)."""
+        if self._budget is None:
+            self._budget = Budget(policy=self.policy)
+        return self._budget
 
     def _park_event(self, branch_id: str) -> asyncio.Event:
         event = self._park_events.get(branch_id)
@@ -842,38 +856,57 @@ class SpeculativeTurn:
         self.completed_at: list[float] = []
         self.stream_ended_at: float = 0.0
         self.reads_issued_early = 0
+        #: Speculations that the model's real decision confirmed, so their work was kept.
+        self.adopted = 0
+        self.confirmed = 0
+        self.squashed = 0
+        self.stalled = 0
+        self._history: list[ToolCall] = []
+        self._results_so_far: list[JsonValue] = []
+        self._predicted: ToolCall | None = None
+        self._speculative: Branch | None = None
+        self._open: asyncio.Task[JsonValue] | None = None
+        self._adopted: asyncio.Task[JsonValue] | None = None
+        self._tier: int = 1
 
     async def run(self, envelope: RequestEnvelope) -> list[JsonValue]:
         scheduler = self._scheduler
         branch = self._branch
         tools = BranchTools(scheduler, branch, self._node_id)
 
-        # Slots are preallocated as blocks parse, and filled by ordinal. Program order is
+        # Slots are preallocated as blocks parse and filled by ordinal. Program order is
         # structural: a result never appends on completion, because the order the model asked
         # for its calls is the order it must be shown them in (Hard Rule 13).
         slots: list[asyncio.Task[JsonValue] | None] = []
-        staged_acks: list[asyncio.Future[JsonValue] | None] = []
 
         async for event in scheduler.target.stream(envelope):
             if isinstance(event, ToolUseComplete):
-                decision = ToolCall(name=event.block.name, args=event.block.args)
-                self.decisions.append(decision)
+                actual = ToolCall(name=event.block.name, args=event.block.args)
+                await self._resolve_prediction(actual)
+
+                self.decisions.append(actual)
                 self.issued_at.append(time.monotonic())
-                spec = scheduler.registry.get(decision.name)
+                spec = scheduler.registry.get(actual.name)
                 ordinal = len(slots)
-                if spec.effect is EffectClass.READ:
+                if spec.effect is EffectClass.READ and self._adopted is None:
                     self.reads_issued_early += 1
-                    slots.append(
-                        asyncio.create_task(
-                            self._timed_read(tools, decision, ordinal, speculative=True)
-                        )
-                    )
-                    staged_acks.append(None)
+                    slots.append(asyncio.create_task(self._timed_read(tools, actual, ordinal)))
+                elif self._adopted is not None:
+                    # The speculation was right: its result is already in hand, so the call is
+                    # not made twice. This is the latency the whole arrangement buys.
+                    adopted = self._adopted
+                    self._adopted = None
+                    slots.append(adopted)
+                    self.adopted += 1
                 else:
                     slots.append(None)
-                    staged_acks.append(None)
+
+                await self._speculate_next(actual)
             elif isinstance(event, TurnComplete):
                 self.stream_ended_at = time.monotonic()
+
+        # Any speculation still open when the turn ended predicted a call the model never made.
+        await self._squash_open("turn_ended")
 
         # The turn is durable now (JournaledModel writes it before yielding TurnComplete), so
         # the writes it emitted may be staged. They are staged here rather than mid-stream so
@@ -887,16 +920,143 @@ class SpeculativeTurn:
             results.append(await tools.call(emitted.name, emitted.args))
         return results
 
-    async def _timed_read(
-        self, tools: BranchTools, decision: ToolCall, ordinal: int, *, speculative: bool
+    async def _speculate_next(self, after: ToolCall) -> None:
+        """Guess the call after this one and start running it, on a branch of its own.
+
+        This is the part that genuinely predicts, and therefore the part that can be wrong.
+        A wrong guess costs the upstream reads its branch made and the tokens it spent; it
+        cannot cost an effect, because its writes go into the store buffer and are discarded
+        without ever being dispatched.
+        """
+        scheduler = self._scheduler
+        if not scheduler.policy.speculation or not scheduler.budget.may_speculate():
+            return
+        drafter = scheduler.predictor
+        if drafter is None:
+            return
+
+        self._history.append(after)
+        context = DraftContext(
+            run_id=scheduler.run_id,
+            branch_id=self._branch.id,
+            step_index=self._branch.cursor.step_index,
+            node_id=self._node_id,
+            history=tuple(self._history),
+            results=dict(enumerate(self._results_so_far)),
+            known_tools=scheduler.registry.names(),
+        )
+        candidates = await drafter.predict(context)
+        if not candidates:
+            return
+
+        prediction = candidates[0]
+        decision = prediction.decision
+        if not isinstance(decision, ToolCall):
+            return
+        spec = scheduler.registry.get(decision.name)
+        child = self._branch.fork(
+            new_ulid(),
+            predicted=decision,
+            step=self._branch.cursor.step_index,
+            tier=prediction.tier,
+        )
+        hazard = analyse(
+            child,
+            decision,
+            spec,
+            scheduler.policy,
+            staged_keys=scheduler.buffer.staged_keys(child),
+            budget=scheduler.budget,
+        )
+        if hazard is not None:
+            scheduler.record_stall(child.cursor.step_index, hazard)
+            self.stalled += 1
+            return
+
+        await scheduler._journal_fork(child, self._node_id)
+        scheduler.counters.branches_forked += 1
+        self._predicted = decision
+        self._speculative = child
+        self._tier = prediction.tier
+        tools = BranchTools(scheduler, child, self._node_id)
+        self._open = asyncio.create_task(self._run_speculation(tools, child, decision))
+
+    async def _run_speculation(
+        self, tools: BranchTools, child: Branch, decision: ToolCall
     ) -> JsonValue:
+        child.advance_step()
+        return await tools.call(decision.name, decision.args)
+
+    async def _resolve_prediction(self, actual: ToolCall) -> None:
+        """The model just said what it actually wants. Compare, and keep or throw away."""
+        if self._predicted is None or self._speculative is None:
+            return
+        scheduler = self._scheduler
+        child = self._speculative
+        status = resolve_decision(self._predicted, actual)
+        confirmed = status is BranchStatus.CONFIRMED
+        scheduler.budget.record_resolution(tier=self._tier, confirmed=confirmed, tokens=0)
+
+        if confirmed:
+            self.confirmed += 1
+            child.confirm()
+            self._adopted = self._open
+            self._open = None
+            self._predicted = None
+            self._speculative = None
+            return
+
+        await self._squash_open("mismatch")
+
+    async def _squash_open(self, reason: str) -> None:
+        """Cancellation *is* the squash. The buffer is closed before the task is cancelled."""
+        if self._speculative is None:
+            return
+        scheduler = self._scheduler
+        child = self._speculative
+        child.squash(reason)
+        self.squashed += 1
+        # Revoke first, cancel second: a tool that cannot be cancelled finishes anyway, and a
+        # closed buffer is what stops its write from being staged into something nothing will
+        # ever drain.
+        discarded = await scheduler.buffer.discard_and_journal(child, reason)
+        scheduler.counters.effects_discarded += discarded
+        scheduler.counters.branches_squashed += 1
+        if self._open is not None:
+            self._open.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._open
+        await scheduler.journal.append_async(
+            scheduler.run_id,
+            "branch_resolved",
+            {
+                "v": 1,
+                "branch_id": child.id,
+                "step": child.fork_step,
+                "status": "squashed",
+                "reason": reason,
+            },
+        )
+        self._open = None
+        self._predicted = None
+        self._speculative = None
+        self._adopted = None
+
+    async def _timed_read(self, tools: BranchTools, decision: ToolCall, ordinal: int) -> JsonValue:
+        """Run a read the model has emitted but whose turn is not yet durable.
+
+        Marked speculative for the duration: the turn that asked for it is still streaming, so
+        if the process died now there would be no journaled decision authorising it. It is
+        counted as a speculative upstream read and re-validated at retirement if it carries a
+        witness.
+        """
         previous = self._branch.status
-        if speculative:
-            self._branch.status = BranchStatus.SPECULATIVE
+        self._branch.status = BranchStatus.SPECULATIVE
         try:
             value = await tools.call(decision.name, decision.args)
         finally:
             self._branch.status = previous
+        self._results_so_far.append(value)
         while len(self.completed_at) <= ordinal:
             self.completed_at.append(0.0)
         self.completed_at[ordinal] = time.monotonic()
