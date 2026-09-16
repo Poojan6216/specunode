@@ -18,7 +18,7 @@ from pathlib import Path
 import typer
 
 from specunode import __version__
-from specunode.config import DEFAULT_CONFIG_NAME
+from specunode.config import DEFAULT_CONFIG_NAME, load_config
 from specunode.journal.journal import Journal
 from specunode.journal.ledger import (
     build_ledger,
@@ -186,6 +186,50 @@ def status(
     typer.echo(f"  dispatch claims still in flight: {len(recovery.unresolved_dispatches)}")
     typer.echo(f"  step index to continue above: {recovery.step_index}")
     typer.echo(f"  resumable: {recovery.resumable}")
+
+
+@app.command("mcp-proxy")
+def mcp_proxy(
+    upstream: str = typer.Option(
+        ..., "--upstream", help="Command that starts the upstream server."
+    ),
+    config: Path = typer.Option(Path(DEFAULT_CONFIG_NAME), "--config", help="specunode.yaml."),
+    handles: bool = typer.Option(
+        False,
+        "--handles",
+        help=(
+            "Return a staged-write handle instead of blocking. Only safe for a client that "
+            "understands one and will not put it in a prompt."
+        ),
+    ),
+) -> None:
+    """Proxy an MCP server, holding its writes until the model's decision confirms them.
+
+    Reads are forwarded immediately. Everything else is held. Because the proxy cannot see the
+    model, the decision arrives out of band -- from a client that reports it, or from
+    ``specunode retire``.
+    """
+    import asyncio
+    import shlex
+
+    from specunode.core.effects import ToolRegistry
+    from specunode.integrations.mcp_proxy import ClientMode, ProxyState, serve
+
+    loaded = load_config(config if config.is_file() else None)
+    registry = ToolRegistry()
+    for _name, spec in loaded.tool_overrides().items():
+        registry.register(spec)
+
+    state = ProxyState(
+        registry=registry,
+        mode=ClientMode.HANDLES if handles else ClientMode.BLOCKING,
+    )
+    typer.echo(
+        f"proxying {upstream!r} in {state.mode.value} mode; "
+        f"context identity is {state.context_identity} over MCP",
+        err=True,
+    )
+    asyncio.run(serve(shlex.split(upstream), state))
 
 
 def main() -> None:

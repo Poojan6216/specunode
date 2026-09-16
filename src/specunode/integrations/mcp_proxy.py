@@ -1,0 +1,393 @@
+"""An MCP proxy, so a developer who cannot change their agent still gets the store buffer.
+
+The proxy sits between an MCP client and an upstream MCP server. It forwards everything it does
+not care about, classifies each `tools/call` by effect class, runs the reads, and holds the
+writes.
+
+**The hard part is that the proxy cannot see the model.** It sees tool calls, not the decision
+that produced them, so it has no way to know whether a call it is holding was confirmed. The
+branch-resolution signal therefore has to arrive out of band: the client sends
+`notifications/specunode/decision`, or an operator runs `specunode retire` from a terminal.
+
+That leads to the one genuinely awkward choice in this integration, and it is resolved by
+asking the client rather than by picking a default:
+
+* A client that **advertises the decision capability** gets the real thing. Writes are staged,
+  the call returns a placeholder handle, and the buffer drains when a decision arrives.
+* A client that **does not** would be handed a placeholder it does not understand, and would
+  put it straight into the next prompt -- which is exactly what Hard Rule 13 forbids, and the
+  proxy cannot see the prompt to stop it. So for that client a write is **blocked** until a
+  decision arrives, the call blocks rather than returning a handle, and the run's ledger is
+  stamped ``context_identity: unenforced`` because the proxy genuinely cannot enforce it.
+
+Neither mode is pretended to be the full runtime. The stamp says which one ran.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+from specunode.canonical import JsonValue, chash
+from specunode.core.decision import Decision, ToolCall, decisions_equal
+from specunode.core.effects import EffectClass, ToolRegistry, ToolSpec
+
+__all__ = [
+    "DECISION_NOTIFICATION",
+    "PROXY_TOOLS",
+    "ClientMode",
+    "ProxyState",
+    "ProxyUnsupported",
+    "StagedCall",
+    "probe_sdk",
+    "serve",
+]
+
+#: The notification a client sends to tell the proxy what the model actually decided.
+DECISION_NOTIFICATION = "notifications/specunode/decision"
+
+#: The capability a client advertises to say it understands a staged-write handle.
+DECISION_CAPABILITY = "specunode/decisions"
+
+
+class ClientMode(Enum):
+    """What this client can be trusted with."""
+
+    #: Advertises the decision capability: understands a handle and will report decisions.
+    HANDLES = "handles"
+    #: Does not. A write blocks until a decision arrives, because handing this client a
+    #: placeholder would put one in the next prompt where nothing can see it.
+    BLOCKING = "blocking"
+
+
+@dataclass(frozen=True, slots=True)
+class StagedCall:
+    """A write the proxy is holding."""
+
+    effect_id: str
+    tool: str
+    args: Mapping[str, JsonValue]
+    effect: EffectClass
+    stage_index: int
+    handle: str
+
+    @property
+    def decision(self) -> ToolCall:
+        return ToolCall(name=self.tool, args=self.args)
+
+
+@dataclass
+class ProxyState:
+    """What the proxy is holding, and for whom.
+
+    Deliberately a plain object with no I/O: the protocol layer calls into it, so the staging
+    rules can be tested without a transport, and a protocol change cannot quietly alter them.
+    """
+
+    registry: ToolRegistry
+    mode: ClientMode = ClientMode.BLOCKING
+    staged: list[StagedCall] = field(default_factory=list)
+    dispatched: list[StagedCall] = field(default_factory=list)
+    discarded: list[StagedCall] = field(default_factory=list)
+    reads_forwarded: int = 0
+    #: Set when a decision arrives, so a blocking client's call can return.
+    _decided: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def context_identity(self) -> str:
+        """The proxy never sees a prompt, so it can never claim to have checked one."""
+        return "unenforced"
+
+    def classify(self, tool: str) -> ToolSpec:
+        return self.registry.get(tool)
+
+    def stage(self, tool: str, args: Mapping[str, JsonValue]) -> StagedCall:
+        """Hold a write. Nothing is sent upstream."""
+        spec = self.classify(tool)
+        effect_id = f"mcp-{len(self.staged):04d}-{chash(dict(args))[:8]}"
+        call = StagedCall(
+            effect_id=effect_id,
+            tool=tool,
+            args=dict(args),
+            effect=spec.effect,
+            stage_index=len(self.staged),
+            handle=f"$specunode.handle:{effect_id}",
+        )
+        self.staged.append(call)
+        return call
+
+    def result_for(self, call: StagedCall) -> Mapping[str, JsonValue]:
+        """What a handle-capable client is handed instead of a value."""
+        return {
+            "_specunode": {
+                "staged": True,
+                "effect_id": call.effect_id,
+                "handle": call.handle,
+                "note": (
+                    "This write is held in a store buffer and has not happened. It will be "
+                    "sent when you report the model's decision, and discarded if you report a "
+                    "different one. Do not put this handle in a prompt."
+                ),
+            }
+        }
+
+    def retire(self, actual: Decision) -> tuple[list[StagedCall], list[StagedCall]]:
+        """Resolve everything held against the decision the model actually made.
+
+        Exact canonical equality, the same relation the in-process gate uses. A call that does
+        not match is discarded unsent -- the proxy is a different transport for the same rule,
+        not a weaker version of it.
+        """
+        confirmed: list[StagedCall] = []
+        dropped: list[StagedCall] = []
+        for call in self.staged:
+            if decisions_equal(call.decision, actual):
+                confirmed.append(call)
+            else:
+                dropped.append(call)
+        self.staged = []
+        self.dispatched.extend(confirmed)
+        self.discarded.extend(dropped)
+        self._decided.set()
+        return confirmed, dropped
+
+    def discard_all(self, reason: str = "squashed") -> int:
+        count = len(self.staged)
+        self.discarded.extend(self.staged)
+        self.staged = []
+        self._decided.set()
+        return count
+
+    async def wait_for_decision(self, deadline_s: float | None = None) -> bool:
+        """Block a non-handle client's call until a decision arrives.
+
+        Named ``deadline_s`` rather than ``timeout`` so it is not mistaken for asyncio's own
+        cancellation timeout: a caller that gives up here has not cancelled the staged write,
+        it is still held and still waiting for a decision.
+        """
+        self._decided.clear()
+        try:
+            await asyncio.wait_for(self._decided.wait(), deadline_s)
+        except TimeoutError:
+            return False
+        return True
+
+    def status(self) -> Mapping[str, JsonValue]:
+        return {
+            "mode": self.mode.value,
+            "context_identity": self.context_identity,
+            "staged": [
+                {"effect_id": c.effect_id, "tool": c.tool, "args": dict(c.args)}
+                for c in self.staged
+            ],
+            "dispatched": len(self.dispatched),
+            "discarded": len(self.discarded),
+            "reads_forwarded": self.reads_forwarded,
+            "note": (
+                "Staged writes have not happened. They are sent when a decision confirming "
+                "them arrives, and discarded if one contradicting them does."
+            ),
+        }
+
+
+def mode_for(client_capabilities: Mapping[str, Any] | None) -> ClientMode:
+    """Decide what this client can be trusted with, from what it advertised.
+
+    Asked rather than assumed. Handing a placeholder to a client that does not understand it
+    puts that placeholder in the next prompt, and the proxy cannot see the prompt to stop it.
+    """
+    capabilities = client_capabilities or {}
+    experimental = capabilities.get("experimental") or {}
+    if isinstance(experimental, Mapping) and DECISION_CAPABILITY in experimental:
+        return ClientMode.HANDLES
+    return ClientMode.BLOCKING
+
+
+#: The proxy's own tools, so a client can see and steer what is being held.
+PROXY_TOOLS: Sequence[Mapping[str, JsonValue]] = (
+    {
+        "name": "specunode.status",
+        "description": "What the proxy is holding, and whether context identity is enforced.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "specunode.ledger",
+        "description": "Effects dispatched and discarded so far in this session.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "specunode.stall",
+        "description": "Stop speculating and run sequentially for the rest of the session.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "specunode.discard",
+        "description": "Discard every held write unsent. Requires confirmation.",
+        "inputSchema": {"type": "object", "properties": {"confirm": {"type": "boolean"}}},
+    },
+    {
+        "name": "specunode.retire",
+        "description": "Report the model's actual decision, releasing or discarding held writes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"tool": {"type": "string"}, "args": {"type": "object"}},
+            "required": ["tool"],
+        },
+    },
+    {
+        "name": "specunode.replay_check",
+        "description": "Whether this session's held writes match a journaled run.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+)
+
+
+# -- the transport --------------------------------------------------------------------------
+#
+# Kept below the rules and deliberately thin. Everything above this line is testable without a
+# socket, which matters because the rules carry the correctness claims and the SDK does not:
+# `mcp` went from 1.x to 2.x with a breaking API change, and a design that put the staging
+# rules inside protocol handlers would have to be re-verified every time that happens.
+
+
+class ProxyUnsupported(RuntimeError):
+    """The installed MCP SDK does not expose what the proxy needs."""
+
+
+#: Probed against this. A newer SDK is allowed and warned about; a missing surface fails loudly.
+PROBED_MCP = "2.2.0"
+
+
+def probe_sdk() -> str:
+    """Check the SDK is one this proxy knows how to drive."""
+    try:
+        import importlib.metadata as metadata
+
+        version = metadata.version("mcp")
+    except Exception as exc:  # pragma: no cover - mcp not installed
+        raise ProxyUnsupported(
+            "the MCP proxy needs the optional extra: pip install 'specunode[mcp]'"
+        ) from exc
+    try:
+        from mcp.server.mcpserver import MCPServer  # noqa: F401
+    except ImportError as exc:
+        raise ProxyUnsupported(
+            f"mcp {version} does not expose mcp.server.mcpserver.MCPServer (probed against "
+            f"{PROBED_MCP}). Pin the SDK rather than running a proxy that silently forwards "
+            "writes it was meant to hold."
+        ) from exc
+    return version
+
+
+async def serve(
+    upstream_command: Sequence[str],
+    state: ProxyState,
+    *,
+    server_name: str = "specunode-proxy",
+) -> None:
+    """Run the stdio proxy against an upstream MCP server.
+
+    Forwards ``tools/list`` with the upstream's annotations merged with the config's override
+    table, runs reads immediately, and holds everything else in ``state`` until a decision
+    arrives. The rules live in :class:`ProxyState`; this function only moves bytes.
+    """
+    probe_sdk()
+    from mcp import types
+    from mcp.client.session import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+    from mcp.server.mcpserver import MCPServer
+
+    params = StdioServerParameters(command=upstream_command[0], args=list(upstream_command[1:]))
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as upstream:
+        await upstream.initialize()
+        listing = await upstream.list_tools()
+        server = MCPServer(server_name)
+
+        for tool in listing.tools:
+            _register_proxied(server, upstream, state, tool, types)
+        _register_control_tools(server, state)
+        # MCPServer.run is sync in mcp 2.x and owns its own event loop for the chosen
+        # transport, so it is handed off to a thread rather than awaited.
+        await asyncio.to_thread(server.run, "stdio")
+
+
+def _register_proxied(server: Any, upstream: Any, state: ProxyState, tool: Any, types: Any) -> None:
+    """Expose one upstream tool, classified and either forwarded or held."""
+
+    async def proxied(**kwargs: JsonValue) -> JsonValue:
+        spec = state.classify(tool.name)
+        if spec.effect is EffectClass.READ:
+            state.reads_forwarded += 1
+            result = await upstream.call_tool(tool.name, kwargs)
+            return [block.model_dump() for block in result.content]
+
+        held = state.stage(tool.name, kwargs)
+        if state.mode is ClientMode.HANDLES:
+            return dict(state.result_for(held))
+
+        # A client that cannot be told "this has not happened yet" waits instead. Returning a
+        # handle here would put it in that client's next prompt, unseen by anything.
+        await state.wait_for_decision()
+        if held in state.dispatched:
+            result = await upstream.call_tool(tool.name, kwargs)
+            return [block.model_dump() for block in result.content]
+        return {"_specunode": {"discarded": True, "effect_id": held.effect_id}}
+
+    server.add_tool(
+        proxied,
+        name=tool.name,
+        description=tool.description,
+        annotations=getattr(tool, "annotations", None),
+    )
+
+
+def _register_control_tools(server: Any, state: ProxyState) -> None:
+    """The proxy's own six tools, so a client can see and steer what is held."""
+
+    async def status() -> JsonValue:
+        return dict(state.status())
+
+    async def ledger() -> JsonValue:
+        return {
+            "dispatched": [c.effect_id for c in state.dispatched],
+            "discarded": [c.effect_id for c in state.discarded],
+            "still_held": [c.effect_id for c in state.staged],
+            "context_identity": state.context_identity,
+        }
+
+    async def stall() -> JsonValue:
+        state.mode = ClientMode.BLOCKING
+        return {"mode": state.mode.value}
+
+    async def discard(confirm: bool = False) -> JsonValue:
+        if not confirm:
+            return {
+                "error": "discard drops held writes unsent; call again with confirm=true",
+            }
+        return {"discarded": state.discard_all()}
+
+    async def retire(tool: str, args: Mapping[str, JsonValue] | None = None) -> JsonValue:
+        confirmed, dropped = state.retire(ToolCall(name=tool, args=dict(args or {})))
+        return {
+            "dispatched": [c.effect_id for c in confirmed],
+            "discarded": [c.effect_id for c in dropped],
+        }
+
+    async def replay_check() -> JsonValue:
+        return {
+            "held": len(state.staged),
+            "note": "The proxy has no journal of its own; a replay check needs the run's journal.",
+        }
+
+    for fn, name, description in (
+        (status, "specunode.status", "What the proxy is holding."),
+        (ledger, "specunode.ledger", "Effects dispatched and discarded this session."),
+        (stall, "specunode.stall", "Stop returning handles; block on writes instead."),
+        (discard, "specunode.discard", "Discard every held write unsent."),
+        (retire, "specunode.retire", "Report the model's decision."),
+        (replay_check, "specunode.replay_check", "Whether held writes match a journaled run."),
+    ):
+        server.add_tool(fn, name=name, description=description)
