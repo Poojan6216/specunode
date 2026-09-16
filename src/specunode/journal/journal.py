@@ -33,12 +33,13 @@ import json
 import os
 import sqlite3
 import threading
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypeVar
 
 from specunode.canonical import JsonValue, canonical, chash
 from specunode.journal.entries import (
@@ -51,14 +52,19 @@ from specunode.journal.entries import (
 
 __all__ = [
     "ChainVerification",
+    "Claim",
+    "DispatchClaim",
     "Journal",
     "JournalBusy",
     "JournalConcurrencyError",
     "JournalConfigError",
     "JournalError",
     "JournalWriteError",
+    "PendingClaim",
     "close_all_writers",
 ]
+
+_T = TypeVar("_T")
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
@@ -73,6 +79,31 @@ _SELECT_HEAD = (
 _SELECT_CHUNK = (
     'SELECT run_id, "offset", kind, payload_json, payload_hash, prev_hash, ts FROM entries '
     'WHERE run_id = :run_id AND "offset" > :after ORDER BY "offset" ASC LIMIT :limit'
+)
+_SELECT_CLAIM = (
+    "SELECT nkey, idem_key, effect_id, branch_id, tool, status, last_outcome, attempt, "
+    "ack_json, entry_offset FROM effect_dispatch WHERE run_id = :run_id AND nkey = :nkey"
+)
+# ON CONFLICT DO NOTHING is spelled identically on SQLite >= 3.24 and on Postgres, which is
+# why it is the only conflict construct this codebase uses.
+_INSERT_CLAIM = (
+    "INSERT INTO effect_dispatch (run_id, nkey, idem_key, effect_id, branch_id, tool, status, "
+    "last_outcome, attempt, claimed_at) VALUES (:run_id, :nkey, :idem_key, :effect_id, "
+    ":branch_id, :tool, 'in_flight', 'unknown', :attempt, :claimed_at) "
+    "ON CONFLICT (run_id, nkey) DO NOTHING"
+)
+_UPDATE_NOT_SENT = (
+    "UPDATE effect_dispatch SET last_outcome = 'not_sent', attempt = :attempt "
+    "WHERE run_id = :run_id AND nkey = :nkey"
+)
+_UPDATE_SETTLED = (
+    "UPDATE effect_dispatch SET status = :status, last_outcome = 'settled', "
+    "ack_json = :ack_json, entry_offset = :entry_offset, attempt = :attempt, "
+    "settled_at = :settled_at WHERE run_id = :run_id AND nkey = :nkey"
+)
+_SELECT_UNRESOLVED = (
+    "SELECT nkey, idem_key, effect_id, branch_id, tool, status, last_outcome, attempt "
+    "FROM effect_dispatch WHERE run_id = :run_id AND status = 'in_flight'"
 )
 _SELECT_CHUNK_KINDS = (
     'SELECT run_id, "offset", kind, payload_json, payload_hash, prev_hash, ts FROM entries '
@@ -99,6 +130,56 @@ class JournalConcurrencyError(JournalError):
 
 class JournalBusy(JournalError):
     """A cross-process lock could not be acquired within the busy timeout."""
+
+
+class Claim(Enum):
+    """What a dispatch claim found."""
+
+    #: Nobody else has this key. We own the send.
+    OWNED = "owned"
+    #: Already acked. Reuse the recorded ack and send nothing.
+    ALREADY_DISPATCHED = "already_dispatched"
+    #: A previous attempt demonstrably never left the process, or was dead-lettered and a
+    #: resume is retrying it. Sending again is not a duplicate.
+    RETRY_SAFE = "retry_safe"
+    #: A previous attempt may or may not have taken effect upstream. The two-generals
+    #: boundary: the caller decides using the tool's declared idempotency, and if it has not
+    #: declared, the honest answer is to dead-letter and let a human look.
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchClaim:
+    outcome: Claim
+    attempt: int = 0
+    ack: JsonValue = None
+
+    @property
+    def may_send(self) -> bool:
+        return self.outcome in (Claim.OWNED, Claim.RETRY_SAFE)
+
+
+@dataclass(frozen=True, slots=True)
+class PendingClaim:
+    run_id: str
+    nkey: str
+    idem_key: str
+    effect_id: str
+    branch_id: str
+    tool: str
+    attempt: int = 1
+
+    def as_params(self, claimed_at: str) -> dict[str, JsonValue]:
+        return {
+            "run_id": self.run_id,
+            "nkey": self.nkey,
+            "idem_key": self.idem_key,
+            "effect_id": self.effect_id,
+            "branch_id": self.branch_id,
+            "tool": self.tool,
+            "attempt": self.attempt,
+            "claimed_at": claimed_at,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,8 +376,131 @@ class _JournalWriter:
         future = self._executor.submit(self._append, run_id, kind, payload_json, payload_hash)
         return await asyncio.wrap_future(future)
 
-    def run(self, fn: object, *args: object) -> object:
-        return self._executor.submit(fn, *args).result()  # type: ignore[arg-type]
+    def submit(self, fn: Callable[[], _T]) -> _T:
+        return self._executor.submit(fn).result()
+
+    async def submit_async(self, fn: Callable[[], _T]) -> _T:
+        return await asyncio.wrap_future(self._executor.submit(fn))
+
+    # -- dispatch deduplication (Hard Rule 8), all on the writer thread ---------------------
+
+    def _claim(self, claim: PendingClaim) -> DispatchClaim:
+        params: dict[str, JsonValue] = {"run_id": claim.run_id, "nkey": claim.nkey}
+        row = self._backend.execute(_SELECT_CLAIM, params).fetchone()
+        if row is None:
+            try:
+                self._backend.execute(_INSERT_CLAIM, claim.as_params(_utc_now()))
+            except sqlite3.IntegrityError as exc:
+                # The nkey was free, so this is the other unique index: one effect id already
+                # has a dispatch row under a different key. That means the same effect was
+                # keyed two ways, which would let it be dispatched twice.
+                raise JournalWriteError(
+                    f"effect {claim.effect_id!r} already has a dispatch row under a different "
+                    f"key; one effect is one idempotency key ({exc})"
+                ) from exc
+            probe = self._backend.execute(_SELECT_CLAIM, params).fetchone()
+            if probe is not None and str(probe["effect_id"]) == claim.effect_id:
+                return DispatchClaim(Claim.OWNED, attempt=claim.attempt)
+            row = probe
+        if row is None:  # pragma: no cover - the insert both failed and left nothing
+            raise JournalWriteError(f"dispatch claim for {claim.nkey} neither inserted nor found")
+
+        status, outcome = str(row["status"]), str(row["last_outcome"])
+        attempt = int(row["attempt"])
+        if status == "dispatched":
+            ack = row["ack_json"]
+            return DispatchClaim(
+                Claim.ALREADY_DISPATCHED,
+                attempt=attempt,
+                ack=json.loads(ack) if ack else None,
+            )
+        if status == "dead_letter":
+            # A resume must retry a dead-lettered effect: the run finished ok=False and the
+            # operator's remedy is to heal the upstream and resume (task 1.5).
+            return DispatchClaim(Claim.RETRY_SAFE, attempt=attempt)
+        if outcome == "not_sent":
+            # The request demonstrably never left this process, so resending is not a
+            # duplicate. This downgrade is what keeps crash window W3 narrow.
+            return DispatchClaim(Claim.RETRY_SAFE, attempt=attempt)
+        # in_flight with an unknown outcome: the request may or may not have taken effect.
+        # This is the two-generals boundary and nothing removes it; the caller decides using
+        # the tool's declared idempotency.
+        return DispatchClaim(Claim.AMBIGUOUS, attempt=attempt)
+
+    def _mark_not_sent(self, run_id: str, nkey: str, attempt: int) -> None:
+        self._backend.execute(
+            _UPDATE_NOT_SENT, {"run_id": run_id, "nkey": nkey, "attempt": attempt}
+        )
+
+    def _settle(
+        self,
+        run_id: str,
+        nkey: str,
+        status: str,
+        ack: JsonValue,
+        attempt: int,
+        kind: str,
+        payload: Mapping[str, JsonValue],
+    ) -> int:
+        """Record the outcome and journal it in ONE transaction, one fsync.
+
+        Splitting them would leave the entry durable and the dedupe row not, or the reverse.
+        A crash in between makes a resume re-send a charge that already went through, and
+        the kill/resume test fails at whichever of its points lands in that microsecond --
+        that is, it fails flakily, and a flaky safety test gets quarantined.
+        """
+        payload_json, payload_hash = canonical(payload).decode("utf-8"), chash(payload)
+        self._backend.begin_immediate()
+        try:
+            head = self._head.get(run_id) or self._seed_head(run_id)
+            offset = 0 if head is None else head.offset + 1
+            prev = genesis_prev_hash(run_id) if head is None else head.entry_hash
+            ts = _utc_now()
+            self._backend.execute(
+                _INSERT_ENTRY,
+                {
+                    "run_id": run_id,
+                    "offset": offset,
+                    "kind": kind,
+                    "payload_json": payload_json,
+                    "payload_hash": payload_hash,
+                    "prev_hash": prev,
+                    "ts": ts,
+                },
+            )
+            self._backend.execute(
+                _UPDATE_SETTLED,
+                {
+                    "run_id": run_id,
+                    "nkey": nkey,
+                    "status": status,
+                    "ack_json": None if ack is None else canonical(ack).decode("utf-8"),
+                    "entry_offset": offset,
+                    "attempt": attempt,
+                    "settled_at": ts,
+                },
+            )
+            self._backend.commit()
+        except Exception:
+            self._backend.rollback()
+            self._head.pop(run_id, None)
+            raise
+        self._head[run_id] = ChainHead(
+            offset=offset,
+            entry_hash=entry_hash(
+                run_id=run_id,
+                offset=offset,
+                kind=kind,
+                ts=ts,
+                payload_hash=payload_hash,
+                prev_hash=prev,
+            ),
+        )
+        return offset
+
+    def _unresolved(self, run_id: str) -> list[Mapping[str, JsonValue]]:
+        rows = self._backend.execute(_SELECT_UNRESOLVED, {"run_id": run_id}).fetchall()
+        return [dict(row) for row in rows]
 
     def close(self) -> None:
         self._executor.shutdown(wait=True)
@@ -499,6 +703,42 @@ class Journal:
         if count == 0:
             return ChainVerification(True, run_id, 0, None, "empty")
         return ChainVerification(True, run_id, count, None, "ok")
+
+    # -- dispatch deduplication (Hard Rule 8) --------------------------------------------
+
+    async def claim_dispatch(self, claim: PendingClaim) -> DispatchClaim:
+        """Stake a claim on sending this effect, durably, *before* the tool is called.
+
+        The claim row is the intent record, which is why no sixteenth journal entry kind is
+        invented for it: a send intent is neither a model output nor a tool result, so Hard
+        Rule 5 does not reach it.
+        """
+        return await self._writer.submit_async(lambda: self._writer._claim(claim))
+
+    async def mark_not_sent(self, run_id: str, nkey: str, attempt: int) -> None:
+        """Record that an attempt failed before anything left the process."""
+        await self._writer.submit_async(lambda: self._writer._mark_not_sent(run_id, nkey, attempt))
+
+    async def settle_dispatch(
+        self,
+        *,
+        run_id: str,
+        nkey: str,
+        status: Literal["dispatched", "dead_letter"],
+        ack: JsonValue,
+        attempt: int,
+        kind: Literal["effect_dispatched", "effect_dead_lettered"],
+        payload: Mapping[str, JsonValue],
+    ) -> int:
+        """Record the outcome and journal it atomically. Returns the entry offset."""
+        validate_payload(kind, payload)
+        return await self._writer.submit_async(
+            lambda: self._writer._settle(run_id, nkey, status, ack, attempt, kind, payload)
+        )
+
+    def unresolved_dispatches(self, run_id: str) -> list[Mapping[str, JsonValue]]:
+        """Claims still in flight. A resume's reconciliation list."""
+        return self._writer.submit(lambda: self._writer._unresolved(run_id))
 
     def close(self) -> None:
         """Journals share a process-global writer; closing one closes none of the others."""

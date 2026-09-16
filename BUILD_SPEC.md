@@ -617,7 +617,7 @@ Goal: writes can be staged and drained, and there is a world that will tell us i
   *Verify:* a tool registered with no class is treated as WRITE; an MCP tool with `readOnlyHint=true` maps to READ; one with no annotations maps to WRITE; overrides in config win.
 - [x] **1.2 Fake world.** `World` with tables (`customers`, `tickets`, `jobs`, `messages`) and endpoint-style tools; every mutation appended to `world.mutations` as `(branch_id, effect_key, tool, args_hash, ts)`. Fault injection per §5. `World.reads_with_witness()` returns `{value, witness}` where witness is a per-row version counter.
   *Verify:* `world.mutations` is the only way state changes; a test monkeypatches every public write path and asserts each appends exactly one record.
-- [ ] **1.3 Idempotency keys + dedupe.** Rule 8 derivation. Dedupe table in the journal keyed on `key`; dispatch checks it first.
+- [x] **1.3 Idempotency keys + dedupe.** Rule 8 derivation. Dedupe table in the journal keyed on `key`; dispatch checks it first.
   *Verify:* property test — same `(run, lineage, step, tool, args)` → same key across processes; any one component changed → different key; draining the same buffer twice sends each effect once (asserted against `world.mutations`).
 - [ ] **1.4 Store buffer.** `stage()`, `forward()`, `drain()`, `discard()` per §7. Placeholders are `"$specunode.handle:<effect_id>"` strings; `hazards.analyse` finds them anywhere in a later call's canonical args.
   *Verify:* staging a WRITE causes no `world.mutations`; draining a CONFIRMED branch causes exactly one per staged effect, in stage order; `discard()` on a SQUASHED branch causes none and journals the count.
@@ -879,6 +879,10 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [AUDIT] Fix: World gained an append-only on-disk mutation log, fsynced per call, and rebuilds state on reopen. Tasks 2.5 and 5.2 SIGKILL a subprocess and compare world.mutations against the uninterrupted run; an in-memory world dies with that process, so the resumed run could not have seen a duplicate dispatch the dead one already made. Chosen over the audit's proposed out-of-process World server: the log achieves the same thing with far less machinery. — 2026-09-15
 [AUDIT] Fix: state changes now run inside World._mutate rather than beside it, so the funnel is structural rather than conventional and each record carries the resulting row — which is what lets recovery replay the log without re-running any tool. — 2026-09-15
 [AUDIT] Already closed by shipped code: the audit asked that ReplayModel be keyed by step rather than ordered, so it is idempotent and safe when concurrent branches request the same step. It was implemented that way in 0.4. — 2026-09-15
+[1.3] Idempotency keys (three derivations from one framed preimage) and the durable dispatch claim protocol. Keys verified stable across processes. — 2026-09-15
+[1.3] Decision: the preimage is a canonical JSON object, never a concatenation, because ("ab","c") and ("a","bc") concatenate to identical bytes and two different effects must never share a key. A test pins it. — 2026-09-15
+[1.3] Decision: the claim row is the intent record, so no sixteenth journal entry kind is invented for it — a send intent is neither a model output nor a tool result, so Hard Rule 5 does not reach it. — 2026-09-15
+[1.3] Decision: an in-flight claim found after a crash is AMBIGUOUS, not retry-safe. Only a failure that demonstrably never left the process is downgraded to retry-safe. Treating the ambiguous case as safe is how a card gets charged twice. — 2026-09-15
 [0.4] Decision: CallScope is carried in a ContextVar rather than passed as an argument, so JournaledModel satisfies ModelClient and can be substituted wherever the developer's graph already calls a model — which is what lets task 2.3 leave their graph file unchanged. — 2026-09-15
 ```
 
