@@ -1007,22 +1007,24 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 
 ## Final Report
 
-**Written 2026-09-16, after 64 of 71 tasks. The seven that are not done are listed below with
-the reason each one is blocked, and none of them is blocked on more work I could do here.**
+**Written 2026-09-16, after 65 of 71 tasks. The six that are open are listed below, and every
+one of them is blocked on a credential, a CI run, or a spend cap — not on more work I could do
+here.**
 
-**666 tests pass, 27 skip. `ruff` and the configured `mypy --strict` are clean.**
+**697 tests pass, 27 skip. `ruff` and the configured `mypy --strict` are clean.**
 
 ### What was built, in five sentences
 
-SpecuNode executes an agent graph the way an out-of-order CPU executes instructions: reads
-issue early, writes wait in a branch-scoped store buffer, and the target model's real decision
-is the only thing that can release a write. Every model output and tool result is journaled and
-fsynced before the runtime acts on it, so a crashed run resumes and a finished run replays, and
-the replay refuses the moment the run would ask the model a different question. Three
-never-skipped tests hold the invariants: nothing reaches the world from a branch that did not
-retire, the effect ledger with speculation on equals the ledger with it off, and the speculative
-arm asked the model the same questions as the sequential arm. It ships a LangGraph integration
-that runs an unchanged graph file, a plain-Python API, an MCP proxy, three drafter tiers, and a
+SpecuNode executes an agent graph the way an out-of-order CPU executes instructions: reads issue
+early, writes wait in a branch-scoped store buffer, and the target model's real decision is the
+only thing that can release a write. Every model output and tool result is journaled and fsynced
+before the runtime acts on it, so a crashed run resumes and a finished run replays, and the
+replay refuses the moment the run would ask the model a different question. Three never-skipped
+tests hold the invariants across three sample workloads and two drafter tiers: nothing reaches
+the world from a branch that did not retire, the effect ledger with speculation on equals the
+ledger with it off, and the speculative arm asked the model the same questions as the sequential
+arm. It ships a LangGraph integration that runs an unchanged graph file, a plain-Python API, an
+MCP proxy driven end to end by a generic client, three drafter tiers, three demos, and a
 benchmark suite whose numbers are all read from committed files. The most useful thing it
 produced is a negative result.
 
@@ -1046,29 +1048,39 @@ Measured on 300 real OpenHands trajectories from `nebius/SWE-rebench-openhands-t
 
 **The second row is the headline and it is zero.** Every tool call in that corpus opens a new
 model turn, and a staged write blocks the next *turn* because that turn would have to contain a
-placeholder where the real result belongs. There is nothing to run ahead into. The mechanism
-this project is named for buys nothing on the only real public corpus available.
+placeholder where the real result belongs. There is nothing to run ahead into.
 
 The third row is the part that is not zero, and it is a different quantity: PASTE refuses to
 speculate on a tool with side effects at all, while SpecuNode stages one, so a *predicted* write
 can be run ahead and discarded. That is an upper bound on opportunity rather than a speedup, and
-it is realisable only where the predictor is right. The two numbers are never quoted apart.
+realisable only where the predictor is right. The two numbers are never quoted apart.
 
-**The second headline number does not exist.** There is no wall-clock reduction figure anywhere
-in this repository, because the online latency benchmark has not been run — see the manual steps.
+The fourth row turned out to be the same fact seen from the runtime side. The drafter's history
+is the calls within the current turn, so a one-call-per-turn workload offers it nothing to
+predict from at all — it is not that speculation is unprofitable there, it is that no prediction
+can be formed.
+
+**The second headline number does not exist.** There is no wall-clock figure in this repository
+for a real model, because the online latency benchmark has not been run. Demo 2 measures wall
+clock against a scripted model and prints what it measures; nothing from it is quoted here or in
+the README, because it is a per-machine number and committing one would be either flaky or
+unmeasured.
 
 ### The anti-results
 
-- **Past-write speculation: 0.0000 span**, as above. 95.5% of the corpus is the
-  `model → write → model(reads the result)` shape that section 1 predicts gains nothing from it.
-- **Break-even α: not measured.** It is defined as the α at which the speculative arm's wall
-  clock equals the sequential arm's, and wall clock has not been measured. `alpha_floor` defaults
-  to `None`, which means the gate is inactive rather than set to a guessed number.
+- **Past-write speculation: 0.0000 span.** 95.5% of the corpus is the
+  `model → write → model(reads the result)` shape that gains nothing from it.
+- **Break-even α: not measured.** It is the α at which the speculative arm's wall clock equals
+  the sequential arm's, and wall clock against a real model has not been measured. `alpha_floor`
+  defaults to `None` — the gate is inactive rather than set to a guessed number.
 - **Undetectable stale reads: 0.5** of the stale reads in attack 7.3's fixture were unwitnessed
   and therefore undetectable. That fraction, not the stale rate, is the honest number.
-- **Journaling and classification overhead: 6.645 ms per step.** That is 87.7% of wall clock in
-  the measurement, and the percentage is the misleading half — a scripted model answers
-  instantly, so it is the worst possible ratio. The absolute per-step figure is what transfers.
+- **Journaling and classification overhead: 6.645 ms per step**, 87.7% of wall clock in that
+  measurement. The percentage is the misleading half — a scripted model answers instantly, so it
+  is the worst possible ratio. The absolute per-step figure is what transfers.
+- **Demo 2's saving is one read's latency.** Speculating past a write hides tool latency, not
+  model latency, and on that workload it hides exactly one independent read. The demo says so in
+  its own output rather than letting the shape of the table suggest more.
 
 ### The attacks that beat it
 
@@ -1088,9 +1100,60 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (8 predictions, 8 squashed, 2,000 wasted tokens, 0 leaks) and 7.8
 replay under model drift (both cases diverge at step 0).
 
+### What the coverage work found, and why none of it was visible before
+
+The three mandatory tests originally ran on one workload at one tier, the demos were one of
+three, neither CLI command the spec names existed, and the MCP proxy had never been driven by a
+client. Closing those four gaps found **nine defects**. Two were fatal to the project's central
+claim and one had been shipped, documented and "tested" in a state where it could not start.
+
+**A confirmed prediction of a write deadlocked the run.** The child branch staged the effect, the
+canonical branch adopted its task and awaited the ack, and nothing drained the child's buffer —
+the drain dispatches by branch id and only the canonical branch retires. The run hung rather than
+failing, which is the worst of the three outcomes because nothing reports it. **This is the case
+the project is named for.** It survived because no test had ever confirmed a prediction of a
+*write*: the stub drafter predicts a read for its confirm case, and reads stage nothing.
+
+**Speculating changed the idempotency keys.** A confirmed speculation did not advance the
+canonical branch's step cursor, so every later call derived a different key depending on whether
+the runtime happened to speculate. A resume with speculation off would not have deduped against
+a crashed run that had it on, and the effect would have been delivered twice. A Hard Rule 9
+violation, caught by the equivalence test the instant a workload confirmed a prediction.
+
+**The MCP proxy could not register a single tool.** Its forwarding function was annotated with
+the package's recursive `JsonValue` alias, and the SDK builds each tool's schema from the
+signature, so registration raised `PydanticUserError` and the proxy died before serving one
+request. Behind that: it read `inputSchema` where the SDK had renamed the field to
+`input_schema` and so advertised a schema it had inferred; it then rejected every call made
+against that schema, because the SDK parses arguments from the signature rather than the schema;
+and the first forwarded read deadlocked, because `MCPServer.run("stdio")` opens its own event
+loop and left the served tools and the upstream session on different ones.
+
+**A read still in flight at retirement demoted its branch.** `_timed_read` marked a read
+speculative by saving the branch's `status`, setting SPECULATIVE, and restoring the saved value
+— so a read that outlived the turn put the old status back after the branch was confirmed, and
+the next drain refused with a Hard Rule 3 message about a branch that had been confirmed
+correctly. Overlapping a read with the drain is the whole point of early issue, so the race was
+reachable on the ordinary path. The same shape could have promoted a squashed branch.
+
+**Park events are keyed by branch id**, so the event a child set when it staged was on a key
+nothing waits on. **The journal could not tell a predicted branch from the canonical one** —
+every `branch_forked` recorded `predicted: null`, and a confirmed speculative branch was never
+journaled as resolved at all. **A node failure was reported as `node <name> failed`**, discarding
+the branch's reason — which for a replay refusal *is* the step index and the field-level request
+diff, the single most useful thing this system can tell an operator.
+
+Two further things are findings rather than defects, and are in `docs/limitations.md`: a drafter
+cannot use the result of the call it was just asked about, because it is consulted immediately
+after a block parses when that call has only been issued; and two of the three sample apps route
+around speculation entirely by calling the model directly rather than through `session.call_turn`.
+
+The honest reading of this section is that the ratio of defects to coverage was uncomfortable,
+and the next axis of coverage probably has more in it.
+
 ### Decisions this spec did not specify
 
-The Progress Log above has 100+ entries; these are the ones that changed the shape of the build.
+The Progress Log has 130+ entries; these changed the shape of the build.
 
 1. **`Journal.read`'s `after` defaults to −1, not §7's 0.** Offsets are dense from zero and
    `after` is exclusive, so the specified default silently skips every run's first entry.
@@ -1098,116 +1161,68 @@ The Progress Log above has 100+ entries; these are the ones that changed the sha
    told the effect exists.
 3. **Three key derivations, not one.** `key` carries the branch lineage and stays internal;
    `nkey` drops it and is both the dedupe primary key and the token the tool sees; `ekey` drops
-   the run too and is used only by the equivalence relation. Deduping on the lineage-bearing key
-   re-dispatches after every stall-and-re-stage and every resume.
+   the run too and is used only by the equivalence relation.
 4. **A staged write always returns a future, never a value.** Handing back a real ack means
-   dispatching inside the call, which is task 1.6's planted bug; making the caller await the
-   drain deadlocks the first write of the first sequential run.
-5. **The leak test asserts two invariants.** The spec's own invariant cannot see the bug the
-   spec names as the planted one, because in a single process a drain before its confirming
-   entry is durable still happens on a branch that retires.
-6. **Hard Rule 1's check parses the AST.** A grep cannot tell a protocol signature that forwards
-   the developer's messages from code that authors a prompt, and fires on every docstring Rule 13
-   needs. The literal `messages=[` grep the spec names is kept alongside it.
-7. **Projections are not implemented at all.** A projection retires unverified and can make Hard
-   Rule 9's mandatory comparison fail in a supported configuration, and Rule 9 has no policy
-   escape clause.
-8. **Handle-accepting tools are not implemented.** Rules 4, 8 and 9 each independently forbid
-   them.
-9. **A ninth hazard, `NODE_NOT_SPECULABLE`.** A refusal that is not named is missing from the
-   histogram, and the honest answer about available speculation is understated.
-10. **Task 2.5's Verify is satisfied in a weaker, truer form.** A resumed run's effects equal the
-    uninterrupted run's at every kill point except one class: if a process dies between a request
-    reaching the world and its ack being recorded, a non-idempotent tool is dead-lettered rather
-    than redelivered, so the run reaches a *prefix*. The test asserts never-duplicated and
-    never-invented, and requires a dead letter whenever it falls short.
-11. **The MCP proxy's mode is read from the client's advertised capability**, not from a default.
-    A client that cannot be told "this has not happened" will put the placeholder in its next
-    prompt, and the proxy cannot see prompts.
-12. **The corpus effect-class table is hand-written and `str_replace_editor` is a WRITE**, though
-    its `view` command reads. Classifying by inspecting the `command` argument is the
-    argument-level heuristic Hard Rule 2 forbids.
-13. **The three sample apps are deliberately three different shapes**, not three instances of
-    one. `support_agent` calls the model directly and issues each tool itself (Demo 1's
-    pattern); `ops_agent` hands its whole turn to the runtime via `session.call_turn` and emits
-    several calls in it; `research_agent` is read-heavy and its write is irreversible and
-    therefore a barrier. A suite where every workload took the same path would test one path
-    three times.
-14. **Each workload declares `drives_turn` and `tier_1_can_predict`**, and the tests assert
-    them. These are expectations about what the runtime will and will not do on that shape.
-    Without them, a workload that silently stopped speculating would still pass every
-    comparison, because two runs that never speculate are trivially equivalent.
-15. **A confirmed speculation's effects are adopted by the canonical branch** rather than the
-    child being retired. Only one branch retires, and re-attributing the effect is what makes
-    the run identical to the one that never speculated — which is Hard Rule 9 restated.
-
-### What the expanded coverage found
-
-The three mandatory tests originally ran on one workload at one tier. Parameterising them over
-three workloads and two drafter tiers was the last substantive work done here, and it surfaced
-four defects. None was reachable from the previous coverage, and one was fatal.
-
-**A confirmed prediction of a write deadlocked the run.** The child branch staged the effect,
-the canonical branch adopted the child's task and awaited its ack, and nothing drained the
-child's buffer — the drain dispatches by branch id and only the canonical branch retires. The
-run hung rather than failing, which is the worst of the three outcomes because nothing reports
-it. This is the case the project is named for. It survived because no test had ever confirmed a
-prediction of a *write*: the stub drafter predicts a read for its confirm case and a write only
-for its squash cases, and reads stage nothing while squashed buffers are discarded, never
-drained. Fixed with `StoreBuffer.adopt`.
-
-**Speculating changed the idempotency keys.** A confirmed speculation did not advance the
-canonical branch's step cursor, so every later call in the run derived a different key
-depending on whether the runtime happened to speculate. A resume with speculation off would
-not have deduped against a crashed run that had it on, and the effect would have been delivered
-twice. That is a Hard Rule 9 violation, and the equivalence test caught it the instant a
-workload confirmed a prediction — which had never happened before.
-
-**Park events are keyed by branch id**, so the event the child set when it staged was on a key
-nothing waits on. Found while fixing the first defect; without it the effect moved to the
-correct list and still never left.
-
-**The journal could not tell a predicted branch from the canonical one.** Every `branch_forked`
-entry recorded `predicted: null` and `tier: null`, and a confirmed speculative branch was never
-journaled as resolved at all. "How much did this run actually speculate" was unanswerable from
-the durable record, which is the only record Hard Rule 12 permits an answer to come from.
-
-Two further things are findings rather than defects, and are in `docs/limitations.md`:
-
-- **A drafter cannot use the result of the call it was just asked about.** It is consulted
-  immediately after a block parses, when that block's call has only been issued. The earliest
-  usable result is from a block two back. This halves the reach of PASTE's data-flow idea
-  inside this runtime, and waiting for the read before asking would serialise exactly what
-  early issue exists to overlap.
-- **A one-call-per-turn workload offers the drafter nothing**, because its history is the calls
-  within the current turn. That is 1.0000 of the offline corpus, and it is the same fact as the
-  0.0000 speculable span seen from the runtime side rather than from the trace.
+   dispatching inside the call, which is task 1.6's planted bug.
+5. **The leak test asserts two invariants.** The spec's own invariant cannot see the bug the spec
+   names as the planted one.
+6. **Hard Rule 1's check parses the AST.** A grep cannot tell a protocol signature from code that
+   authors a prompt. The literal grep the spec names is kept alongside it.
+7. **Projections and handle-accepting tools are not implemented at all.** Each is independently
+   forbidden by Rules 4, 8 and 9, and a projection can make Rule 9's mandatory comparison fail in
+   a supported configuration.
+8. **A ninth hazard, `NODE_NOT_SPECULABLE`.** A refusal that is not named is missing from the
+   histogram.
+9. **Task 2.5's Verify is satisfied in a weaker, truer form.** A resumed run reaches a *prefix* of
+   the uninterrupted run's effects: at the two-generals window a non-idempotent tool is
+   dead-lettered rather than redelivered. The test asserts never-duplicated and never-invented.
+10. **The MCP proxy's mode is read from the client's advertised capability**, not from a default.
+11. **The corpus effect-class table is hand-written**, because classifying by inspecting an
+    argument is the heuristic Hard Rule 2 forbids.
+12. **The three sample apps are three different shapes**, not three instances of one, and each
+    workload declares `drives_turn` and `tier_1_can_predict` so that a workload which silently
+    stopped speculating cannot still pass every comparison.
+13. **A confirmed speculation's effects are adopted by the canonical branch**, re-attributed but
+    never re-keyed — `nkey` is the token the tool sees.
+14. **`Config` gains `graph: "module:attribute"`.** A journal records what a graph did, not what
+    it is, so `resume` and `replay` cannot find one without being told; both refuse rather than
+    import something plausible and re-drive the wrong program.
+15. **`specunode replay` dispatches nothing unless `--dispatch` is passed**, and the dry run is
+    recorded on the ledger row rather than only in a banner.
+16. **The proxied MCP tool is given the upstream's parameter names, typed `Any`.** The upstream is
+    the authority on its own argument types, and re-deriving Python types from JSON Schema would
+    invent disagreements.
 
 ### Definition of Done: what is not ticked, and why
 
 | Item | Status |
 |---|---|
-| Wheel on 3.11/3.12/3.13, macOS **and Ubuntu** | Verified on macOS for all three; Ubuntu is CI-only and CI has not been run. |
-| The three tests on every workload, every tier, **every CI job** | They run, are never skipped, and now cover all three sample apps at tiers 0 and 1. Tier 2 is a draft *model* behind an optional extra: requiring it here would make a mandatory test skippable, which is the one property these files may never have, so it is covered by its own tests instead. The open clause is **every CI job** — CI has not been run. |
-| LangGraph ✓, plain ✓, **MCP proxy with a generic client** | The proxy's rules are tested (20 tests) and the stdio transport is wired, but it has not been driven by a real client against a real upstream server. Phase Gate 4 is **not** met. |
+| Wheel on 3.11/3.12/3.13, macOS **and Ubuntu** | Verified on macOS for all three. Ubuntu is CI-only and CI has not been run. |
+| The three tests on every workload, every tier, **every CI job** | They run, are never skipped, and cover all three sample apps at tiers 0 and 1. Tier 2 is a draft *model* behind an optional extra — requiring it would make a mandatory test skippable, which is the one property these files may never have, so it has its own tests. The open clause is **every CI job**. |
 | Offline ✓, overhead ✓, adversarial ✓, **online latency** | Needs an API key. Not run. |
-| Published to PyPI; demoed from the published wheel | Not done. Needs credentials. |
+| Published to PyPI; demoed from the published wheel | Needs credentials. |
+
+Also unverified, and stated rather than left to be discovered: **the Postgres journal backend is
+written and type-checked but has never been executed** — this machine has no Postgres and no
+Docker, and it needs the CI job.
+
+Phase Gate 4's blocking half is met: the proxy works with a generic client, demonstrated against
+a real upstream server. Its remaining clause — that the ledger match the LangGraph integration's
+exactly — cannot hold while `node_id` is a mandatory key input and a generic client reports no
+node. That is a design decision for you, not a bug: accept the node-insensitive comparison, or
+accept that the clause holds only for clients that report node ids.
 
 ### Manual steps left for you
 
 1. **An Anthropic API key and a spend cap**, for the online latency benchmark (task 6.4). Set
    `ANTHROPIC_API_KEY` and `SPECUNODE_BENCH_BUDGET_USD` (default 25). Decision Gate D2 says to
    report the reduced *n* and its wider interval rather than raising the cap, and the runner is
-   written to do that. Until this runs, there is no wall-clock number and the README says so.
+   written to do that.
 2. **PyPI credentials**, for task 9.3. `uv build` works and the wheel installs and runs on 3.11,
-   3.12 and 3.13 locally; publishing and the clean-venv install from PyPI are yours.
+   3.12 and 3.13 locally.
 3. **Run CI once.** The Ubuntu matrix, the Postgres 16 job and the extras matrix have never
-   executed. The Postgres backend in particular is **written and type-checked but never run** —
-   this machine has no Postgres and no Docker.
-4. **Decide Phase Gate 4.** "The support example driven by a generic MCP client produces the same
-   ledger as the LangGraph integration" cannot hold while `node_id` is a mandatory key input and a
-   generic client reports no node. Either accept the node-insensitive comparison, or accept that
-   the gate passes only for clients that report node ids.
+   executed.
+4. **Decide Phase Gate 4's ledger clause**, as above.
 
 Decision Gate D1 did **not** fire: the corpus was fetched from Hugging Face, so the opportunity
 analysis is on real trajectories rather than self-generated ones.
@@ -1216,23 +1231,24 @@ analysis is on real trajectories rather than self-generated ones.
 
 **Find a corpus where the mechanism can work.** The measured zero is a real finding, but it is a
 finding about OpenHands' one-call-per-turn shape rather than about agents in general. A workload
-that emits several tool calls per turn — a parallel-fanout agent, a batch-of-reads planner — is
-where past-write speculation has room, and I would go looking for one and publish both.
+that emits several tool calls per turn is where past-write speculation has room, and I would go
+looking for one and publish both numbers.
 
 **Measure wall clock against a real model.** Every latency claim in this design is currently an
 argument. The overhead number says 6.6 ms per step; whether that is noise or a tax depends
 entirely on numbers that need an API key.
 
-**Drive the MCP proxy end to end.** The rules are tested and the transport is wired, but "wired"
-and "works" are different words and only one of them has been demonstrated.
+**Test transports, not only rules.** The single most expensive mistake here was testing the MCP
+proxy's rules without its transport. The reasoning was sound — the rules carry the correctness
+claims — and the result was a component that had never once started. Every place this codebase
+tests a policy without the thing that carries it deserves the same suspicion.
 
-**Widen the coverage matrix again, and expect it to find more.** Going from one workload at one
-tier to three workloads at two tiers found four defects in an afternoon, one of them fatal to
-the project's central claim. That is not a comfortable ratio, and the honest reading is that the
-next axis — more tiers, more fault injection, more turn shapes — probably has more in it. Demo 2
-was still not built, because `ops_agent` only reached its final shape at the end.
+**Widen the coverage matrix again, and expect it to find more.** One workload at one tier became
+three at two, and one demo became three, and that found nine defects. That is not a comfortable
+ratio, and the honest conclusion is that the next axis — more fault injection, more turn shapes,
+more adapters — probably has more in it.
 
-**Spend the time on the predictor, not the buffer.** The store buffer works and its guarantees
-hold under every fault I could inject. The number that decides whether any of it pays for itself
-is the acceptance rate, measured here at 0.5350 top-1 — and that is a prediction problem, not a
-runtime one.
+**Spend the remaining time on the predictor, not the buffer.** The store buffer works and its
+guarantees hold under every fault I could inject. The number that decides whether any of it pays
+for itself is the acceptance rate, measured here at 0.5350 top-1 — and that is a prediction
+problem, not a runtime one.
