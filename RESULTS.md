@@ -87,6 +87,20 @@ The chaos matrix produced 4 dead letters, which is the partition rounds behaving
 
 ---
 
+### What the runtime costs
+
+The same LangGraph app, the same scripted model, the same fake world, run 15 times each way: once bare, once through the runtime. The difference is the journal's fsyncs, effect classification, staging and the ledger.
+
+| | ms per run |
+|---|---|
+| Bare graph | 2.797 |
+| Under the runtime | 22.731 |
+| **Overhead** | **19.934** (6.645 per step) |
+
+That is 87.7% of wall clock here, and the percentage is the misleading half of it. A scripted model answers instantly, so this is the worst case for the ratio: against a real multi-second turn the same absolute cost is a far smaller fraction. The absolute per-step figure is the one to compare.
+
+---
+
 ### Wall-clock latency
 
 Not measured yet. Produce it with:

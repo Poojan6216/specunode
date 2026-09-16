@@ -192,6 +192,36 @@ def invariants_section() -> str:
     )
 
 
+def overhead_section() -> str:
+    report = load("overhead.json")
+    if report is None:
+        return missing(
+            "What the runtime costs",
+            "python bench/offline/run_opportunity.py --overhead --out bench/results/overhead.json",
+        )
+    o = report["overhead"]
+    return "\n".join(
+        [
+            "### What the runtime costs",
+            "",
+            f"The same LangGraph app, the same scripted model, the same fake world, run "
+            f"{o['rounds']} times each way: once bare, once through the runtime. The difference "
+            "is the journal's fsyncs, effect classification, staging and the ledger.",
+            "",
+            "| | ms per run |",
+            "|---|---|",
+            f"| Bare graph | {o['bare_ms']['mean']} |",
+            f"| Under the runtime | {o['wrapped_ms']['mean']} |",
+            f"| **Overhead** | **{o['overhead_ms_per_run']}** "
+            f"({o['overhead_ms_per_step']} per step) |",
+            "",
+            f"That is {o['overhead_fraction_of_wall_clock']:.1%} of wall clock here, and the "
+            "percentage is the misleading half of it. " + str(o["note"]),
+            "",
+        ]
+    )
+
+
 def latency_section() -> str:
     return (load("latency.json") and "") or missing(
         "Wall-clock latency",
@@ -221,6 +251,9 @@ def build() -> str:
             "---",
             "",
             invariants_section(),
+            "---",
+            "",
+            overhead_section(),
             "---",
             "",
             latency_section(),

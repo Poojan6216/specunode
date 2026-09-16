@@ -730,7 +730,7 @@ Goal: numbers, with the negative ones first.
   *Verify:* `B_naive_parallel` leaks on the Demo 1 workload and the leak count is reported, not hidden.
 - [ ] **6.4 Online latency bench.** `bench/online/run_latency.py`: the three sample apps × 30 seeded tasks × {B_seq, B_readonly_spec, B_specunode} with the real target model, budget-capped; per run: wall clock, tokens (target, draft), wasted tokens, α per tier, stalls by hazard, stale reads, effects dispatched, leaks (must be 0). Report the break-even α per workload (the α at which `B_specunode` wall clock equals `B_seq`). Bootstrap CIs over tasks.
   *Verify:* `bench/results/latency.json`; spend stays under the cap and the report records the spend.
-- [ ] **6.5 Overhead.** Journaling + classification overhead of `B_seq` vs the same graph on vanilla LangGraph with no SpecuNode, same `ReplayModel`. Reported as absolute ms per step and as a fraction of wall clock.
+- [x] **6.5 Overhead.** Journaling + classification overhead of `B_seq` vs the same graph on vanilla LangGraph with no SpecuNode, same `ReplayModel`. Reported as absolute ms per step and as a fraction of wall clock.
   *Verify:* `bench/results/overhead.json`.
 - [x] **6.6 Report generation.** `bench/report.py` → `RESULTS.md`; `bench/plots/make_plots.py` → PNGs; `bench/check_numbers.py` enforces README traceability.
   *Verify:* `RESULTS.md` regenerates identically from committed JSON; CI fails on a planted untraceable number.
@@ -947,6 +947,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [7.7] Drafter poisoning: an index trained on an adversarial strong chain that ends in a charge made 8 predictions, all 8 squashed, 2,000 wasted tokens, the alpha gate disabled speculation, and 0 effects reached the world. The cost is tokens and stalls; it is not a leak. — 2026-09-16
 [7.7] The first version measured 0 predictions, because the poisoned chain's arguments were not fillable from history and the drafter correctly declined to offer it. A strong chain has to carry its arguments forward or there is no attack — fixing the fixture is what made the attack real. — 2026-09-16
 [7.8] Replay under model drift: a one-token system prompt change and an added tool both diverge at step 0, as the spec predicts. Held, not beaten. — 2026-09-16
+[6.5] Overhead measured: 6.645 ms per step (19.934 ms per run) against the same LangGraph app running bare. That is 87.7% of wall clock here, and the percentage is the misleading half — a scripted model answers instantly, so this is the worst case for the ratio. The absolute per-step figure is the one that transfers to a real multi-second turn. Dominated by the journal's one-fsync-per-entry discipline, which is the cost of Hard Rule 5 and is not being optimised away. — 2026-09-16
 [0.4] Decision: CallScope is carried in a ContextVar rather than passed as an argument, so JournaledModel satisfies ModelClient and can be substituted wherever the developer's graph already calls a model — which is what lets task 2.3 leave their graph file unchanged. — 2026-09-15
 ```
 

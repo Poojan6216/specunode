@@ -1,0 +1,18 @@
+{
+  "overhead": {
+    "bare_ms": {
+      "mean": 2.797,
+      "median": 2.387
+    },
+    "note": "A scripted model answers instantly, so this is the worst case for the ratio: against a real multi-second turn the same absolute cost is a far smaller fraction. The absolute per-step figure is the one to compare.",
+    "overhead_fraction_of_wall_clock": 0.877,
+    "overhead_ms_per_run": 19.934,
+    "overhead_ms_per_step": 6.645,
+    "rounds": 15,
+    "steps_per_run": 3,
+    "wrapped_ms": {
+      "mean": 22.731,
+      "median": 22.562
+    }
+  }
+}

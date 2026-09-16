@@ -223,8 +223,90 @@ def measure(traces: Sequence[Sequence[Step]], predict_sample: int) -> dict[str, 
     }
 
 
+# -- overhead (spec task 6.5) ------------------------------------------------------------------
+
+
+async def measure_overhead(rounds: int) -> dict[str, Any]:
+    """What journaling and classification cost, against the same graph running bare.
+
+    The same LangGraph app, the same scripted model, the same fake world -- once through
+    ``ainvoke`` with nothing wrapping it, and once through the runtime. The difference is the
+    journal's fsyncs, the effect classification, the staging and the ledger.
+
+    Reported per *step* as well as in total, because a per-run figure says more about how many
+    steps the workload happens to have than about what the runtime costs.
+    """
+    import statistics as stats
+    import tempfile
+    import time
+
+    from examples.support_agent.langgraph_agent import build_graph, build_registry
+
+    from specunode.buffer.dispatcher import Dispatcher
+    from specunode.core.model import JournaledModel
+    from specunode.integrations.langgraph import wrap
+    from specunode.journal.journal import Journal
+    from specunode.testing.models import ScriptedModel, tool_turn
+    from specunode.testing.world import standard_world
+
+    charge = ("charge_card", {"customer_id": "cus-1", "amount": 25.0})
+
+    def scripted() -> ScriptedModel:
+        return ScriptedModel(turns=[tool_turn(charge, turn=0)])
+
+    bare: list[float] = []
+    wrapped: list[float] = []
+    steps = 0
+
+    for _ in range(rounds):
+        world = standard_world()
+        graph = build_graph(world, scripted())
+        started = time.perf_counter()
+        await graph.ainvoke({"customer_id": "cus-1"})
+        bare.append((time.perf_counter() - started) * 1000.0)
+
+    tmp = Path(tempfile.mkdtemp())
+    for index in range(rounds):
+        world = standard_world()
+        journal = Journal(tmp / f"overhead-{index}.db")
+        registry = build_registry(world)
+        runtime = wrap(
+            build_graph(world, scripted()),
+            registry=registry,
+            journal=journal,
+            target=JournaledModel(scripted(), journal, provider="scripted"),
+            dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        )
+        started = time.perf_counter()
+        result = await runtime.run({"customer_id": "cus-1"})
+        wrapped.append((time.perf_counter() - started) * 1000.0)
+        steps = max(steps, result.steps)
+
+    bare_mean = stats.fmean(bare)
+    wrapped_mean = stats.fmean(wrapped)
+    overhead = wrapped_mean - bare_mean
+    return {
+        "rounds": rounds,
+        "steps_per_run": steps,
+        "bare_ms": {"mean": round(bare_mean, 3), "median": round(stats.median(bare), 3)},
+        "wrapped_ms": {"mean": round(wrapped_mean, 3), "median": round(stats.median(wrapped), 3)},
+        "overhead_ms_per_run": round(overhead, 3),
+        "overhead_ms_per_step": round(overhead / steps, 3) if steps else 0.0,
+        "overhead_fraction_of_wall_clock": (
+            round(overhead / wrapped_mean, 4) if wrapped_mean else 0.0
+        ),
+        "note": (
+            "A scripted model answers instantly, so this is the worst case for the ratio: "
+            "against a real multi-second turn the same absolute cost is a far smaller "
+            "fraction. The absolute per-step figure is the one to compare."
+        ),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Offline opportunity analysis")
+    parser.add_argument("--overhead", action="store_true", help="measure runtime overhead (6.5)")
+    parser.add_argument("--rounds", type=int, default=15)
     parser.add_argument("--corpus", type=Path, default=CORPUS)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument(
@@ -234,6 +316,27 @@ def main(argv: list[str] | None = None) -> int:
         help="trajectories used for leave-one-out predictability (it is quadratic)",
     )
     args = parser.parse_args(argv)
+
+    if args.overhead:
+        import asyncio
+
+        report = {"overhead": asyncio.run(measure_overhead(args.rounds))}
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+        o = report["overhead"]
+        print()
+        print("OVERHEAD (journaling + classification)")
+        print(f"  bare graph:        {o['bare_ms']['mean']:.3f} ms/run")
+        print(f"  under the runtime: {o['wrapped_ms']['mean']:.3f} ms/run")
+        print(
+            f"  overhead:          {o['overhead_ms_per_run']:.3f} ms/run "
+            f"({o['overhead_ms_per_step']:.3f} ms/step)"
+        )
+        print(f"  as a fraction:     {o['overhead_fraction_of_wall_clock']:.1%} of wall clock")
+        print(f"  {o['note']}")
+        print()
+        return 0
 
     if not args.corpus.is_file():
         print(f"no corpus at {args.corpus}; run bench/corpus/fetch.py first", file=sys.stderr)
