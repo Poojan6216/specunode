@@ -17,8 +17,18 @@ def _write(tmp_path: Path, text: str) -> Path:
 
 
 def test_the_shipped_example_is_valid() -> None:
-    """A broken example is worse than none: it is the first thing anyone copies."""
-    example = Path(__file__).resolve().parents[2] / "specunode.yaml.example"
+    """A broken example is worse than none: it is the first thing anyone copies.
+
+    Located through the package rather than the repo root. The template used to live at the
+    checkout root and be read via ``parents[2]``, which resolves to ``lib/python3.11/`` from an
+    installed wheel -- so it shipped in neither distribution and ``specunode init`` fell back to
+    writing eighteen unusable bytes for every user who was not working from source. This test
+    passed the whole time, because it ran from source.
+    """
+    from importlib import resources
+
+    example = Path(str(resources.files("specunode").joinpath("specunode.yaml.example")))
+    assert example.is_file(), "the template is not inside the package, so wheels will not carry it"
     config = load_config(example)
     assert config.schema_version == SCHEMA_VERSION
     assert config.tools["send_email"].effect == "irreversible"

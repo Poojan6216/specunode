@@ -132,7 +132,7 @@ from collections.abc import Mapping, Sequence
 from typing import Final, Protocol
 
 from specunode.buffer.idempotency import equivalence_key
-from specunode.canonical import JsonValue, canonical, chash_bytes
+from specunode.canonical import JsonValue, canonical, chash, chash_bytes
 from specunode.core.decision import ToolCall, decision_payload
 
 __all__ = [
@@ -363,18 +363,38 @@ def _world_join_problem(ledger: LedgerLike, mutations: Sequence[MutationLike]) -
                 f"({row.nkey[:8]}…) where the world has {mutation.tool!r} "
                 f"({mutation.effect_key[:8]}…)"
             )
+        # The key joins them; the *call* has to match too. Joining on the key alone compares a
+        # label to a label, so a drain that rewrote a call on its way to the dispatcher --
+        # different tool, different arguments, same idempotency key -- produced a ledger
+        # claiming one thing while the world received another, and this returned True.
+        if row.call.name != mutation.tool:
+            return (
+                f"at position {index} the ledger claims {row.call.name!r} but the world "
+                f"received {mutation.tool!r} under the same key {row.nkey[:8]}… -- the call "
+                "was rewritten between staging and dispatch"
+            )
+        expected = chash(dict(row.call.args))
+        if mutation.args_hash and expected != mutation.args_hash:
+            return (
+                f"at position {index} the ledger's {row.call.name!r} carries arguments hashing "
+                f"to {expected[:8]}… but the world received {mutation.args_hash[:8]}… -- the "
+                "arguments were rewritten between staging and dispatch"
+            )
     return None
 
 
 def ledger_matches_world(ledger: LedgerLike, mutations: Sequence[MutationLike]) -> bool:
     """Does the ledger account for the world, in order, one mutation per row that reached it?
 
-    Joins on ``nkey``, the one key the world sees, and then compares *sequence*: one mutation
-    per ``DISPATCHED`` or ``COMPENSATED`` row, no mutation without a row, and the world's
-    arrival order equal to the ledger's row order. The order clause is what makes a reversed
-    drain detectable twice -- a key join on its own is order-insensitive, and an equivalence
-    suite that relied on it alone would report that the ledger and the world agree about a
-    drain that ran backwards.
+    Joins on ``nkey``, the one key the world sees, and then compares *sequence and content*:
+    one mutation per ``DISPATCHED`` or ``COMPENSATED`` row, no mutation without a row, the
+    world's arrival order equal to the ledger's row order, and the tool and canonical arguments
+    the same on both sides.
+
+    The order clause is what makes a reversed drain detectable twice -- a key join on its own is
+    order-insensitive. The content clause is what makes a *rewritten* call detectable at all: an
+    idempotency key is a label, and comparing labels to labels reported that the ledger and the
+    world agreed while the world had received a different call under the same key.
 
     Both arguments must come from the **same** run: ``nkey`` is run-scoped, so this is a
     within-run corroboration and never a cross-arm comparison.

@@ -60,6 +60,12 @@ packages = ["src/specunode"]
 [tool.hatch.build.targets.sdist]
 include = ["src/specunode", "tests", "bench", "examples", "docs", "README.md", "LICENSE"]
 
+# The config template lives inside the package so that `specunode init` works from an installed
+# wheel. It used to sit at the repo root, be read via parents[2], and ship in neither
+# distribution -- so every installed user got an 18-byte config from the fallback branch.
+[tool.hatch.build.targets.wheel.force-include]
+"src/specunode/specunode.yaml.example" = "specunode/specunode.yaml.example"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

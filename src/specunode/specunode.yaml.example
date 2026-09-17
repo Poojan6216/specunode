@@ -7,6 +7,17 @@
 
 schema_version: 1
 
+# The callable that builds your graph and its tool registry, as "module:attribute". It takes no
+# arguments and returns (graph_adapter, tool_registry).
+#
+# `specunode resume` and `specunode replay` both re-drive a graph, and a journal does not
+# contain one -- it records what a graph did, not what it is. Without this entry both commands
+# refuse, by design: importing something plausible and re-driving the wrong program is worse
+# than stopping. This template omitted it entirely, which taught the wrong shape to everyone who
+# started from it.
+#
+# graph: "your_app.agent:build"
+
 journal:
   kind: sqlite # sqlite | postgres
   path: ./.specunode/journal.db

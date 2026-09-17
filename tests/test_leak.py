@@ -557,6 +557,14 @@ async def test_the_real_runtime_leaks_nothing_on_a_real_workload(
     assert touched <= retired, (
         f"Hard Rule 3 violated: {sorted(touched - retired)} touched the world without retiring"
     )
+    # I2 as well, over the real scheduler and not only over the simulator above. Without this,
+    # if ``Scheduler._retire`` ever stopped going through the guarded ``drain()`` entry point
+    # and dispatched before appending its confirming entry, nothing anywhere would notice --
+    # which is the exact bug I2 was strengthened to catch, checked only in a hand-written
+    # simulator that calls ``drain`` itself.
+    assert not unauthorised_effects(
+        RunResult(world=world, journal=journal, run_id=run_id, branches=[])
+    ), "an effect was dispatched before its branch's confirming entry was durable"
     # And the count is the workload's declared one, so a run that dispatched less than it
     # should cannot pass by leaking nothing.
     assert len(world.mutations) == workload.expect_effects

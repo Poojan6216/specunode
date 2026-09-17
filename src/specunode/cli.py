@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from importlib import resources
 from pathlib import Path
 
 import typer
@@ -72,11 +73,15 @@ def init(
     if target.exists():
         typer.echo(f"{target} already exists; leaving it alone")
     else:
-        example = Path(__file__).resolve().parents[2] / "specunode.yaml.example"
-        if example.is_file():
-            target.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
-        else:  # pragma: no cover - installed wheels carry the example in the sdist only
-            target.write_text("schema_version: 1\n", encoding="utf-8")
+        # Read from inside the package, not from the repo root. It used to resolve
+        # ``parents[2]``, which is the checkout only when running from source: from an
+        # installed wheel that is ``lib/python3.11/``, the file was absent, and the fallback
+        # wrote ``schema_version: 1`` and nothing else -- no ``graph:``, no ``target:``, no
+        # ``tools:``. Every user who installed the package and ran ``init`` got an 18-byte
+        # config that cannot drive anything. The example was listed in neither the wheel nor
+        # the sdist include lists, so the fallback was the only path that ever ran for them.
+        example = resources.files("specunode").joinpath("specunode.yaml.example")
+        target.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
         typer.echo(f"wrote {target}")
     typer.echo(f"created {directory / '.specunode'}")
 
@@ -252,19 +257,43 @@ def replay(
         raise typer.Exit(1)
 
 
+def signature_path(journal: Path, run_id: str, explicit: Path | None = None) -> Path:
+    """Where a run's ledger signature lives: beside the journal, never inside it.
+
+    Inside is impossible, not merely untidy. The signed payload covers ``journal_head`` and
+    ``journal_entries``, so appending the signature to the journal it signs changes the material
+    it was computed over and the signature stops verifying against a freshly built ledger.
+
+    This is why ``verify-ledger`` could never verify anything: ``sign-ledger`` echoed the
+    envelope to the terminal and wrote it nowhere, ``build_ledger`` never assigns ``signature``,
+    and so verification returned ``unsigned`` before running any of its four checks.
+    """
+    if explicit is not None:
+        return explicit
+    return journal.parent / "ledgers" / f"{run_id}.sig"
+
+
 @app.command("verify-ledger")
 def verify_ledger_command(
     run_id: str = typer.Argument(..., help="The run to verify."),
     journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
     keystore: Path = typer.Option(Path("./.specunode/keys"), "--keystore"),
+    signature: Path = typer.Option(
+        None, "--signature", help="Signature file. Defaults to <journal dir>/ledgers/<run>.sig."
+    ),
 ) -> None:
     """Check a ledger's signature and its journal chain, and say which failed.
 
     An edited ledger and a ledger signed by an unknown key are different problems with
     different remedies, so they are reported as different reasons rather than one refusal.
     """
+    from dataclasses import replace as _replace
+
     store = Journal(journal)
     built = build_ledger(store, run_id)
+    envelope_path = signature_path(journal, run_id, signature)
+    if envelope_path.is_file():
+        built = _replace(built, signature=envelope_path.read_text(encoding="utf-8").strip())
     result = verify_ledger(built, journal=store, store=keystore)
     typer.echo(f"{result.category}: {result.detail or result.reason}")
     if result.key_id:
@@ -278,12 +307,24 @@ def sign_ledger_command(
     run_id: str = typer.Argument(..., help="The run to sign."),
     journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
     keystore: Path = typer.Option(Path("./.specunode/keys"), "--keystore"),
+    out: Path = typer.Option(
+        None, "--out", help="Where to write it. Defaults to <journal dir>/ledgers/<run>.sig."
+    ),
 ) -> None:
-    """Sign a run's ledger with the local key, creating one on first use."""
+    """Sign a run's ledger with the local key, creating one on first use.
+
+    The envelope is **written to a file**, not only printed. It used to be echoed and stored
+    nowhere, so ``verify-ledger`` rebuilt an unsigned ledger and reported ``unsigned`` on every
+    run that had been signed.
+    """
     store = Journal(journal)
     key = load_or_create_key(keystore)
     signed = sign_ledger(build_ledger(store, run_id), key)
+    destination = signature_path(journal, run_id, out)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(signed.signature + "\n", encoding="utf-8")
     typer.echo(f"signed with {key.key_id}")
+    typer.echo(f"wrote {destination}")
     typer.echo(signed.signature)
 
 

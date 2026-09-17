@@ -179,3 +179,35 @@ def test_the_graph_reference_the_tests_use_is_the_one_the_config_names() -> None
     from specunode.runner import load_reference
 
     assert callable(load_reference(GRAPH_REFERENCE))
+
+
+def test_init_writes_a_config_that_actually_parses(tmp_path: Path) -> None:
+    """``specunode init`` from an installed wheel used to write 18 unusable bytes.
+
+    The template was located at ``Path(__file__).parents[2]``, which is the checkout only when
+    running from source; from an installed wheel that is ``lib/python3.11/``, the file was
+    absent, and the ``pragma: no cover`` fallback wrote ``schema_version: 1`` and nothing else.
+    The example was listed in neither the wheel nor the sdist include lists, so for every user
+    who installed the package that fallback was the *only* path that ever ran.
+
+    It lives inside the package now. This asserts the result parses and carries the keys that
+    make it usable, rather than asserting a byte count.
+    """
+    from specunode.cli import app as cli_app
+
+    result = CliRunner().invoke(cli_app, ["init", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+
+    written = tmp_path / "specunode.yaml"
+    assert written.is_file()
+    text = written.read_text(encoding="utf-8")
+    assert len(text) > 500, f"init wrote {len(text)} bytes; the fallback stub is back"
+
+    from specunode.config import load_config
+
+    config = load_config(written)
+    assert config.schema_version == 1
+    # The keys an operator needs in front of them. `graph` in particular is what `resume` and
+    # `replay` refuse without, so a template that omits it teaches the wrong shape.
+    for key in ("graph:", "target:", "journal:", "policy:", "tools:"):
+        assert key in text, f"the template no longer documents {key!r}"

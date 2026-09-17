@@ -332,3 +332,57 @@ async def test_no_branch_ever_sends_a_request_while_guessing(
         "the runtime will refuse the branch at retirement, and this file's stronger claim now "
         "needs a real check rather than a vacuous one."
     )
+
+
+async def test_the_fail_closed_refusal_is_not_merely_decorative(tmp_path: Path) -> None:
+    """Restoring the old ``context_verified = True`` must break something.
+
+    ``_verify_context``'s own docstring records that it used to be an unconditional stamp with a
+    hard-coded zero checks, which made the store buffer's Rule 13 gate unreachable. Nothing
+    protected that fix: the regression could be reintroduced verbatim and the whole suite stayed
+    green, including this file. In a codebase with a demonstrated history of fixes being undone
+    by later fixes, an unprotected repair is a repair with a countdown on it.
+
+    Asserted at the seam rather than by running a whole workload, because no shipped path
+    produces a speculative prompt -- see ``test_no_branch_ever_sends_a_request_while_guessing``.
+    What must hold is that a branch which *did* send one is refused rather than stamped.
+    """
+    from specunode.buffer.dispatcher import Dispatcher
+    from specunode.core.branch import Branch, BranchStatus
+    from specunode.core.decision import ToolCall
+    from specunode.core.policy import Policy
+    from specunode.core.scheduler import Scheduler
+    from specunode.testing.models import ScriptedModel
+    from specunode.testing.world import standard_world
+
+    world = standard_world()
+    _adapter, registry = WORKLOADS[0].make(world)
+    journal = Journal(tmp_path / "rule13-gate.db")
+    scheduler = Scheduler(
+        graph=_adapter,
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=new_ulid()),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1),
+        target=JournaledModel(ScriptedModel(turns=[]), journal, provider="scripted"),
+        policy=Policy(speculation=True),
+    )
+
+    guessing = Branch(id=new_ulid(), status=BranchStatus.SPECULATIVE, predicted=ToolCall("x", {}))
+    guessing.record_prompt(0, "some-request-hash")
+    assert guessing.speculative_prompts == 1, "the fixture did not record a speculative prompt"
+
+    checked = scheduler._verify_context(guessing)
+
+    assert checked == 0
+    assert guessing.context_verified is False, (
+        "a branch that sent a request while guessing was stamped as verified without anything "
+        "having been checked -- which is the regression this test exists to hold shut"
+    )
+    assert "Hard Rule 13" in (guessing.reason or "")
+
+    # And a branch that sent nothing while guessing has nothing to rebuild, which is not the
+    # same as claiming a check.
+    ordinary = Branch(id=new_ulid(), status=BranchStatus.SPECULATIVE)
+    assert scheduler._verify_context(ordinary) == 0
+    assert ordinary.context_verified is True
