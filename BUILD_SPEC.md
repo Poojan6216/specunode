@@ -1044,7 +1044,7 @@ Measured on 300 real OpenHands trajectories from `nebius/SWE-rebench-openhands-t
 | **SpecuNode speculable span past a write** | **0.0000 [0.0000, 0.0000]** |
 | Steps PASTE must skip that SpecuNode can stage | 0.9555 [0.9531, 0.9577] |
 | Calls that open a new model turn | 1.0000 [1.0000, 1.0000] |
-| T1 predictability, leave-one-trajectory-out | top-1 0.5350, top-3 0.8369 |
+| T1 **signature** accuracy (upper bound on acceptance), n=25 | top-1 0.5350, top-3 0.8369 |
 
 **The second row is the headline and it is zero.** Every tool call in that corpus opens a new
 model turn, and a staged write blocks the next *turn* because that turn would have to contain a
@@ -1263,5 +1263,7 @@ more adapters — probably has more in it.
 
 **Spend the remaining time on the predictor, not the buffer.** The store buffer works and its
 guarantees hold under every fault I could inject. The number that decides whether any of it pays
-for itself is the acceptance rate, measured here at 0.5350 top-1 — and that is a prediction
-problem, not a runtime one.
+for itself is the acceptance rate, and it is **not measured anywhere in this repository**. The
+0.5350 figure is signature accuracy — right tool, right argument names — while the gate compares
+argument values exactly. Measuring the real thing is a prediction problem, not a runtime one,
+and it is the first number I would go and get.

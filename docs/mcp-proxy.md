@@ -47,7 +47,9 @@ actually decided. The LangGraph and plain-Python integrations do it automaticall
 are inside the loop; over MCP, either the client reports it or a person does:
 
 ```
-specunode retire <run-id> --step 4 --decision '{"tool": "charge_card", "args": {...}}'
+# The proxy's own MCP tool, called by the client -- not a CLI command.
+# There is no `specunode retire` binary; this used to be documented as one in three places.
+specunode.retire {"tool": "charge_card", "args": {...}}
 ```
 
 Until a decision arrives, nothing held is sent. `specunode.status` says what is being held and

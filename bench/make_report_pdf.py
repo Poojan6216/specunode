@@ -115,7 +115,10 @@ def build_story(styles: Any) -> list[Any]:
             "steps. SpecuNode stages a write instead of refusing it, covering the other "
             f"{o['steps_paste_must_skip_that_specunode_can_stage']['mean']:.1%}. That is an "
             "upper bound on opportunity, not a speedup, realisable only where the predictor is "
-            f"right - measured at {opportunity['opportunity']['predictability']['top_1']:.1%} "
+            f"right. The nearest measured proxy is signature accuracy at "
+            f"{opportunity['opportunity']['signature_predictability']['top_1']:.1%} top-1, "
+            "which compares tool names and argument keys but not argument values, and is "
+            "therefore an upper bound on acceptance rather than a measurement of it "
             "top-1. Neither number means anything alone."
         )
 

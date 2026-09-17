@@ -137,6 +137,7 @@ async def simulate(
     *,
     skip_status_check: bool = False,
     skip_durability_check: bool = False,
+    drain_before_confirm: bool = False,
 ) -> RunResult:
     """Drive a branch tree to completion, staging and resolving as the real scheduler would."""
     run_id = new_ulid()
@@ -191,14 +192,20 @@ async def simulate(
 
         winner.confirm()
         winner.context_verified = True
-        confirmed_offset = await journal.append_async(
-            run_id,
-            "branch_resolved",
-            {"v": 1, "branch_id": winner.id, "step": step, "status": "confirmed"},
-        )
+        if drain_before_confirm:
+            # The confirming entry is NOT written yet. That is the bug: the drain below runs
+            # first, against the offset the entry is about to take.
+            confirmed_offset = (journal.last_offset(run_id) or -1) + 1
+        else:
+            confirmed_offset = await journal.append_async(
+                run_id,
+                "branch_resolved",
+                {"v": 1, "branch_id": winner.id, "step": step, "status": "confirmed"},
+            )
         if skip_durability_check:
-            # PLANTED BUG: claim the confirming entry is at an offset that does not exist yet,
-            # which is what draining before the fsync amounts to.
+            # PLANTED BUG: claim the confirming entry is at an offset that does not exist yet.
+            # Kept because it is a different failure -- a dispatch against nothing at all --
+            # but it is strictly easier to catch than the one above.
             confirmed_offset = (journal.last_offset(run_id) or 0) + 1000
         await _drain(
             buffer,
@@ -206,8 +213,18 @@ async def simulate(
             dispatcher,
             confirmed_offset=confirmed_offset,
             skip_status_check=skip_status_check,
-            skip_durability_check=skip_durability_check,
+            skip_durability_check=skip_durability_check or drain_before_confirm,
         )
+        if drain_before_confirm:
+            # Appended now, at the offset the drain already claimed. The finished journal is
+            # complete and self-consistent -- every entry present, every offset real. Only the
+            # order betrays it, which is why an invariant that does not compare offsets cannot
+            # see this and an invariant that fabricates a missing offset never had to.
+            await journal.append_async(
+                run_id,
+                "branch_resolved",
+                {"v": 1, "branch_id": winner.id, "step": step, "status": "confirmed"},
+            )
         winner.retire()
         await journal.append_async(
             run_id,
@@ -255,26 +272,49 @@ def leaked_branches(result: RunResult) -> set[str]:
 
 
 def unauthorised_effects(result: RunResult) -> list[str]:
-    """I2: effects whose confirming journal entry was not durable when they were dispatched."""
+    """I2: effects whose confirming journal entry was not durable when they were dispatched.
+
+    The property is an **ordering** one, and both facts are in the journal: the confirming
+    ``branch_resolved{confirmed}`` entry and the ``effect_dispatched`` entry each have an
+    offset, and the first must come before the second. If it does not, the effect left before
+    anything authorised it, and a crash at that instant leaves a world that changed for a
+    decision the journal never recorded.
+
+    This used to check two much weaker things -- that the branch has *some* confirming entry
+    anywhere in the finished journal, and that the offset the dispatch names is not past the
+    *final* head. An entry appended after the dispatch satisfies both. The planted-bug proof
+    passed only because it fabricated ``head + 1000``, an offset that never exists at all, which
+    is a strictly stronger falsification than the bug being modelled: plant the real shape --
+    drain against the offset the confirming entry is about to occupy, then append it -- and both
+    invariants reported clean. ``test_i2_catches_the_real_shape_of_the_planted_bug`` now plants
+    exactly that.
+    """
     confirmed_at: dict[str, int] = {}
-    head = -1
     for entry in result.journal.read(result.run_id):
-        head = entry.offset
         if entry.kind == "branch_resolved" and entry.payload.get("status") == "confirmed":
             branch_id = entry.payload.get("branch_id")
             if isinstance(branch_id, str):
-                confirmed_at[branch_id] = entry.offset
+                confirmed_at.setdefault(branch_id, entry.offset)
 
     bad: list[str] = []
     for entry in result.journal.read(result.run_id, kinds=["effect_dispatched"]):
         branch_id = entry.payload.get("branch_id")
         claimed = entry.payload.get("confirmed_by_offset")
+        effect_id = entry.payload.get("effect_id")
         if not isinstance(branch_id, str) or branch_id not in confirmed_at:
-            bad.append(f"{entry.payload.get('effect_id')}: no confirming entry for {branch_id}")
-        elif isinstance(claimed, int) and claimed > head:
+            bad.append(f"{effect_id}: no confirming entry for {branch_id}")
+            continue
+        confirmed_offset = confirmed_at[branch_id]
+        if confirmed_offset >= entry.offset:
             bad.append(
-                f"{entry.payload.get('effect_id')}: dispatched against offset {claimed}, "
-                f"journal head is {head}"
+                f"{effect_id}: dispatched at offset {entry.offset}, but its branch was only "
+                f"confirmed at offset {confirmed_offset} -- the effect left before anything "
+                "authorised it"
+            )
+        elif isinstance(claimed, int) and claimed != confirmed_offset:
+            bad.append(
+                f"{effect_id}: dispatched against offset {claimed}, which is not its branch's "
+                f"confirming entry (that is at {confirmed_offset})"
             )
     return bad
 
@@ -362,15 +402,49 @@ def test_the_invariant_catches_a_drain_on_a_squashed_branch(tmp_path: Path) -> N
     assert leaked_branches(result), "I1 did not notice a squashed branch reaching the world"
 
 
-def test_the_invariant_catches_a_drain_before_the_confirming_entry_is_durable(
+def test_the_invariant_catches_a_dispatch_against_an_offset_that_does_not_exist(
     tmp_path: Path,
 ) -> None:
-    """The exact bug task 1.6 names."""
+    """The easy half: a dispatch claiming an offset nothing will ever occupy."""
     result = asyncio.run(
         simulate(tmp_path / "j.db", ALWAYS_LEAKS, NO_FAULTS, skip_durability_check=True)
     )
     assert unauthorised_effects(result), (
         "I2 did not notice an effect dispatched against a journal offset that does not exist"
+    )
+
+
+def test_i2_catches_the_real_shape_of_the_planted_bug(tmp_path: Path) -> None:
+    """The bug task 1.6 actually names: drain first, append the confirming entry after.
+
+    This is the harder half and the one that matters. Nothing is fabricated -- every entry is
+    present in the finished journal and every offset is real. Only the *order* is wrong, which
+    is precisely what draining before the fsync means.
+
+    For a long time I2 could not see this. It checked that the branch had some confirming entry
+    somewhere in the finished journal, and that the offset the dispatch named was not past the
+    final head; an entry appended after the dispatch satisfies both. The proof above passed
+    only because it fabricated ``head + 1000``, a strictly stronger falsification than the bug
+    being modelled -- so the invariant looked proven while the fault class it was written for
+    went straight through it.
+    """
+    result = asyncio.run(
+        simulate(tmp_path / "real.db", ALWAYS_LEAKS, NO_FAULTS, drain_before_confirm=True)
+    )
+
+    assert result.world.mutations, "nothing was dispatched, so this proves nothing"
+    problems = unauthorised_effects(result)
+    assert problems, (
+        "I2 did not notice an effect dispatched before its confirming entry was written -- "
+        "which is the exact bug it exists to catch"
+    )
+    assert any("before anything authorised it" in problem for problem in problems), problems
+
+    # And I1 is confirmed blind to it, which is why I2 exists at all: the branch does retire,
+    # so the subset invariant holds perfectly while the effect left too early.
+    assert not leaked_branches(result), (
+        "this planted bug is supposed to be invisible to I1; if I1 sees it, the two invariants "
+        "are not testing different things and one of them is redundant"
     )
 
 

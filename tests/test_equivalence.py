@@ -39,6 +39,7 @@ from bench.workloads import WORKLOADS, Workload
 
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
+from specunode.core.decision import ToolCall
 from specunode.core.model import JournaledModel
 from specunode.core.policy import Policy
 from specunode.core.scheduler import RunResult, Scheduler
@@ -46,6 +47,7 @@ from specunode.drafters.base import DraftContext, Drafter, Prediction
 from specunode.drafters.t1_pattern import PatternDrafter, PatternIndex
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
+from specunode.testing.models import ScriptedModel, tool_turn
 from specunode.testing.world import World, standard_world
 from specunode.verify.equivalence import (
     EquivalenceError,
@@ -293,3 +295,72 @@ async def test_both_arms_journal_chains_verify(
             db=f"{workload.name}-{tier}-chain-{speculation}.db",
         )
         assert journal.verify_chain(result.run_id).ok
+
+
+async def test_the_relation_holds_when_the_speculation_was_actually_wrong(
+    tmp_path: Path,
+) -> None:
+    """Hard Rule 9 over a run where the store buffer really had to hold something back.
+
+    Every case above passes ``min_squashed_with_staged=0``, and the anchor would have fired if
+    it were set higher: across all six workload x tier cells the speculative arm squashes
+    nothing and discards nothing, because the index is trained on the run's own trace and is
+    therefore always right. So the mandatory Rule 9 test was only ever asserted over runs in
+    which speculation held nothing back -- the configuration where the two arms are trivially
+    identical, and exactly the one the anchor exists to rule out.
+
+    ``assert_equivalent``'s own docstring says why that matters: "Zero discarded effects means
+    the store buffer was never asked to hold anything back, so the 'retire on SQUASHED' bug the
+    relation exists to catch was unreachable in that run and the arms were never really
+    compared."
+
+    A ``FixedDrafter`` is used rather than a mistrained index because the prediction has to be
+    a *write* whose arguments are complete -- a mistrained index mostly mispredicts by offering
+    a read, or offers nothing at all when it cannot fill the arguments, and in both cases the
+    buffer is never asked to hold anything and the run is as vacuous as the ones above.
+    """
+    from tests.integration.test_speculation import FixedDrafter, OneTurnGraph, registry_for
+
+    turn = (
+        ("fetch_runbook", {"section": "restart"}),
+        ("restart_job", {"job_id": "etl-1"}),
+    )
+    # A registered WRITE the model never asks for: staged, then contradicted, then discarded.
+    mispredicted = ToolCall("charge_card", {"customer_id": "cus-1", "amount": 99.0})
+
+    async def arm(*, speculation: bool, db: str) -> tuple[RunResult, World]:
+        world = standard_world()
+        registry = registry_for(world)
+        journal = Journal(tmp_path / db)
+        scheduler = Scheduler(
+            graph=OneTurnGraph(),  # type: ignore[arg-type]
+            registry=registry,
+            journal=journal,
+            buffer=StoreBuffer(journal=journal, run_id=""),
+            dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+            target=JournaledModel(
+                ScriptedModel(turns=[tool_turn(*turn, turn=0)], block_delay_ms=25.0),
+                journal,
+                provider="scripted",
+            ),
+            policy=Policy(speculation=speculation),
+            predictor=FixedDrafter(mispredicted) if speculation else None,
+        )
+        return await scheduler.run(new_ulid(), {}), world
+
+    off, off_world = await arm(speculation=False, db="wrong-off.db")
+    on, on_world = await arm(speculation=True, db="wrong-on.db")
+    assert off.ok and on.ok, on.error
+
+    assert_equivalent(
+        off.ledger,
+        on.ledger,
+        off_world.mutations,
+        on_world.mutations,
+        expect_rows=1,
+        # One, not zero. The run must have squashed a branch that had already staged an effect,
+        # or this is the same vacuous comparison as every case above.
+        min_squashed_with_staged=1,
+    )
+    # And the contradicted write is nowhere in the world, which is the point of all of it.
+    assert [m.tool for m in on_world.mutations] == ["restart_job"]

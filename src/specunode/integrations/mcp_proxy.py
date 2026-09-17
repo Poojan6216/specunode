@@ -7,7 +7,7 @@ writes.
 **The hard part is that the proxy cannot see the model.** It sees tool calls, not the decision
 that produced them, so it has no way to know whether a call it is holding was confirmed. The
 branch-resolution signal therefore has to arrive out of band: the client sends
-`notifications/specunode/decision`, or an operator runs `specunode retire` from a terminal.
+`notifications/specunode/decision`, or a second client call invokes the `specunode.retire` tool.
 
 That leads to the one genuinely awkward choice in this integration, and it is resolved by
 asking the client rather than by picking a default:
@@ -62,6 +62,15 @@ class ClientMode(Enum):
     #: Does not. A write blocks until a decision arrives, because handing this client a
     #: placeholder would put one in the next prompt where nothing can see it.
     BLOCKING = "blocking"
+
+
+#: How long a blocking client's write waits for a decision before giving up, in seconds.
+#:
+#: Generous, because the decision legitimately comes from outside the proxy and a model turn
+#: takes as long as it takes. Finite, because the alternative is what shipped: an unbounded wait
+#: in the default mode, which reads to an operator as a hung server rather than as a runtime
+#: doing exactly what it promised.
+DEFAULT_DECISION_DEADLINE_S = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,10 +205,21 @@ class ProxyState:
         Named ``deadline_s`` rather than ``timeout`` so it is not mistaken for asyncio's own
         cancellation timeout: a caller that gives up here has not cancelled the staged write,
         it is still held and still waiting for a decision.
+
+        **Bounded by default.** This used to default to waiting forever, in the proxy's default
+        mode, with the documented escape being a ``specunode retire`` CLI command that does not
+        exist -- and a single-threaded client blocked on the outstanding write call cannot issue
+        the ``specunode.retire`` tool that does. The default configuration therefore hung on the
+        first write with no working way out. It now gives up after
+        :data:`DEFAULT_DECISION_DEADLINE_S` and says so; the write stays held and unsent, which
+        is the safe side of the choice.
         """
         self._decided.clear()
         try:
-            await asyncio.wait_for(self._decided.wait(), deadline_s)
+            await asyncio.wait_for(
+                self._decided.wait(),
+                DEFAULT_DECISION_DEADLINE_S if deadline_s is None else deadline_s,
+            )
         except TimeoutError:
             return False
         return True

@@ -24,7 +24,7 @@ Means with 95% percentile-bootstrap intervals over trajectories.
 | **SpecuNode span past a write (calls)** | 0.0000 [0.0000, 0.0000] |
 | Model turn consuming a write's result | 0.9547 [0.9523, 0.9569] |
 
-Tier-1 predictability, leave-one-trajectory-out over 25 trajectories: top-1 0.5350, top-3 0.8369.
+Tier-1 **signature** predictability, leave-one-trajectory-out over 25 trajectories (not 300; this measure is quadratic): top-1 0.5350, top-3 0.8369. A signature is the tool name plus its sorted argument *keys*. Argument **values** are not compared, while the runtime releases a write only on exact canonical equality of values -- so this is an upper bound on the acceptance rate, not the acceptance rate. It is published without an interval because it is a single leave-one-out pass.
 
 #### The anti-result, first
 
@@ -38,7 +38,7 @@ That is the shape spec section 1 predicts gains nothing, and it is 95.5% of this
 
 A different quantity, and the one that is not zero. PASTE excludes a tool with side effects from speculation entirely, so it can speculate on 4.5% of steps. SpecuNode stages a write instead of refusing it, so a *predicted* write can be run ahead like any other call and discarded if the model decides otherwise — which covers the other 95.5%.
 
-That is an upper bound on opportunity, not a speedup. It is realisable only where the predictor is right, which here is 53.5% at top-1. Neither number means anything alone, which is why they are printed together.
+That is an upper bound on opportunity, not a speedup. It is realisable only where the predictor is right. The nearest measured proxy is signature top-1 at 53.5%, which is an upper bound on that and not a measurement of it. Neither number means anything alone, which is why they are printed together.
 
 ---
 

@@ -114,7 +114,13 @@ def test_the_store_buffer_opportunity_is_reported_next_to_the_predictor(tmp_path
     staged = opportunity["steps_paste_must_skip_that_specunode_can_stage"]["mean"]  # type: ignore[index]
     reads = opportunity["read_fraction"]["mean"]  # type: ignore[index]
     assert abs((staged + reads) - 1.0) < 1e-9, "every step is either a read or a stageable write"
-    assert opportunity["predictability"]["top_1"] >= 0.0  # type: ignore[index]
+    signature = opportunity["signature_predictability"]  # type: ignore[index]
+    assert signature["top_1"] >= 0.0
+    # The name and the disclaimer travel with the number, because this was published as "the
+    # acceptance rate" while measuring a strictly weaker relation than the one that releases
+    # a write.
+    assert signature["is_upper_bound_on_acceptance"] is True
+    assert "values are not compared" in signature["relation"].lower()
 
 
 def test_results_md_regenerates_identically() -> None:

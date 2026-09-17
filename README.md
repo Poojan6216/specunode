@@ -102,8 +102,13 @@ be run ahead like any other call and discarded if the model decides otherwise. T
 other 95.5%.
 
 That is an upper bound on opportunity, not a speedup. It is realisable only where the predictor
-is right, which here is 53.5% at top-1 and 83.7% at top-3. Neither number means anything on its
-own, which is why they are never quoted apart.
+is right, and **how often the predictor is right has not been measured.** The nearest thing
+measured here is *signature* accuracy — the right tool with the right argument *names*, ranked
+top-1 for 53.5% of steps and top-3 for 83.7%. The runtime releases a write only on exact
+canonical equality of argument **values**, and half this corpus is `execute_bash` with a
+free-form command string. So 53.5% is an upper bound on the acceptance rate and is not the
+acceptance rate; it is also a single leave-one-out pass over 25 trajectories rather than 300,
+and is published without an interval for that reason.
 
 No wall-clock figure appears anywhere in this repository. The online latency benchmark needs an
 API key and has not been run.

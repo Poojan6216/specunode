@@ -157,7 +157,21 @@ def staged_not_skipped(trace: Sequence[Step]) -> float:
 
 
 def predictability(traces: Sequence[Sequence[Step]], top_k: int) -> float:
-    """Leave-one-trace-out top-k accuracy of an order-2 index over tool signatures."""
+    """Leave-one-trace-out top-k accuracy of an order-2 index over tool *signatures*.
+
+    **This is not the runtime's acceptance rate, and it is an upper bound on it.** A signature
+    is ``name(sorted argument keys)``: values are dropped by construction, here and in
+    ``signature_of``. What releases a write at run time is ``decisions_equal`` -- exact
+    canonical equality over argument *values* -- and ``PatternDrafter`` withholds a prediction
+    whose values it cannot fill at all. On this corpus half the calls are ``execute_bash`` with
+    a free-form ``command`` string and roughly a fifth carry an argument copied from a prior
+    result; this measurement examines none of that.
+
+    So a hit here means "the right tool with the right argument names would have been ranked in
+    the top k", which is strictly weaker than "the branch would have retired". The number is
+    reported under a name that says so, and every document that quotes it says so too. It was
+    for a while published as "the acceptance rate", which it is not.
+    """
     from specunode.core.decision import ToolCall
     from specunode.drafters.t1_pattern import PatternIndex
 
@@ -215,7 +229,11 @@ def measure(traces: Sequence[Sequence[Step]], predict_sample: int) -> dict[str, 
         "steps_paste_must_skip_that_specunode_can_stage": stat(staged_not_skipped),
         "specunode_post_write_span": stat(specunode_post_write_span),
         "model_turn_consuming_a_write_result": stat(model_turn_consumes_write),
-        "predictability": {
+        # Named for the relation it actually measures. "predictability" read as though it were
+        # the rate at which the runtime accepts a prediction; it is an upper bound on that.
+        "signature_predictability": {
+            "relation": "tool name + sorted argument keys; argument VALUES are not compared",
+            "is_upper_bound_on_acceptance": True,
             "sampled_trajectories": len(sample),
             "top_1": round(predictability(sample, 1), 4),
             "top_3": round(predictability(sample, 3), 4),
@@ -366,8 +384,9 @@ def main(argv: list[str] | None = None) -> int:
     ):
         s = o[key]
         print(f"  {label:<38} {s['mean']:>8.4f}  [{s['ci95_low']:.4f}, {s['ci95_high']:.4f}]")
-    p = o["predictability"]
-    print(f"  {'T1 top-1 / top-3':<38} {p['top_1']:>8.4f}  / {p['top_3']:.4f}")
+    p = o["signature_predictability"]
+    print(f"  {'T1 SIGNATURE top-1 / top-3':<38} {p['top_1']:>8.4f}  / {p['top_3']:.4f}")
+    print(f"  {'':38}  (an upper bound on acceptance; values not compared)")
     print()
     return 0
 

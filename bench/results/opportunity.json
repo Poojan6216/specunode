@@ -34,15 +34,17 @@
       "ci95_low": 0.0438,
       "mean": 0.0462
     },
-    "predictability": {
-      "sampled_trajectories": 25,
-      "top_1": 0.535,
-      "top_3": 0.8369
-    },
     "read_fraction": {
       "ci95_high": 0.0469,
       "ci95_low": 0.0423,
       "mean": 0.0445
+    },
+    "signature_predictability": {
+      "is_upper_bound_on_acceptance": true,
+      "relation": "tool name + sorted argument keys; argument VALUES are not compared",
+      "sampled_trajectories": 25,
+      "top_1": 0.535,
+      "top_3": 0.8369
     },
     "specunode_post_write_span": {
       "ci95_high": 0.0,

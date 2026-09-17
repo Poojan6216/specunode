@@ -337,7 +337,10 @@ def mcp_proxy(
 
     Reads are forwarded immediately. Everything else is held. Because the proxy cannot see the
     model, the decision arrives out of band -- from a client that reports it, or from
-    ``specunode retire``.
+    a second call to the proxy's own ``specunode.retire`` tool. That needs a client which can
+    issue one while a write is outstanding; a single-threaded client blocked on the write
+    cannot, and its call gives up after the proxy's decision deadline with the write still
+    held and unsent.
     """
     import asyncio
     import shlex

@@ -76,9 +76,15 @@ def opportunity_section() -> str:
         "| Model turn consuming a write's result | "
         f"{ci(o['model_turn_consuming_a_write_result'])} |",
         "",
-        f"Tier-1 predictability, leave-one-trajectory-out over "
-        f"{o['predictability']['sampled_trajectories']} trajectories: "
-        f"top-1 {o['predictability']['top_1']:.4f}, top-3 {o['predictability']['top_3']:.4f}.",
+        f"Tier-1 **signature** predictability, leave-one-trajectory-out over "
+        f"{o['signature_predictability']['sampled_trajectories']} trajectories "
+        f"(not {o['trajectories']}; this measure is quadratic): "
+        f"top-1 {o['signature_predictability']['top_1']:.4f}, "
+        f"top-3 {o['signature_predictability']['top_3']:.4f}. "
+        "A signature is the tool name plus its sorted argument *keys*. Argument **values** are "
+        "not compared, while the runtime releases a write only on exact canonical equality of "
+        "values -- so this is an upper bound on the acceptance rate, not the acceptance rate. "
+        "It is published without an interval because it is a single leave-one-out pass.",
         "",
         "#### The anti-result, first",
         "",
@@ -104,7 +110,9 @@ def opportunity_section() -> str:
         f"{o['steps_paste_must_skip_that_specunode_can_stage']['mean']:.1%}.",
         "",
         "That is an upper bound on opportunity, not a speedup. It is realisable only where the "
-        f"predictor is right, which here is {o['predictability']['top_1']:.1%} at top-1. "
+        f"predictor is right. The nearest measured proxy is signature top-1 at "
+        f"{o['signature_predictability']['top_1']:.1%}, which is an upper bound on that and "
+        "not a measurement of it. "
         "Neither number means anything alone, which is why they are printed together.",
         "",
     ]
