@@ -1,0 +1,224 @@
+{
+  "acceptance": {
+    "across_turns": {
+      "acceptance_given_offered": 0.0002,
+      "acceptance_rate": 0.0002,
+      "acceptance_rate_by_trajectory": {
+        "ci95_high": 0.0004,
+        "ci95_low": 0.0,
+        "mean": 0.0002
+      },
+      "accepted": 3,
+      "by_argument_provenance": {
+        "does_not": {
+          "acceptance_given_offered": 0.0002,
+          "acceptance_rate": 0.0002,
+          "accepted": 3,
+          "offered": 15105,
+          "steps": 15243
+        },
+        "references_a_prior_result": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 3683,
+          "steps": 3941
+        }
+      },
+      "by_effect": {
+        "read": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 544,
+          "steps": 550
+        },
+        "write": {
+          "acceptance_given_offered": 0.0002,
+          "acceptance_rate": 0.0002,
+          "accepted": 3,
+          "offered": 18244,
+          "steps": 18634
+        }
+      },
+      "by_tool": {
+        "execute_bash": {
+          "acceptance_given_offered": 0.0002,
+          "acceptance_rate": 0.0002,
+          "accepted": 2,
+          "offered": 9791,
+          "steps": 9836
+        },
+        "finish": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 258,
+          "steps": 263
+        },
+        "str_replace_editor": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 7943,
+          "steps": 8271
+        },
+        "task_tracker": {
+          "acceptance_given_offered": 0.004,
+          "acceptance_rate": 0.0038,
+          "accepted": 1,
+          "offered": 252,
+          "steps": 264
+        },
+        "think": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 544,
+          "steps": 550
+        }
+      },
+      "offered": 18788,
+      "offered_rate": 0.9794,
+      "realisable_write_speculation": 0.0002,
+      "signature_top1": 0.5339,
+      "squashed_at_turn_end": 0,
+      "steps": 19184
+    },
+    "copying_ceiling": {
+      "every_argument_value_seen_before": 1887,
+      "rate": 0.0984,
+      "rate_previous_call": 0.0011,
+      "rate_whole_call": 0.0879,
+      "relation": "a predictor that can only copy argument values out of earlier calls cannot be exactly right more often than rate",
+      "steps": 19184,
+      "whole_call_is_the_previous_call": 22,
+      "whole_call_seen_before": 1687
+    },
+    "predictor": {
+      "drafter": "PatternDrafter top_k=1, require_complete_args=True, no tool results",
+      "grader": "specunode.verify.gate.resolve_decision",
+      "index": "order-2 PatternIndex, leave-one-trajectory-out over every trajectory"
+    },
+    "runtime_policy": "within_turn",
+    "trajectories": 300,
+    "within_turn": {
+      "acceptance_given_offered": 0.0,
+      "acceptance_rate": 0.0,
+      "acceptance_rate_by_trajectory": {
+        "ci95_high": 0.0,
+        "ci95_low": 0.0,
+        "mean": 0.0
+      },
+      "accepted": 0,
+      "by_argument_provenance": {
+        "does_not": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 14642,
+          "steps": 15243
+        },
+        "references_a_prior_result": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 3646,
+          "steps": 3941
+        }
+      },
+      "by_effect": {
+        "read": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 544,
+          "steps": 550
+        },
+        "write": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 17744,
+          "steps": 18634
+        }
+      },
+      "by_tool": {
+        "execute_bash": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 9674,
+          "steps": 9836
+        },
+        "finish": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 253,
+          "steps": 263
+        },
+        "str_replace_editor": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 7605,
+          "steps": 8271
+        },
+        "task_tracker": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 212,
+          "steps": 264
+        },
+        "think": {
+          "acceptance_given_offered": 0.0,
+          "acceptance_rate": 0.0,
+          "accepted": 0,
+          "offered": 544,
+          "steps": 550
+        }
+      },
+      "offered": 18288,
+      "offered_rate": 0.9533,
+      "realisable_write_speculation": 0.0,
+      "signature_top1": 0.0,
+      "squashed_at_turn_end": 18288,
+      "steps": 19184
+    }
+  },
+  "alignment": {
+    "dropped_misaligned": 0,
+    "dropped_missing_values": 0,
+    "duplicate_ids_in_sidecar": 0,
+    "joined": 300,
+    "trajectories_in_corpus": 300
+  },
+  "corpus": {
+    "corpus_hash": "377ffc8aeefb002c2350032d5918a69f5f844c9b330a89e88b07615d140b6117",
+    "dataset": "nebius/SWE-rebench-openhands-trajectories",
+    "source": "huggingface",
+    "steps": 19484,
+    "tools": [
+      "execute_bash",
+      "finish",
+      "str_replace_editor",
+      "task_tracker",
+      "think"
+    ],
+    "trajectories": 300
+  },
+  "values": {
+    "corpus_hash": "377ffc8aeefb002c2350032d5918a69f5f844c9b330a89e88b07615d140b6117",
+    "dataset": "nebius/SWE-rebench-openhands-trajectories",
+    "inline_bytes": 64,
+    "matches_committed_corpus": true,
+    "source": "huggingface",
+    "steps": 19484,
+    "trajectories": 300,
+    "values": 36068,
+    "values_digested": 17586,
+    "values_hash": "9789e25dea97c29c06993b1360bbb6c9dc4cbe8a3815c4bf7404d40ee8190f92"
+  }
+}

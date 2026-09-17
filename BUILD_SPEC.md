@@ -684,7 +684,7 @@ Goal: the runtime runs ahead, and everything it runs ahead is either confirmed e
 Goal: a developer who cannot change their agent's code still gets the store buffer.
 
 - [x] **4.1 Proxy skeleton.** `specunode mcp-proxy --upstream "<cmd>" --config specunode.yaml`; stdio; forwards `initialize`, `tools/list` (annotations passed through, overrides applied), and everything not tool-related unchanged.
-  *Verify:* a reference MCP client lists tools through the proxy and sees the upstream's list with effect-class annotations merged from config.
+  *Verify:* a reference MCP client lists tools through the proxy and sees the upstream's list with its annotations passed through unchanged; the proxy classifies each tool from those annotations with the config's overrides winning, and the end-to-end test proves a tool the upstream marks `readOnlyHint: true`, with no override anywhere, is forwarded as a read.
 - [x] **4.2 `tools/call` interception.** READ → forwarded upstream immediately, result journaled. WRITE/COMPENSABLE/IRREVERSIBLE → staged in the run's current branch; the proxy returns the placeholder handle *as the tool result* with `isError=false` and a structured `_specunode: {staged: true, effect_id}` field; drained on retirement.
   *Verify:* a scripted client issues read, write, read; the upstream receives the two reads immediately and the write only after the proxy receives the `specunode/retire` notification (below).
 - [x] **4.3 Decision boundary over MCP.** The proxy cannot see the model, so branch resolution needs a signal: the client sends `notifications/specunode/decision` with the step's actual `Decision` (the LangGraph and plain integrations do this automatically; for a foreign client, `specunode retire <run_id> --step N --decision <json>` does it from a terminal). Until a decision arrives, staged writes stay staged and the proxy's `status` tool says so.
@@ -733,6 +733,8 @@ Goal: numbers, with the negative ones first.
 - [x] **6.5 Overhead.** Journaling + classification overhead of `B_seq` vs the same graph on vanilla LangGraph with no SpecuNode, same `ReplayModel`. Reported as absolute ms per step and as a fraction of wall clock.
   *Verify:* `bench/results/overhead.json`.
 - [x] **6.6 Report generation.** `bench/report.py` → `RESULTS.md`; `bench/plots/make_plots.py` → PNGs; `bench/check_numbers.py` enforces README traceability.
+- [x] **6.7 Acceptance rate, measured.** `bench/corpus/fetch.py --values` writes the argument values the committed corpus drops to a sidecar (`values.json`, digests over 64 canonical bytes; the corpus and its hash untouched). `bench/offline/run_acceptance.py` grades `PatternDrafter` with `resolve_decision` — the runtime's own gate — leave-one-trajectory-out over every trajectory, under the runtime's within-turn policy and the across-turns policy it does not implement, next to the copying ceiling (steps whose argument values have all been seen before). Output `bench/results/acceptance.json`; `RESULTS.md` and the README quote it and never the signature figure alone.
+  *Verify:* leave-one-out by subtraction equals retraining; a right signature with a wrong value is a miss; a guess at a turn boundary is a miss within a turn and a hit across turns; the drafter sees only the turn's calls within a turn; acceptance never exceeds signature accuracy or the copying ceiling; the committed numbers regenerate identically.
   *Verify:* `RESULTS.md` regenerates identically from committed JSON; CI fails on a planted untraceable number.
 
 **Phase Gate 6:** opportunity + latency + overhead results committed with CIs; `RESULTS.md` generated; the anti-results (workloads where speculation buys ≤ 5% or is disabled by policy) are in the README with the same prominence as the wins.
@@ -749,7 +751,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 - [x] **7.4 Non-idempotent tool with duplicate delivery.** `world.duplicate_delivery` on a tool declared `idempotent=False`. Measure: duplicates reaching the world with vs without the dedupe table; document that dedupe protects the *dispatcher's* retries, not the network beyond it.
 - [x] **7.5 Return-value laundering.** A branch copies a placeholder handle into free text and a later tool receives it inside a string. Measure: does hazard analysis catch placeholders embedded in strings, in nested arrays, base64-encoded? Report the miss rate; fix what can be fixed (substring scan of canonical args), document what cannot (encoded).
 - [x] **7.6 Prompt-injected tool call.** A READ result contains text instructing the model to call `send_email`. The drafter (T1) predicts it; the target model does not emit it. Measure: 0 dispatches expected (it is a squash). Then the target model *does* emit it: it dispatches, because SpecuNode is not an authorization layer — the README says so and points to SCOPEGATE-style per-call policy as the missing piece.
-- [x] **7.7 Drafter poisoning.** Train the T1 index on traces with an adversarial "strong chain" that ends in a write. Measure: wasted tokens and stall/squash counts; assert leaks stay 0.
+- [x] **7.7 Drafter poisoning.** Train the T1 index on traces with an adversarial "strong chain" that ends in a write, and run it inside the real scheduler. Measure: guesses forked, charges staged and discarded, the alpha gate closing and its closure journaled, wasted tokens (zero, because a pattern-index guess costs no model tokens — reported as zero, not invented); assert leaks stay 0.
 - [x] **7.8 Replay under model drift.** Replay a journal after changing the system prompt by one token, and after changing the tool list. Measure: step of first `ReplayDivergence`. Expected: step 1 in both cases.
 - [x] **7.10 Asynchronous side effect behind a READ.** A tool declared READ whose synchronous response is `{"status": "queued", "job_id": …}` and whose upstream enqueues a background job that writes and notifies. The branch is squashed; the job runs anyway. Measure: leaked effects per squashed branch. Expected non-zero. Document: *a tool that enqueues, schedules or triggers anything asynchronously is not a READ, whatever its HTTP verb.*
 - [x] **7.9 Speculation past an IRREVERSIBLE with `stage_irreversible=true`.** Measure the latency gain and show the ledger row that says an irreversible effect was retired on a decision the model made — correct, but the docs must say the default is off and why.
@@ -1001,6 +1003,12 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [4.x] DEFECT (fixed): the SDK parses a call's arguments against a model built from the function *signature*, not from the advertised schema, so a bare **kwargs forwarder advertised the upstream's schema and then rejected every call made against it. The forwarder is now given the upstream's parameter names, typed Any — the upstream is the authority on its own argument types and re-deriving Python types from JSON Schema would invent disagreements. — 2026-09-16
 [4.x] DEFECT (fixed): the first forwarded read hung. MCPServer.run('stdio') opens its own event loop, so the served tools ran on one loop and the upstream ClientSession on another, and awaiting the session from the wrong loop deadlocked. run_stdio_async keeps them on one. The startup probe now checks for each SDK surface these fixes depend on. — 2026-09-16
 [4.x] Four defects in a row, none visible to a rules-only test suite. The split — rules tested without a transport, because the rules carry the correctness claims and the SDK does not — is defensible right up until it is the only thing tested. — 2026-09-16
+[3.6] DEFECT (fixed): Hard Rule 10 was dead code. Budget.record_resolution, record_speculative_read, inflight_branches, disable and the alpha window were written, unit-tested and documented, and the scheduler called none of them — the gate opened and closed on a window that never received a sample, wasted_tokens was 0 on every run, and the "speculation disabled" policy_event could not be emitted. Wired at fork, confirm, squash and execute_read; every resolution journals alpha_observed; the gate closing journals speculation_disabled once and the counters say why; a Prediction carries cost_tokens and tier 2 fills it from the draft model's usage; run_started carries the whole alpha configuration; the ledger renders "unjudged (h/n graded)" while the window fills instead of "n/a". Each fix verified by reverting it and watching its test fail first. — 2026-09-17
+[4.1] DEFECT (fixed): the proxy passed upstream annotations through to the client and never consulted them, so a tool the upstream marked readOnlyHint: true was synthesised as an unknown WRITE and held until a decision arrived. ToolRegistry.from_mcp_tools existed for exactly this and was called only by its own tests; the spec's "or rely on MCP tool annotations" was false. serve() now classifies from the annotations with the config's overrides winning; the reference upstream gained an annotated read-only tool with no override and the end-to-end test proves it is forwarded. — 2026-09-17
+[6.7] The acceptance rate, measured. fetch.py --values fetches the same 300 trajectories and writes the argument values the committed corpus drops to a sidecar (values over 64 canonical bytes stored as digests, which preserve equality and nothing else; the corpus and its hash untouched, and the sidecar's manifest records that the rows served today still hash to the committed corpus). run_acceptance.py grades PatternDrafter with resolve_decision, leave-one-trajectory-out by subtraction — exact and linear, a test proves it equals retraining — under the runtime's within-turn policy and the across-turns policy it does not implement. Result: 0.0000 and 0.0002 (3 of 19,184); signature top-1 0.5339 on the same steps; every argument value already seen at 0.0984 of steps, the ceiling for any copying predictor. — 2026-09-17
+[6.7] Decision: the drafter's history at run time is the current turn's calls, and this corpus emits one call per turn, so the runtime's own acceptance rate here is zero by construction rather than by prediction quality. Carrying a guess across turns was measured rather than built: it would raise the figure to 0.0002, which does not justify a change to the scheduler. — 2026-09-17
+[6.7] Decision: a first draft defined the copying ceiling as "the whole call already occurred" and the fixture refuted it — the drafter correctly assembled a call nobody had made yet from a value it had seen. The ceiling is "every argument value already seen"; whole-call repeats are reported beside it as the stricter figure. — 2026-09-17
+[7.7] Attack 7.7 now runs the poisoned drafter inside the real scheduler instead of hand-driving a Budget with an invented 250 tokens per squash. What is measured is what the runtime did: 4 guesses forked, 4 charges staged and discarded, the alpha gate closed after its 4-sample window filled with misses and the closure journaled 1 time, wasted_tokens 0 because a pattern-index guess costs no model tokens, leaked effects 0. The previous row's wasted_tokens=2000 was arithmetic, not a measurement. A first cut counted every branch_forked and every branch_resolved{confirmed}, which include the canonical branch of each node visit; guesses are now counted from resolutions that name an adopter. — 2026-09-17
 ```
 
 ---
@@ -1060,6 +1068,7 @@ Measured on 300 real OpenHands trajectories from `nebius/SWE-rebench-openhands-t
 | Steps PASTE must skip that SpecuNode can stage | 0.9555 [0.9531, 0.9577] |
 | Calls that open a new model turn | 1.0000 [1.0000, 1.0000] |
 | T1 **signature** accuracy (upper bound on acceptance), n=25 | top-1 0.5350, top-3 0.8369 |
+| **T1 acceptance rate**, the gate's own verdict, n=300 (added 2026-09-17) | **0.0000** under the runtime's within-turn policy; **0.0002** with guesses carried across turns (3 of 19,184); signature top-1 on the same steps 0.5339; copying ceiling 0.0984 |
 
 **The second row is the headline and it is zero.** Every tool call in that corpus opens a new
 model turn, and a staged write blocks the next *turn* because that turn would have to contain a
@@ -1075,6 +1084,16 @@ is the calls within the current turn, so a one-call-per-turn workload offers it 
 predict from at all — it is not that speculation is unprofitable there, it is that no prediction
 can be formed.
 
+**The sixth row was added on 2026-09-17, and it closes the question the Final Report below left
+open.** The acceptance rate is measured now — the real drafter graded by the real gate on the
+same corpus joined to its argument values (`bench/offline/run_acceptance.py`) — and it is
+0.0002 at best and 0.0000 under the runtime's own policy. Signature accuracy
+was never the number: the gate needs the exact command string, path or thought, and every
+argument value of a call has already appeared earlier at only 9.8% of steps, which is the
+ceiling for any predictor that copies values out of history. On this corpus the tier-1 predictor
+as built is worth nothing, no copying predictor can exceed that ceiling, and the case for the
+store buffer rests on a predictor that generates values, which needs an API key to measure.
+
 **The second headline number does not exist.** There is no wall-clock figure in this repository
 for a real model, because the online latency benchmark has not been run. Demo 2 measures wall
 clock against a scripted model and prints what it measures; nothing from it is quoted here or in
@@ -1085,6 +1104,9 @@ unmeasured.
 
 - **Past-write speculation: 0.0000 span.** 95.5% of the corpus is the
   `model → write → model(reads the result)` shape that gains nothing from it.
+- **Tier-1 acceptance rate: 0.0002 across turns, 0.0000 within.** 3 of 19,184
+  guesses would have retired; the copying ceiling is 0.0984. Signature accuracy was an
+  upper bound, and a loose one.
 - **Break-even α: not measured.** It is the α at which the speculative arm's wall clock equals
   the sequential arm's, and wall clock against a real model has not been measured. `alpha_floor`
   defaults to `None` — the gate is inactive rather than set to a guessed number.
@@ -1417,3 +1439,12 @@ for itself is the acceptance rate, and it is **not measured anywhere in this rep
 0.5350 figure is signature accuracy — right tool, right argument names — while the gate compares
 argument values exactly. Measuring the real thing is a prediction problem, not a runtime one,
 and it is the first number I would go and get.
+
+**Addendum, 2026-09-17 — that number has been got, and it is zero.**
+`bench/offline/run_acceptance.py` grades the tier-1 drafter with the runtime's own gate over all
+300 trajectories joined to their argument values: 0.0002 with guesses carried across
+turns, 0.0000 under the policy the runtime runs, against a copying ceiling of 0.0984. The
+paragraph above stands as written; its recommendation has been carried out, and the result is
+the strongest negative result in this repository. On this corpus the tier-1 predictor as built
+is worth nothing, no predictor that copies values can exceed 9.8%, and the case for the
+store buffer now rests entirely on a predictor that generates values, which is unmeasured.

@@ -113,6 +113,11 @@ This is not a corner case. It is 1.0000 of the tool calls in the offline corpus,
 the measured speculable span past a write is 0.0000 there. Two of the three sample apps have
 that shape deliberately, so the test suite keeps resembling the thing it is a model of.
 
+Measured directly (`RESULTS.md`, "The acceptance rate, measured"): under this policy no tier-1
+guess on that corpus can ever be resolved, and carrying guesses across turns — which the runtime
+does not do — would confirm three of them. The limit is the corpus's turn shape and, behind it,
+the fact that a tier-1 guess can only copy values it has already seen.
+
 ## Two of the three sample apps route around speculation entirely
 
 `support_agent` and `research_agent` call the model directly and then issue each tool

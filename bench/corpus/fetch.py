@@ -9,6 +9,13 @@ Only the **normalised** form is committed: per trajectory, the ordered sequence 
 opportunity analysis reads, it is a few hundred kilobytes rather than gigabytes, and it makes
 the analysis reproducible without a network.
 
+Argument **values** are dropped from that form on purpose, and they are exactly what the
+acceptance measurement needs: the runtime releases a write only on exact canonical equality of
+values, so a corpus without them can bound the acceptance rate and cannot measure it.
+``--values`` fetches the same rows again and writes the values to a sidecar, ``values.json``,
+step for step alongside the committed corpus, with any value longer than ``VALUE_INLINE_BYTES``
+replaced by a digest. The committed corpus, and every number derived from it, keeps its hash.
+
 Decision Gate D1: if the dataset is unavailable, ``--fallback`` generates traces from the
 sample apps instead, and the manifest records which arm produced the corpus so the README can
 say so.
@@ -27,12 +34,33 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from specunode.canonical import canonical, chash_bytes
+from specunode.canonical import CanonicalError, canonical, chash_bytes
 
 DATASET = "nebius/SWE-rebench-openhands-trajectories"
 ROWS_URL = "https://datasets-server.huggingface.co/rows"
 PAGE = 100
 HERE = Path(__file__).resolve().parent
+
+#: Argument values whose canonical form is longer than this are stored as a digest. The tier-1
+#: drafter copies a value verbatim from history or does not offer the call at all, so equality
+#: is the only property of a value the acceptance measurement uses -- and a digest preserves
+#: equality exactly while keeping 19,000 steps of shell commands and file contents at a size
+#: that can be committed.
+VALUE_INLINE_BYTES = 64
+
+
+def reduce_value(value: Any) -> Any:
+    """A value as the sidecar stores it: itself when short, ``{"$hash": ...}`` when long."""
+    try:
+        body = canonical(value)
+    except CanonicalError:
+        # A value with no canonical form (a NaN, say) could not be compared by the gate
+        # either. Its digest stands in for it, so the step is kept and the value still equals
+        # itself and nothing else.
+        body = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+    if len(body) <= VALUE_INLINE_BYTES:
+        return value
+    return {"$hash": chash_bytes(body)}
 
 
 @dataclass
@@ -77,7 +105,13 @@ def _fetch_page(offset: int, length: int) -> list[dict[str, Any]]:
 
 def normalise(row: dict[str, Any]) -> Trace:
     """Reduce one trajectory to its tool-call sequence."""
+    return normalise_with_values(row)[0]
+
+
+def normalise_with_values(row: dict[str, Any]) -> tuple[Trace, list[dict[str, Any]]]:
+    """The committed shape, plus the argument values it drops, step for step."""
     trace = Trace(trajectory_id=str(row.get("trajectory_id", "")), repo=str(row.get("repo", "")))
+    arg_values: list[dict[str, Any]] = []
     seen_results: list[str] = []
     turn = -1
     for message in row.get("trajectory") or []:
@@ -111,21 +145,36 @@ def normalise(row: dict[str, Any]) -> Trace:
                     ordinal=ordinal,
                 )
             )
-    return trace
+            arg_values.append({key: reduce_value(args[key]) for key in sorted(args)})
+    return trace, arg_values
 
 
 def fetch(limit: int, seed_offset: int = 0) -> list[Trace]:
+    return fetch_with_values(limit, seed_offset)[0]
+
+
+def fetch_with_values(
+    limit: int, seed_offset: int = 0
+) -> tuple[list[Trace], list[list[dict[str, Any]]]]:
+    """The same rows ``fetch`` reads, with each trajectory's argument values alongside."""
     traces: list[Trace] = []
+    values: list[list[dict[str, Any]]] = []
+    fetched = 0
     offset = seed_offset
-    while len(traces) < limit:
-        want = min(PAGE, limit - len(traces))
+    while fetched < limit:
+        want = min(PAGE, limit - fetched)
         rows = _fetch_page(offset, want)
         if not rows:
             break
-        traces.extend(normalise(row) for row in rows)
+        for row in rows:
+            trace, step_values = normalise_with_values(row)
+            if trace.steps:
+                traces.append(trace)
+                values.append(step_values)
+        fetched += len(rows)
         offset += want
-        print(f"  fetched {len(traces)}/{limit}", file=sys.stderr)
-    return [t for t in traces if t.steps]
+        print(f"  fetched {fetched}/{limit}", file=sys.stderr)
+    return traces, values
 
 
 def fallback_traces() -> list[Trace]:
@@ -170,11 +219,74 @@ def write_corpus(traces: list[Trace], source: str, out: Path) -> dict[str, Any]:
     return manifest
 
 
+def write_values(
+    traces: list[Trace], values: list[list[dict[str, Any]]], source: str, out: Path
+) -> dict[str, Any]:
+    """Write the values sidecar as canonical bytes, and say whether it lines up with the corpus.
+
+    The manifest carries the hash of the corpus these values were cut from, computed the way
+    ``write_corpus`` computes it. It equals the committed manifest's hash exactly when the
+    dataset served the same rows in the same order -- and the acceptance measurement checks the
+    alignment again, per trajectory and per step, when it loads.
+    """
+    dataset = DATASET if source == "huggingface" else "examples/*"
+    payload = {
+        "source": source,
+        "dataset": dataset,
+        "inline_bytes": VALUE_INLINE_BYTES,
+        "trajectories": [
+            {"trajectory_id": trace.trajectory_id, "steps": step_values}
+            for trace, step_values in zip(traces, values, strict=True)
+        ],
+    }
+    body = canonical(payload)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(body)
+
+    corpus_hash = chash_bytes(
+        canonical({"source": source, "dataset": dataset, "traces": [asdict(t) for t in traces]})
+    )
+    manifest_path = out.parent / "manifest.json"
+    committed = (
+        json.loads(manifest_path.read_text(encoding="utf-8")).get("corpus_hash")
+        if manifest_path.is_file()
+        else None
+    )
+    digested = sum(
+        1
+        for steps in values
+        for step in steps
+        for value in step.values()
+        if isinstance(value, dict) and set(value) == {"$hash"}
+    )
+    manifest = {
+        "source": source,
+        "dataset": dataset,
+        "trajectories": len(traces),
+        "steps": sum(len(steps) for steps in values),
+        "values": sum(len(step) for steps in values for step in steps),
+        "values_digested": digested,
+        "inline_bytes": VALUE_INLINE_BYTES,
+        "values_hash": chash_bytes(body),
+        "corpus_hash": corpus_hash,
+        "matches_committed_corpus": committed is not None and committed == corpus_hash,
+    }
+    (out.parent / "values_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return manifest
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Fetch the offline trace corpus")
     parser.add_argument("--limit", type=int, default=300)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--fallback", action="store_true", help="skip the network (D1)")
+    parser.add_argument(
+        "--values",
+        action="store_true",
+        help="fetch the same rows and write values.json beside the corpus, which is not rewritten",
+    )
     parser.add_argument("--verify-manifest", action="store_true")
     parser.add_argument("--out", type=Path, default=HERE / "traces.json")
     args = parser.parse_args(argv)
@@ -192,6 +304,33 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"manifest verified: {manifest['trajectories']} trajectories, {manifest['steps']} steps"
         )
+        values_manifest = args.out.parent / "values_manifest.json"
+        values_path = args.out.parent / "values.json"
+        if values_manifest.is_file():
+            expected = json.loads(values_manifest.read_text(encoding="utf-8"))
+            if not values_path.is_file():
+                print("values_manifest.json is committed without values.json", file=sys.stderr)
+                return 1
+            got = chash_bytes(values_path.read_bytes())
+            if got != expected["values_hash"]:
+                print(f"values hash {got} != manifest {expected['values_hash']}", file=sys.stderr)
+                return 1
+            print(
+                f"values manifest verified: {expected['trajectories']} trajectories, "
+                f"{expected['values']} values ({expected['values_digested']} digested)"
+            )
+        return 0
+
+    if args.values:
+        if args.fallback:
+            print("--values needs the dataset; the fallback corpus has no values", file=sys.stderr)
+            return 2
+        traces, values = fetch_with_values(args.limit, args.offset)
+        manifest = write_values(traces, values, "huggingface", args.out.parent / "values.json")
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        if not manifest["matches_committed_corpus"]:
+            print("the rows served today are not the committed corpus", file=sys.stderr)
+            return 1
         return 0
 
     if args.fallback:

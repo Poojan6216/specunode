@@ -122,6 +122,65 @@ def build_story(styles: Any) -> list[Any]:
             "top-1. Neither number means anything alone."
         )
 
+    # -- the acceptance rate, measured ------------------------------------------------------
+    para("The acceptance rate, measured", h2)
+    acceptance = load("acceptance.json")
+    if acceptance is None:
+        para("Not measured. Run <font face='Courier'>bench/offline/run_acceptance.py</font>.")
+    else:
+        a = acceptance["acceptance"]
+        within, across, ceiling = a["within_turn"], a["across_turns"], a["copying_ceiling"]
+        para(
+            "The signature figure is an upper bound; this is the quantity itself. The tier-1 "
+            "predictor, graded by the runtime's own gate on exact canonical equality of "
+            f"argument values, over all {a['trajectories']} trajectories joined to their "
+            "argument values, leave-one-trajectory-out. <b>within_turn</b> is the policy the "
+            "runtime runs; <b>across_turns</b> is what carrying a guess into the next model "
+            "turn would be worth."
+        )
+        table(
+            [
+                ["Measure", "within_turn", "across_turns"],
+                ["Steps graded", str(within["steps"]), str(across["steps"])],
+                [
+                    "Guesses offered",
+                    f"{within['offered_rate']:.4f}",
+                    f"{across['offered_rate']:.4f}",
+                ],
+                [
+                    "Acceptance rate, pooled",
+                    f"{within['acceptance_rate']:.4f}",
+                    f"{across['acceptance_rate']:.4f}",
+                ],
+                [
+                    "Acceptance rate, by trajectory",
+                    ci(within["acceptance_rate_by_trajectory"]),
+                    ci(across["acceptance_rate_by_trajectory"]),
+                ],
+                ["Confirmed guesses", str(within["accepted"]), str(across["accepted"])],
+                [
+                    "Signature top-1, same steps",
+                    f"{within['signature_top1']:.4f}",
+                    f"{across['signature_top1']:.4f}",
+                ],
+                [
+                    "Squashed at a turn boundary",
+                    str(within["squashed_at_turn_end"]),
+                    str(across["squashed_at_turn_end"]),
+                ],
+            ]
+        )
+        para(
+            f"<b>The tier-1 acceptance rate on this corpus is {across['acceptance_rate']:.4f} "
+            f"at best and {within['acceptance_rate']:.4f} under the runtime's own policy.</b> "
+            f"The index knows which tool comes next {across['signature_top1']:.1%} of the "
+            "time; the gate needs the exact command, path or thought. Every argument value of "
+            f"a call has already appeared earlier at {ceiling['rate']:.1%} of steps, which is "
+            "the ceiling for any predictor that copies values out of history, and this one is "
+            "far below it. Anything above the ceiling needs a predictor that generates values, "
+            "and that has not been measured."
+        )
+
     story.append(PageBreak())
 
     # -- what beats it ----------------------------------------------------------------------

@@ -101,14 +101,18 @@ steps — the reads. SpecuNode stages a write instead of refusing it, so a *pred
 be run ahead like any other call and discarded if the model decides otherwise. That covers the
 other 95.5%.
 
-That is an upper bound on opportunity, not a speedup. It is realisable only where the predictor
-is right, and **how often the predictor is right has not been measured.** The nearest thing
-measured here is *signature* accuracy — the right tool with the right argument *names*, ranked
-top-1 for 53.5% of steps and top-3 for 83.7%. The runtime releases a write only on exact
-canonical equality of argument **values**, and half this corpus is `execute_bash` with a
-free-form command string. So 53.5% is an upper bound on the acceptance rate and is not the
-acceptance rate; it is also a single leave-one-out pass over 25 trajectories rather than 300,
-and is published without an interval for that reason.
+That is an upper bound on opportunity, not a speedup. It is realisable only where the predictor is
+right, and **how often the predictor is right is now measured, and it is almost never.** *Signature*
+accuracy — the right tool with the right argument *names* — is 53.4% top-1 over all 300
+trajectories. The runtime releases a write only on exact canonical equality of argument **values**,
+and graded by that gate on the same steps, the tier-1 acceptance rate is **0.0002** with guesses
+carried across model turns (3 of 19,184) and **0.0000** under the policy the runtime actually runs,
+where every guess is squashed at the turn boundary because every call in this corpus opens a new
+turn. Nor is that a flaw this predictor could fix: every argument value of a call has already
+appeared in an earlier call at only 9.8% of steps, which is the ceiling for any predictor that
+copies values out of history, and half this corpus is `execute_bash` with a free-form command
+string. Anything above that ceiling has to come from a predictor that generates values — a draft
+model — and that has not been measured because it needs an API key.
 
 No wall-clock figure appears anywhere in this repository. The online latency benchmark needs an
 API key and has not been run.

@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from specunode.canonical import canonical
+from specunode.canonical import JsonValue, canonical
 from specunode.core.branch import Branch, BranchStatus
 from specunode.core.decision import ToolCall
 from specunode.core.effects import EffectClass, ToolRegistry, ToolSpec
@@ -366,69 +366,188 @@ async def attack_77_drafter_poisoning() -> AttackResult:
     """7.7 — train the pattern index on traces whose "strong chain" ends in a write.
 
     An adversary who can influence what the index learns can make it confidently predict a
-    write that the model never asks for. Every one of those is squashed, so nothing reaches the
-    world; what it costs is wasted tokens, wasted upstream reads and stalls. The measurement is
-    that cost, and the assertion is that leaks stay at zero.
-    """
-    from specunode.core.policy import Budget, Policy
-    from specunode.drafters.base import DraftContext
-    from specunode.drafters.t1_pattern import PatternDrafter, PatternIndex
-    from specunode.verify.gate import resolve_decision
+    write that the model never asks for. This runs the poisoned drafter inside the real
+    scheduler, so every number below is something the runtime did: each guess forked a branch,
+    staged the charge in the store buffer, and was squashed when the model's real block
+    arrived or the turn ended; the alpha gate closed once its window filled with misses; and
+    the remaining turns ran with no speculation at all.
 
-    # The adversarial "strong chain": a lookup that carries an amount, followed by a charge
-    # that consumes it. The amount has to be reachable from history or the drafter declines to
+    A pattern-index guess costs no model tokens, so ``wasted_tokens`` is genuinely zero here
+    and is reported as zero rather than as an invented per-guess charge. What a poisoned
+    index costs is the branches, the stagings that are thrown away, and the window's worth of
+    misses before the gate closes. What it cannot cost is an effect, and that is the assertion.
+    """
+    import tempfile
+    import time
+    from dataclasses import dataclass as _dataclass
+
+    from specunode.buffer.dispatcher import Dispatcher
+    from specunode.buffer.store_buffer import StoreBuffer
+    from specunode.core.decision import Decision
+    from specunode.core.graph import END, AdapterCapabilities, NextNode, NodeRef, RunSession
+    from specunode.core.model import JournaledModel, Message, RequestEnvelope, TextBlock
+    from specunode.core.policy import Budget, Policy
+    from specunode.core.scheduler import Scheduler
+    from specunode.drafters.t1_pattern import PatternDrafter, PatternIndex
+    from specunode.journal.journal import close_all_writers
+    from specunode.testing.models import ScriptedModel, tool_turn
+
+    turns = 6
+    window = 4
+
+    class _TurnsGraph:
+        """A node that hands the runtime one turn per visit and stops after ``turns``."""
+
+        def capabilities(self) -> AdapterCapabilities:
+            return AdapterCapabilities(drives_itself=False, framework="plain")
+
+        def nodes(self) -> list[NodeRef]:
+            return [NodeRef(name="agent")]
+
+        def decision_kind(self, node: NodeRef) -> str:
+            return "tool_call"
+
+        def next(self, state: object) -> NextNode:
+            done = isinstance(state, dict) and int(state.get("turns", 0)) >= turns
+            return END if done else NodeRef(name="agent")
+
+        async def run_node(self, node: NodeRef, session: RunSession) -> Decision:
+            assert session.call_turn is not None
+            await session.call_turn(
+                RequestEnvelope(
+                    model="scripted",
+                    messages=(Message(role="user", content=(TextBlock(text="decide"),)),),
+                    max_tokens=128,
+                    stream=True,
+                )
+            )
+            session.state["turns"] = int(session.state.get("turns", 0)) + 1
+            return ToolCall("", {})
+
+        async def drive(self, session: RunSession, inputs: object) -> object:
+            raise NotImplementedError
+
+    @_dataclass
+    class _LetsTheGuessStage(ScriptedModel):
+        """A scripted model that lets each guess reach the store buffer before moving on.
+
+        "Staged a charge and threw it away" is only countable if the charge reached
+        ``StoreBuffer.stage`` before the event that squashes it. ``bench/real_arm.py`` explains
+        why a fixed delay makes that likely and a committed number needs it certain: this waits
+        on the condition before every event after the first block, and stops waiting once the
+        gate has closed and nothing will be staged again.
+        """
+
+        buffer: StoreBuffer | None = None
+        budget: Budget | None = None
+
+        async def _settle(self) -> None:
+            if self.buffer is None or self.budget is None:
+                return
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and self.budget.may_speculate():
+                if self.buffer.has_staged():
+                    return
+                await asyncio.sleep(0)
+
+        async def stream(self, envelope):  # type: ignore[no-untyped-def]
+            first = True
+            async for event in super().stream(envelope):
+                if not first:
+                    await self._settle()
+                first = False
+                yield event
+
+    # The adversarial "strong chain": a quote that carries an amount, then a charge that
+    # consumes it. The amount has to be reachable from history or the drafter declines to
     # offer the prediction at all -- an unfillable guess would squash every time and its only
     # effect would be the reads its branch paid for.
     poison = [
-        ToolCall("lookup_customer", {"customer_id": "cus-1", "amount": 999.0}),
+        ToolCall("quote", {"customer_id": "cus-1", "amount": 999.0}),
         ToolCall("charge_card", {"customer_id": "cus-1", "amount": 999.0}),
     ]
     index = PatternIndex(order=2)
     index.train([poison] * 50)
-    drafter = PatternDrafter(index=index)
+
+    async def quote(customer_id: str, amount: float) -> JsonValue:
+        return {"customer_id": customer_id, "amount": amount, "currency": "usd"}
 
     world = standard_world()
     registry = ToolRegistry()
-    registry.register(ToolSpec(name="charge_card", effect=EffectClass.WRITE, fn=world.charge_card))
+    registry.register(ToolSpec(name="quote", effect=EffectClass.READ, fn=quote))
     registry.register(
         ToolSpec(
             name="lookup_customer", effect=EffectClass.READ, fn=world.lookup_customer, witness=True
         )
     )
+    registry.register(ToolSpec(name="charge_card", effect=EffectClass.WRITE, fn=world.charge_card))
 
-    budget = Budget(policy=Policy(alpha_window=4, alpha_floor=0.5))
-    honest = ToolCall("lookup_customer", {"customer_id": "cus-2"})
-    squashed = 0
-    predicted = 0
-    for _ in range(8):
-        candidates = await drafter.predict(
-            DraftContext(
-                run_id="r",
-                branch_id="b",
-                step_index=1,
-                node_id="n",
-                history=(poison[0],),
-                known_tools=registry.names(),
-            )
+    # What the model honestly does, every turn: a quote, then a lookup. Never a charge.
+    honest = (
+        ("quote", {"customer_id": "cus-2", "amount": 999.0}),
+        ("lookup_customer", {"customer_id": "cus-2"}),
+    )
+    with tempfile.TemporaryDirectory() as root:
+        journal = Journal(Path(root) / "attack-77.db")
+        buffer = StoreBuffer(journal=journal, run_id="")
+        model = _LetsTheGuessStage(
+            turns=[tool_turn(*honest, turn=i) for i in range(turns)], buffer=buffer
         )
-        if not candidates:
-            break
-        predicted += 1
-        guess = candidates[0].decision
-        if resolve_decision(guess, honest) is BranchStatus.SQUASHED:
-            squashed += 1
-            budget.record_resolution(tier=1, confirmed=False, tokens=250)
+        scheduler = Scheduler(
+            graph=_TurnsGraph(),  # type: ignore[arg-type]
+            registry=registry,
+            journal=journal,
+            buffer=buffer,
+            dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+            target=JournaledModel(model, journal, provider="scripted"),
+            policy=Policy(alpha_window=window, alpha_floor=0.5),
+            predictor=PatternDrafter(index=index),
+        )
+        model.budget = scheduler.budget
+        run_id = new_ulid()
+        outcome = await scheduler.run(run_id, {})
+        if not outcome.ok:
+            raise RuntimeError(f"the run failed: {outcome.error}")
+        disabled = [
+            e
+            for e in journal.read(run_id, kinds=["policy_event"])
+            if e.payload.get("event") == "speculation_disabled"
+        ]
+        # A guess ends squashed, stalled, or confirmed-and-adopted by the branch that made it;
+        # the canonical branch of each node visit is confirmed by its own turn and then retired.
+        # ``counters.branches_forked`` counts both kinds of fork, so the guesses are counted
+        # from how they were resolved, and a confirmation counts only if it names an adopter.
+        resolved = [dict(e.payload) for e in journal.read(run_id, kinds=["branch_resolved"])]
+        close_all_writers()
 
+    counters = scheduler.counters
+    guesses = {
+        "confirmed": sum(
+            1 for r in resolved if r.get("status") == "confirmed" and "adopted_by" in r
+        ),
+        "squashed": sum(1 for r in resolved if r.get("status") == "squashed"),
+        "stalled": sum(1 for r in resolved if r.get("status") == "stalled"),
+    }
     leaked = world.mutations_by("charge_card")
     return AttackResult(
         id="7.7",
         name="drafter poisoning",
-        claim="a poisoned index wastes tokens and stalls; it cannot put an effect in the world",
+        claim=(
+            "a poisoned index forks, stages and squashes until the alpha window fills with "
+            "misses and the gate closes; it cannot put an effect in the world"
+        ),
         measured={
-            "predictions_made": predicted,
-            "squashed": squashed,
-            "wasted_tokens": budget.wasted_tokens,
-            "speculation_disabled_by_alpha_gate": 1 if not budget.may_speculate() else 0,
+            "turns_run": turns,
+            "alpha_window": window,
+            "predictions_made": sum(guesses.values()),
+            "confirmed": guesses["confirmed"],
+            "squashed": guesses["squashed"],
+            "charges_staged_then_discarded": counters.effects_discarded,
+            "speculation_disabled_by_alpha_gate": (
+                1 if counters.speculation_disabled_reason == "alpha_below_floor" else 0
+            ),
+            "gate_closures_journaled": len(disabled),
+            "wasted_tokens": scheduler.budget.wasted_tokens,
             "leaked_effects": len(leaked),
         },
         defeated_runtime=bool(leaked),

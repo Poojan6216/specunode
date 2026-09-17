@@ -119,6 +119,73 @@ def opportunity_section() -> str:
     return "\n".join(lines)
 
 
+def acceptance_section() -> str:
+    report = load("acceptance.json")
+    if report is None:
+        return missing(
+            "The acceptance rate, measured",
+            "python bench/corpus/fetch.py --values && python bench/offline/run_acceptance.py "
+            "--out bench/results/acceptance.json",
+        )
+    a = report["acceptance"]
+    within, across, ceiling = a["within_turn"], a["across_turns"], a["copying_ceiling"]
+    values = report.get("values") or {}
+    lines = [
+        "### The acceptance rate, measured",
+        "",
+        "The signature figure above is an upper bound. This is the quantity itself: the tier-1 "
+        "predictor (`PatternDrafter` over an order-2 `PatternIndex`) graded by the runtime's own "
+        "gate (`resolve_decision`: exact canonical equality of argument **values**), on the same "
+        f"{a['trajectories']} trajectories joined to the argument values the committed corpus "
+        f"drops (`bench/corpus/values.json`: {values.get('values', 0)} values, "
+        f"{values.get('values_digested', 0)} of them stored as digests, which preserve equality "
+        "and nothing else). Leave-one-trajectory-out over every trajectory, not a sample. The "
+        "drafter is given no tool results, because the corpus keeps none.",
+        "",
+        "Two policies, because they answer different questions. **within_turn** is what the "
+        "runtime does: it asks the drafter after each block with this turn's history, and "
+        "squashes an open guess when the turn ends. **across_turns** is what carrying a guess "
+        "into the next model turn would be worth; the runtime does not do it.",
+        "",
+        "| Measure | within_turn | across_turns |",
+        "|---|---|---|",
+        f"| Steps graded | {within['steps']} | {across['steps']} |",
+        f"| Guesses offered | {within['offered_rate']:.4f} | {across['offered_rate']:.4f} |",
+        f"| **Acceptance rate**, pooled | **{within['acceptance_rate']:.4f}** | "
+        f"**{across['acceptance_rate']:.4f}** |",
+        "| Acceptance rate, mean over trajectories | "
+        f"{ci(within['acceptance_rate_by_trajectory'])} | "
+        f"{ci(across['acceptance_rate_by_trajectory'])} |",
+        f"| Guesses the gate would have confirmed | {within['accepted']} | {across['accepted']} |",
+        f"| Signature top-1 on the same steps | {within['signature_top1']:.4f} | "
+        f"{across['signature_top1']:.4f} |",
+        f"| Guesses squashed at a turn boundary | {within['squashed_at_turn_end']} | "
+        f"{across['squashed_at_turn_end']} |",
+        f"| Realisable write speculation | {within['realisable_write_speculation']:.4f} | "
+        f"{across['realisable_write_speculation']:.4f} |",
+        "",
+        f"**The tier-1 acceptance rate on this corpus is {across['acceptance_rate']:.4f} with "
+        f"guesses carried across turns, and {within['acceptance_rate']:.4f} under the policy the "
+        f"runtime runs.** {across['accepted']} of {across['steps']} guesses would have retired "
+        "even in the more generous policy. Under the runtime's own, none can: every call in "
+        "these trajectories opens a new model turn, and a guess the turn ends on is squashed "
+        f"unresolved -- {within['squashed_at_turn_end']} of them here.",
+        "",
+        f"The signature bound of {across['signature_top1']:.1%} on the same steps says the index "
+        "knows *which tool* comes next about half the time. The gate needs the exact command "
+        "string, path or thought, and those almost never repeat: every argument value of a call "
+        f"has already appeared in an earlier call at {ceiling['rate']:.1%} of steps, and the "
+        f"whole call has at {ceiling['rate_whole_call']:.1%}. A predictor that can only copy "
+        "values out of earlier calls -- which is what tier 1 is, on a corpus whose results are "
+        f"free text -- cannot be exactly right more often than {ceiling['rate']:.1%}, and this "
+        "one is nowhere near that. Anything above the ceiling has to come from a predictor "
+        "that generates values (tier 2, a draft model), whose acceptance rate has not been "
+        "measured because that needs an API key.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def demo_section() -> str:
     report = load("demo_leak.json")
     if report is None:
@@ -250,6 +317,9 @@ def build() -> str:
             "---",
             "",
             opportunity_section(),
+            "---",
+            "",
+            acceptance_section(),
             "---",
             "",
             attacks_section(),

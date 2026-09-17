@@ -42,6 +42,29 @@ That is an upper bound on opportunity, not a speedup. It is realisable only wher
 
 ---
 
+### The acceptance rate, measured
+
+The signature figure above is an upper bound. This is the quantity itself: the tier-1 predictor (`PatternDrafter` over an order-2 `PatternIndex`) graded by the runtime's own gate (`resolve_decision`: exact canonical equality of argument **values**), on the same 300 trajectories joined to the argument values the committed corpus drops (`bench/corpus/values.json`: 36068 values, 17586 of them stored as digests, which preserve equality and nothing else). Leave-one-trajectory-out over every trajectory, not a sample. The drafter is given no tool results, because the corpus keeps none.
+
+Two policies, because they answer different questions. **within_turn** is what the runtime does: it asks the drafter after each block with this turn's history, and squashes an open guess when the turn ends. **across_turns** is what carrying a guess into the next model turn would be worth; the runtime does not do it.
+
+| Measure | within_turn | across_turns |
+|---|---|---|
+| Steps graded | 19184 | 19184 |
+| Guesses offered | 0.9533 | 0.9794 |
+| **Acceptance rate**, pooled | **0.0000** | **0.0002** |
+| Acceptance rate, mean over trajectories | 0.0000 [0.0000, 0.0000] | 0.0002 [0.0000, 0.0004] |
+| Guesses the gate would have confirmed | 0 | 3 |
+| Signature top-1 on the same steps | 0.0000 | 0.5339 |
+| Guesses squashed at a turn boundary | 18288 | 0 |
+| Realisable write speculation | 0.0000 | 0.0002 |
+
+**The tier-1 acceptance rate on this corpus is 0.0002 with guesses carried across turns, and 0.0000 under the policy the runtime runs.** 3 of 19184 guesses would have retired even in the more generous policy. Under the runtime's own, none can: every call in these trajectories opens a new model turn, and a guess the turn ends on is squashed unresolved -- 18288 of them here.
+
+The signature bound of 53.4% on the same steps says the index knows *which tool* comes next about half the time. The gate needs the exact command string, path or thought, and those almost never repeat: every argument value of a call has already appeared in an earlier call at 9.8% of steps, and the whole call has at 8.8%. A predictor that can only copy values out of earlier calls -- which is what tier 1 is, on a corpus whose results are free text -- cannot be exactly right more often than 9.8%, and this one is nowhere near that. Anything above the ceiling has to come from a predictor that generates values (tier 2, a draft model), whose acceptance rate has not been measured because that needs an API key.
+
+---
+
 ### What beats it
 
 Every strategy below defeats the runtime. Each reports a measured rate.
@@ -54,7 +77,7 @@ Every strategy below defeats the runtime. Each reports a measured rate.
 | 7.4 | duplicate delivery of a non-idempotent tool | beats it | delivered=2, duplicates=1, intended=1 |
 | 7.5 | return-value laundering | beats it | cases=9, caught=6, miss_rate=0.333, missed=3, missed_cases=L6 base64-encoded, L7 hex-encoded, L9 split inside the prefix |
 | 7.6 | prompt-injected tool call | beats it | dispatched_when_only_the_drafter_predicted_it=0, dispatched_when_the_model_emitted_it=1 |
-| 7.7 | drafter poisoning | held | leaked_effects=0, predictions_made=8, speculation_disabled_by_alpha_gate=1, squashed=8, wasted_tokens=2000 |
+| 7.7 | drafter poisoning | held | alpha_window=4, charges_staged_then_discarded=4, confirmed=0, gate_closures_journaled=1, leaked_effects=0, predictions_made=4, speculation_disabled_by_alpha_gate=1, squashed=4, turns_run=6, wasted_tokens=0 |
 | 7.8 | replay under model drift | held | both_caught_at_step_0=1, first_divergence_step_after_system_prompt_change=0, first_divergence_step_after_tool_list_change=0 |
 | 7.9 | staging an irreversible effect | beats it | barrier_by_default=1, staged_when_enabled=1 |
 | 7.10 | asynchronous side effect behind a READ | beats it | effects_landing_after_the_squash=1, leaked_effects_per_squashed_branch=1, mutations_at_squash_time=0, synchronous_response_looks_like_a_read=1 |
