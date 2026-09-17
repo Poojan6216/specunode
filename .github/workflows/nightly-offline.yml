@@ -1,7 +1,8 @@
 name: nightly-offline
 
 # The offline benchmark: no model API calls, so it is safe to run unattended.
-# Produces bench/results/opportunity.json, chaos.json, concurrency.json, attacks.json.
+# Produces bench/results/opportunity.json, acceptance.json, chaos.json, concurrency.json,
+# attacks.json.
 on:
   schedule: [{ cron: "0 4 * * *" }]
   workflow_dispatch:
@@ -24,6 +25,8 @@ jobs:
         run: uv run python bench/corpus/fetch.py --verify-manifest
       - name: opportunity analysis
         run: uv run python bench/offline/run_opportunity.py --out bench/results/opportunity.json
+      - name: acceptance rate (the committed values sidecar; no network, no model)
+        run: uv run python bench/offline/run_acceptance.py --out bench/results/acceptance.json
       - name: chaos matrix
         run: uv run python bench/chaos/run_chaos.py --out bench/results/chaos.json
       - name: concurrency
