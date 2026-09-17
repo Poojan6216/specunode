@@ -122,6 +122,11 @@ class AlphaWindow:
         return len(self._samples) >= self.size
 
     @property
+    def hits(self) -> int:
+        """Confirmed predictions in the window. For the receipt, not the gate."""
+        return sum(1 for s in self._samples if s)
+
+    @property
     def alpha(self) -> float | None:
         """The rate, or ``None`` until the window is full.
 

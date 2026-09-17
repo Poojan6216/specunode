@@ -333,3 +333,36 @@ async def test_a_timed_out_write_is_not_reported_as_discarded(tmp_path: Path) ->
         # And it really is still held, which is the fact the message now states.
         status = await asyncio.wait_for(session.call_tool("specunode.status", {}), 60)
         assert "1" in text_of(status), text_of(status)
+
+
+# -- classification from the upstream's own annotations -----------------------------------------
+
+
+async def test_a_tool_annotated_read_only_upstream_is_forwarded_without_an_override(
+    tmp_path: Path,
+) -> None:
+    """The spec says "declare the effect class of each tool (or rely on MCP tool annotations)".
+
+    The second half was false for the whole build. ``ToolRegistry.from_mcp_tools`` existed for
+    exactly this and was called only by itself; the proxy passed the upstream's annotations
+    *through* to the client and never consulted them, so a tool marked ``readOnlyHint: true``
+    with no config override was synthesised as an unknown WRITE and held until a decision that
+    nobody would ever make for a read. The default proxy was unusable without a full override
+    table, and this test's config deliberately does not list ``peek_ticket``.
+
+    Asserted at the upstream's own log and with a short deadline: if the annotation is ignored,
+    the call blocks until the deadline and the log stays empty.
+    """
+    log = tmp_path / "upstream.log"
+    async with proxy_client(tmp_path, "--deadline", "2") as session:
+        listing = await asyncio.wait_for(session.list_tools(), 60)
+        assert "peek_ticket" in tool_names(listing)
+        result = await asyncio.wait_for(
+            session.call_tool("peek_ticket", {"ticket_id": "tkt-1"}), 60
+        )
+    body = text_of(result)
+    assert "peeked" in body, f"the annotated read was held instead of forwarded: {body!r}"
+    assert "timed_out" not in body, "the read waited out the decision deadline"
+    assert upstream_calls(log) == ["peek_ticket"], (
+        "the upstream never received the read; the annotation was ignored and it was held"
+    )

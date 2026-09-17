@@ -134,6 +134,7 @@ class _StagesBeforeNextBlock(ScriptedModel):
             first = False
             yield event
 
+
 async def run_specunode_arm(
     transcripts: Sequence[Transcript],
     world: World,
@@ -166,9 +167,7 @@ async def run_specunode_arm(
                 buffer=buffer,
                 dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
                 target=JournaledModel(
-                    _StagesBeforeNextBlock(
-                        turns=[tool_turn(*blocks, turn=0)], buffer=buffer
-                    ),
+                    _StagesBeforeNextBlock(turns=[tool_turn(*blocks, turn=0)], buffer=buffer),
                     journal,
                     provider="scripted",
                 ),

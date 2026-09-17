@@ -213,13 +213,37 @@ async def test_speculation_is_off_when_the_policy_says_so(tmp_path: Path) -> Non
 
 
 async def test_the_budget_stops_speculation_when_the_reads_run_out(tmp_path: Path) -> None:
-    """Hard Rule 10: wasted work is bounded, and the bound has a name."""
-    drafter = FixedDrafter(ToolCall("get_pipeline_status", {"pipeline_id": "etl-99"}))
-    scheduler, _world, _journal, run_id = build(tmp_path, drafter, db="budget.db")
-    scheduler.policy = Policy(speculation=True, max_speculative_reads=0)
-    await scheduler.run(run_id, {})
+    """Hard Rule 10's read budget, exercised rather than restated.
+
+    This used to set ``max_speculative_reads=0`` and assert the gate was closed -- which
+    ``0 >= 0`` satisfies before a single read has happened. It would have passed identically
+    with ``Budget.record_speculative_read`` deleted, and in effect it was: nothing in the
+    runtime called it, so ``speculative_reads_used`` was 0 on every run, the READ_BUDGET hazard
+    could never fire, and the limit attack 7.2's writeup calls "the budget that bounds the cost
+    of a wrong guess" bounded nothing.
+
+    Now the limit is 1, a real speculative read is made, and the assertions are that it was
+    *counted*, that the gate then closed, and that the closure is in the durable record.
+    """
+    drafter = FixedDrafter(ToolCall("fetch_runbook", {"section": "restart"}))
+    scheduler, world, journal, run_id = build(tmp_path, drafter, db="reads.db")
+    scheduler.policy = Policy(speculation=True, max_speculative_reads=1)
+    result = await scheduler.run(run_id, {})
+    assert result.ok, result.error
+
+    assert scheduler.budget.speculative_reads_used >= 1, (
+        "a speculative read was made and never counted against the budget"
+    )
     assert not scheduler.budget.may_speculate()
     assert scheduler.budget.exhausted() == "max_speculative_reads"
+    assert scheduler.budget.speculation_disabled, "the gate closed but disable() never ran"
+
+    events = [e.payload for e in journal.read(run_id, kinds=["policy_event"])]
+    closed = [e for e in events if e.get("event") == "speculation_disabled"]
+    assert len(closed) == 1, f"expected exactly one closure event, got {len(closed)}"
+    assert closed[0]["reason"] == "max_speculative_reads"
+    # The world is untouched by budget accounting: the run still did its job.
+    assert [m.tool for m in world.mutations] == ["restart_job"]
 
 
 async def test_the_run_still_does_what_it_was_asked_whatever_the_drafter_guessed(

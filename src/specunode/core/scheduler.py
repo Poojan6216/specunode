@@ -101,6 +101,8 @@ class _Counters:
     effects_dead_lettered: int = 0
     effects_discarded: int = 0
     speculative_reads_upstream: int = 0
+    #: Why the gate closed, if it did. None on a run where it never did.
+    speculation_disabled_reason: str | None = None
     #: E3's tallies. Zero on a run with no speculative reads, which is honest; they were zero
     #: on *every* run while ``validate_reads`` had no caller, which was not.
     reads_validated: int = 0
@@ -322,6 +324,12 @@ class Scheduler:
         )
         if speculative:
             self.counters.speculative_reads_upstream += 1
+            # The budget's counter, not only the report's. These were two counters that were
+            # supposed to move together, and only the informational one ever did -- so the
+            # READ_BUDGET hazard could never fire and ``max_speculative_reads`` was dead
+            # config, while attack 7.2's writeup described it as the budget that bounds the
+            # cost of a wrong guess.
+            self.budget.record_speculative_read()
         await self.journal.append_async(
             self.run_id,
             "tool_result",
@@ -1025,8 +1033,78 @@ class Scheduler:
 
     # -- journal bookends --------------------------------------------------------------------------
 
+    async def _journal_alpha_observed(self, step: int) -> None:
+        """One ``policy_event`` per resolution, carrying the window's current alpha.
+
+        The ledger reads alpha from ``policy_event`` payloads and from nowhere else, and none
+        was ever written -- so every ledger ever produced printed ``alpha: n/a`` while the
+        runtime was measuring it the whole time. One small entry per resolution is bounded by
+        the speculation budget itself, and it gives the durable record the trajectory rather
+        than a single number nobody can place in time.
+        """
+        window = self.budget.window
+        await self.journal.append_async(
+            self.run_id,
+            "policy_event",
+            {
+                "v": 1,
+                "event": "alpha_observed",
+                "reason": "a prediction resolved",
+                "step": step,
+                "alpha": window.alpha,
+                # The rate the gate consults is None until the window is full, on purpose --
+                # disabling on three data points is a worse error than guessing three more
+                # times. The *receipt* still has to say what was measured, so the counts
+                # travel too and the ledger renders them when the rate is not yet judged.
+                "hits": window.hits,
+                "samples": window.samples,
+                "window": window.size,
+                "wasted_tokens": self.budget.wasted_tokens,
+                "speculative_reads_used": self.budget.speculative_reads_used,
+            },
+        )
+
+    async def _journal_speculation_disabled(self, step: int) -> None:
+        """Record, once, that the gate closed and why. Idempotent across calls."""
+        if self.budget.speculation_disabled:
+            return
+        reason = self.budget.should_disable() or "unknown"
+        self.budget.disable(reason)
+        self.counters.speculation_disabled_reason = reason
+        await self.journal.append_async(
+            self.run_id,
+            "policy_event",
+            {
+                "v": 1,
+                "event": "speculation_disabled",
+                "reason": reason,
+                "step": step,
+                "alpha": self.budget.window.alpha,
+                "samples": self.budget.window.samples,
+                "window": self.budget.window.size,
+                "wasted_tokens": self.budget.wasted_tokens,
+                "speculative_reads_used": self.budget.speculative_reads_used,
+                "inflight_branches": self.budget.inflight_branches,
+            },
+        )
+
     async def _journal_run_started(self, inputs: JsonValue) -> None:
         capabilities = self.graph.capabilities()
+        if self.policy.speculation and self.policy.alpha_floor is None:
+            # The ledger already knows how to render this event; nothing ever emitted it.
+            await self.journal.append_async(
+                self.run_id,
+                "policy_event",
+                {
+                    "v": 1,
+                    "event": "alpha_floor_unmeasured",
+                    "reason": (
+                        "no break-even alpha has been measured for this workload, so the "
+                        "alpha gate is inactive; the other budgets still apply"
+                    ),
+                    "step": 0,
+                },
+            )
         await self.journal.append_async(
             self.run_id,
             "run_started",
@@ -1039,8 +1117,14 @@ class Scheduler:
                     "speculation": self.policy.speculation,
                     "max_inflight_branches": self.policy.max_inflight_branches,
                     "max_speculation_depth": self.policy.max_speculation_depth,
+                    "max_wasted_tokens": self.policy.max_wasted_tokens,
+                    "max_speculative_reads": self.policy.max_speculative_reads,
+                    # The ledger reads its window size from here; it read -1 and rendered "-".
+                    "alpha_window": self.policy.alpha_window,
+                    "alpha_floor": self.policy.alpha_floor,
                     "stage_irreversible": self.policy.stage_irreversible,
                     "on_stale_read": self.policy.on_stale_read,
+                    "on_unverifiable_read": self.policy.on_unverifiable_read,
                 },
                 "graph": {
                     "adapter": capabilities.framework,
@@ -1135,6 +1219,8 @@ class SpeculativeTurn:
         self._open: asyncio.Task[JsonValue] | None = None
         self._adopted: asyncio.Task[JsonValue] | None = None
         self._tier: int = 1
+        #: What the open prediction cost to produce; charged to ``wasted_tokens`` on a squash.
+        self._cost_tokens: int = 0
 
     async def run(self, envelope: RequestEnvelope) -> list[JsonValue]:
         scheduler = self._scheduler
@@ -1215,7 +1301,16 @@ class SpeculativeTurn:
         without ever being dispatched.
         """
         scheduler = self._scheduler
-        if not scheduler.policy.speculation or not scheduler.budget.may_speculate():
+        if not scheduler.policy.speculation:
+            return
+        if not scheduler.budget.may_speculate():
+            # The gate has closed for this run. Say so, once, in the durable record. The gate
+            # itself always worked -- ``may_speculate`` re-evaluates every time -- but
+            # ``Budget.disable`` had no caller and no ``policy_event`` was ever journaled, so
+            # Hard Rule 10's "speculation is disabled for that run by deterministic policy,
+            # **and the ledger says so**" held for the first half and not the second. A run
+            # that stopped speculating and a run that never started looked identical.
+            await scheduler._journal_speculation_disabled(self._branch.cursor.step_index)
             return
         drafter = scheduler.predictor
         if drafter is None:
@@ -1293,6 +1388,12 @@ class SpeculativeTurn:
         self._predicted = decision
         self._speculative = child
         self._tier = prediction.tier
+        self._cost_tokens = prediction.cost_tokens
+        # An open guess. Counted up here and down at resolution, on either path. This was
+        # never counted at all, so ``max_inflight_branches`` -- one of the three limits Hard
+        # Rule 10 names -- could not be reached and the BUDGET hazard's inflight clause was
+        # unreachable.
+        scheduler.budget.inflight_branches += 1
         tools = BranchTools(scheduler, child, self._node_id)
         # The block this predicts would be the next one the model emits, so it occupies the
         # next ordinal. Reserving it here is what keeps a confirmed speculation's effect at the
@@ -1327,9 +1428,16 @@ class SpeculativeTurn:
         child = self._speculative
         status = resolve_decision(self._predicted, actual)
         confirmed = status is BranchStatus.CONFIRMED
-        scheduler.budget.record_resolution(tier=self._tier, confirmed=confirmed, tokens=0)
 
         if confirmed:
+            # Only the hit is recorded here. The miss is recorded by ``_squash_open``, which
+            # this falls through to -- recording it in both places double-counted it, and
+            # recording it only here left end-of-turn squashes out of the window entirely.
+            scheduler.budget.record_resolution(
+                tier=self._tier, confirmed=True, tokens=self._cost_tokens
+            )
+            scheduler.budget.inflight_branches -= 1
+            await scheduler._journal_alpha_observed(self._branch.cursor.step_index)
             self.confirmed += 1
             child.confirm()
             # The guess was right, so the work stops being speculative and becomes the
@@ -1378,6 +1486,15 @@ class SpeculativeTurn:
         child = self._speculative
         child.squash(reason)
         self.squashed += 1
+        # Every squash is a miss in the alpha window, whatever its reason. End-of-turn
+        # squashes -- a guess the model never got round to contradicting -- were not recorded
+        # at all, so the window overstated the acceptance rate by exactly those. The tokens
+        # the guess cost to produce are wasted from here on.
+        scheduler.budget.record_resolution(
+            tier=self._tier, confirmed=False, tokens=self._cost_tokens
+        )
+        scheduler.budget.inflight_branches -= 1
+        await scheduler._journal_alpha_observed(self._branch.cursor.step_index)
         # Revoke first, cancel second: a tool that cannot be cancelled finishes anyway, and a
         # closed buffer is what stops its write from being staged into something nothing will
         # ever drain.

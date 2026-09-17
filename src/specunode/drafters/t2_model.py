@@ -74,11 +74,17 @@ class ModelDrafter:
             # sequential path is always correct; losing a speculation is not an error.
             return []
 
+        # The draft model's usage travels with the prediction. It used to be discarded here,
+        # so a squashed tier-2 guess reported zero wasted tokens whatever it had cost.
+        cost = response.usage.input_tokens + response.usage.output_tokens
         for block in response.tool_uses:
             if block.name in ctx.known_tools:
                 return [
                     Prediction(
-                        decision=ToolCall(name=block.name, args=block.args), tier=2, score=0.5
+                        decision=ToolCall(name=block.name, args=block.args),
+                        tier=2,
+                        score=0.5,
+                        cost_tokens=cost,
                     )
                 ]
 
@@ -86,7 +92,7 @@ class ModelDrafter:
         if parsed is None:
             self.unparsable += 1
             return []
-        return [Prediction(decision=parsed, tier=2, score=0.4)]
+        return [Prediction(decision=parsed, tier=2, score=0.4, cost_tokens=cost)]
 
     def _envelope(self, ctx: DraftContext) -> RequestEnvelope:
         """Build the draft request from journaled history on this branch's own lineage."""

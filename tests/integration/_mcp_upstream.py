@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
+from mcp.types import ToolAnnotations
 
 server = MCPServer("upstream")
 
@@ -42,6 +43,21 @@ def close_ticket(ticket_id: str) -> dict[str, object]:
     """Close a ticket. This one changes something."""
     _record("close_ticket", {"ticket_id": ticket_id})
     return {"ticket_id": ticket_id, "status": "closed"}
+
+
+@server.tool(annotations=ToolAnnotations(read_only_hint=True))
+def peek_ticket(ticket_id: str) -> dict[str, object]:
+    """A read that declares itself one through MCP annotations, and nowhere else.
+
+    The proxy's test config deliberately does NOT list this tool. If the proxy classifies
+    from the upstream's ``readOnlyHint`` it forwards this immediately; if it ignores the
+    annotation -- as it did for the whole build, while the spec said "or rely on MCP tool
+    annotations" -- it synthesises an unknown WRITE and holds the call until a decision
+    arrives, which for a read that nobody will ever "decide" means the client waits out the
+    deadline.
+    """
+    _record("peek_ticket", {"ticket_id": ticket_id})
+    return {"ticket_id": ticket_id, "status": "open", "peeked": True}
 
 
 if __name__ == "__main__":

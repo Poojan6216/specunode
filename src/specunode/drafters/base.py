@@ -70,6 +70,11 @@ class Prediction:
     #: The drafter's own confidence, for ranking only. Never a threshold the gate consults:
     #: confirmation is exact equality, and a confident wrong guess is still wrong.
     score: float = 1.0
+    #: What producing this prediction cost, in model tokens. Zero for tier 0 and tier 1, which
+    #: are free; the tier-2 draft model's usage otherwise. This is what ``wasted_tokens`` is
+    #: fed when the prediction is squashed -- it was always fed 0, so ``max_wasted_tokens``
+    #: was a limit nothing could ever reach.
+    cost_tokens: int = 0
 
 
 @runtime_checkable

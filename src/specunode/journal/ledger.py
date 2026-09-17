@@ -334,6 +334,11 @@ class Ledger:
     injected_blocks: int = 0
     alpha: float | None = None
     alpha_window: int | None = None
+    #: What was actually graded, whether or not the window filled. ``alpha`` alone rendered
+    #: ``n/a`` on every run shorter than the window -- which is most runs -- so a ledger said
+    #: nothing about a rate the runtime had been measuring the whole time.
+    alpha_hits: int = 0
+    alpha_samples: int = 0
     #: True when no break-even was measured for this workload, so the alpha gate is inactive.
     alpha_gate_unmeasured: bool = False
     #: Effects whose ``dispatch_index`` disagrees with their ``stage_index``.
@@ -446,6 +451,8 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
     divergences = 0
     policy_events: list[PolicyEventRow] = []
     alpha: float | None = None
+    alpha_hits = 0
+    alpha_samples = 0
     alpha_gate_unmeasured = False
 
     for entry in ordered:
@@ -510,6 +517,11 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
             reported = _as_float(payload, "alpha")
             if reported is not None:
                 alpha = reported
+            if "samples" in payload:
+                # The last observation wins: the window is a rolling one and the latest
+                # event carries its current state.
+                alpha_hits = max(0, _as_int(payload, "hits", 0))
+                alpha_samples = max(0, _as_int(payload, "samples", 0))
             if event == "alpha_floor_unmeasured":
                 alpha_gate_unmeasured = True
 
@@ -549,6 +561,8 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
         injected_blocks=injected,
         alpha=alpha,
         alpha_window=_as_int(policy, "alpha_window", -1) if policy else None,
+        alpha_hits=alpha_hits,
+        alpha_samples=alpha_samples,
         alpha_gate_unmeasured=alpha_gate_unmeasured,
         dispatch_order_anomalies=sum(1 for row in rows if row.dispatch_index != row.stage_index),
         args_hash_mismatches=sum(1 for row in rows if row.args_mismatch),
@@ -836,6 +850,8 @@ def ledger_payload(ledger: Ledger) -> Mapping[str, JsonValue]:
         "injected_blocks": ledger.injected_blocks,
         "alpha": ledger.alpha,
         "alpha_window": ledger.alpha_window,
+        "alpha_hits": ledger.alpha_hits,
+        "alpha_samples": ledger.alpha_samples,
         "alpha_gate_unmeasured": ledger.alpha_gate_unmeasured,
         "dispatch_order_anomalies": ledger.dispatch_order_anomalies,
         "args_hash_mismatches": ledger.args_hash_mismatches,
@@ -1274,7 +1290,14 @@ def _summary(ledger: Ledger, *, ellipsis: str, equivalence_digest: str | None) -
         stall_detail = f" ({shown})"
     tally = ledger.reads_validated
     window = "-" if ledger.alpha_window is None or ledger.alpha_window < 0 else ledger.alpha_window
-    alpha = "n/a" if ledger.alpha is None else f"{ledger.alpha:.2f}"
+    if ledger.alpha is not None:
+        alpha = f"{ledger.alpha:.2f}"
+    elif ledger.alpha_samples:
+        # Judged by the gate as "not enough evidence yet"; reported by the receipt as exactly
+        # what it was. "n/a" here read as "nothing was measured" and that was never true.
+        alpha = f"unjudged ({ledger.alpha_hits}/{ledger.alpha_samples} graded)"
+    else:
+        alpha = "n/a"
     gate = "  [gate inactive: unmeasured]" if ledger.alpha_gate_unmeasured else ""
     order = (
         "stage-ordered"

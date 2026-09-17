@@ -453,6 +453,17 @@ async def serve(
     async with stdio_client(params) as (read, write), ClientSession(read, write) as upstream:
         await upstream.initialize()
         listing = await upstream.list_tools()
+        # Classify from the upstream's own annotations, with the config's overrides winning.
+        # ``ToolRegistry.from_mcp_tools`` existed for exactly this and was called only by
+        # itself: the proxy passed annotations *through* to the client and never consulted
+        # them, so a tool the upstream marked ``readOnlyHint: true`` was synthesised as an
+        # unknown WRITE and held until a decision arrived. The spec's "or rely on MCP tool
+        # annotations" was false, and the default proxy was unusable without a full override
+        # table. The registry handed in by the CLI holds only the overrides.
+        overrides = {name: state.registry.get(name) for name in state.registry.names()}
+        state.registry = ToolRegistry.from_mcp_tools(
+            [_tool_as_mapping(tool) for tool in listing.tools], overrides=overrides
+        )
         server = MCPServer(server_name)
 
         for tool in listing.tools:
@@ -489,6 +500,26 @@ def _upstream_schema(tool: Any) -> Mapping[str, Any] | None:
         f"mcp {PROBED_MCP}), so its arguments cannot be forwarded. Pin the SDK rather than "
         "running a proxy that advertises a schema the upstream did not declare."
     )
+
+
+def _tool_as_mapping(tool: Any) -> dict[str, Any]:
+    """An SDK tool object as the JSON shape ``ToolRegistry.from_mcp_tools`` reads.
+
+    Annotations are dumped under both their alias and field spellings (``readOnlyHint`` and
+    ``read_only_hint``), because the MCP wire format is camelCase while the SDK's models are
+    snake_case, and the mapping should not depend on which one this SDK version emits.
+    """
+    annotations = getattr(tool, "annotations", None)
+    dumped: dict[str, Any] | None = None
+    if annotations is not None and hasattr(annotations, "model_dump"):
+        dumped = {**annotations.model_dump(), **annotations.model_dump(by_alias=True)}
+    elif isinstance(annotations, Mapping):
+        dumped = dict(annotations)
+    return {
+        "name": getattr(tool, "name", None),
+        "annotations": dumped,
+        "inputSchema": _upstream_schema(tool),
+    }
 
 
 def _register_proxied(server: Any, upstream: Any, state: ProxyState, tool: Any, types: Any) -> None:
