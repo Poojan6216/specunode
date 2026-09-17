@@ -339,6 +339,24 @@ class Branch:
         self.reason = reason
 
     def confirm(self) -> None:
+        """Mark this branch as authorised to dispatch. A squashed branch never is.
+
+        Guarded, like :meth:`retire`, and for the same reason. ``_retire`` opens with
+        ``branch.confirm()``, and one caller reached it with a branch ``_quiesce`` had already
+        squashed after its node raised -- so the status went SQUASHED -> CONFIRMED, the store
+        buffer's "only CONFIRMED branches dispatch (Hard Rule 3)" precondition was satisfied by
+        a forged status, and the staged write went out. Rule 3 is the one invariant this project
+        cannot bend, and it was bent by an unguarded assignment.
+
+        A terminal status is terminal. Reaching here from one is a bug in the caller, and it
+        raises rather than repairing itself, because the repair would be to dispatch.
+        """
+        if self.status in (BranchStatus.SQUASHED, BranchStatus.RETIRED):
+            raise BranchClosed(
+                f"branch {self.id} is {self.status.value} and cannot be confirmed; a terminal "
+                "status is terminal, and confirming out of one would let a branch that was "
+                "thrown away dispatch (Hard Rule 3)"
+            )
         self.status = BranchStatus.CONFIRMED
 
     def retire(self) -> None:

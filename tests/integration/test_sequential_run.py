@@ -79,7 +79,9 @@ async def test_the_ledger_rows_match_what_the_world_received(tmp_path: Path) -> 
 async def test_the_read_ran_but_never_mutated_anything(tmp_path: Path) -> None:
     scheduler, world, _journal, run_id = make_run(tmp_path)
     await scheduler.run(run_id, {"customer_id": "cus-1"})
-    assert [r.tool for r in world.reads] == ["lookup_customer"]
+    # The second is lattice rule E3's witness re-check at retirement, which is an upstream
+    # call the design counts rather than hides.
+    assert [r.tool for r in world.reads] == ["lookup_customer", "lookup_customer"]
     assert "lookup_customer" not in {m.tool for m in world.mutations}
 
 

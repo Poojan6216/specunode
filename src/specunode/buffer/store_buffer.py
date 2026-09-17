@@ -168,7 +168,13 @@ class StoreBuffer:
     # -- staging ---------------------------------------------------------------------------
 
     async def stage(
-        self, branch: Branch, call: ToolCall, spec: ToolSpec, *, node_id: str = ""
+        self,
+        branch: Branch,
+        call: ToolCall,
+        spec: ToolSpec,
+        *,
+        node_id: str = "",
+        step: int | None = None,
     ) -> StagedEffect:
         """Record a write without performing it. Never executes anything.
 
@@ -196,11 +202,27 @@ class StoreBuffer:
         # that will retire, and anything it stages afterwards belongs there too.
         owner_id, owner_lineage = self._drain_owner(branch)
         staged = self._staged.setdefault(owner_id, [])
+
+        # The position the *caller* took for this call, not wherever the cursor has since got
+        # to. ``Branch.reserve_step`` is ``max(cursor, requested)``, so the cursor is a running
+        # maximum over every position any block in the turn reserved -- and which blocks reserve
+        # on this branch depends on whether a speculation ran them instead. Reading the cursor
+        # here therefore made a write's idempotency key depend on the speculation outcome, which
+        # is precisely what ``reserve_step`` exists to prevent and what its own docstring says
+        # Hard Rule 9 forbids. The observable harm is a resume charging a card a second time:
+        # crash after the dispatch, resume with a different speculation outcome, derive a
+        # different nkey, and the dedupe table has nothing to match against.
+        #
+        # It also loses writes with no crash and no speculation at all. A turn of
+        # ``[write, write, read]`` has the read bump the cursor past both writes' slots before
+        # either is staged, so both collapse onto one step index, collide on ``nkey`` here, and
+        # the second raises after the first has already reached the world.
+        position = branch.cursor.step_index if step is None else step
         effect = StagedEffect(
             id=effect_id,
             branch_id=owner_id,
             lineage=owner_lineage,
-            step=branch.cursor.step_index,
+            step=position,
             node_id=node_id,
             call=call,
             effect=spec.effect,
@@ -208,14 +230,14 @@ class StoreBuffer:
                 run_id=self.run_id,
                 lineage=branch.lineage,
                 node_id=node_id,
-                step_index=branch.cursor.step_index,
+                step_index=position,
                 tool_name=call.name,
                 args=call.args,
             ),
             nkey=dedupe_key(
                 run_id=self.run_id,
                 node_id=node_id,
-                step_index=branch.cursor.step_index,
+                step_index=position,
                 tool_name=call.name,
                 args=call.args,
             ),

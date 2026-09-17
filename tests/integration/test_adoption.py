@@ -202,3 +202,101 @@ async def test_the_adoption_is_recorded_in_the_journal(tmp_path: Path) -> None:
     # Whether the effect moved with adopt() or was staged late and routed by it, exactly one
     # branch must end up owning it, and the journal must say which.
     assert len(adoptions) <= 1
+
+
+# -- the program position a write is keyed on ---------------------------------------------------
+#
+# Reserving a position per block ordinal was only half the fix. StoreBuffer.stage went on
+# deriving the effect's step -- and both idempotency keys -- from branch.cursor.step_index, which
+# reserve_step leaves as a running *maximum* over every position any block in the turn reserved.
+# Which blocks reserve on a given branch depends on whether a speculation ran them instead, so a
+# write's key depended on the speculation outcome. That is the exact failure reserve_step's own
+# docstring says Hard Rule 9 forbids.
+#
+# All three of these use a turn shaped [write, read]: a read emitted *after* a write is issued
+# early and bumps the cursor past the write's slot before the write is staged. No shipped
+# workload has that shape, which is why the suite was green.
+
+WRITE_THEN_READ = (
+    ("restart_job", {"job_id": "etl-1"}),
+    ("fetch_runbook", {"section": "restart"}),
+)
+
+
+@pytest.mark.timeout(60)
+async def test_a_writes_key_does_not_depend_on_whether_the_runtime_speculated(
+    tmp_path: Path,
+) -> None:
+    """Hard Rule 8, which is what Hard Rule 9 is protecting here.
+
+    The same call, emitted by the same model at the same position, must derive the same
+    idempotency key in both arms -- or a resume with speculation off cannot dedupe against a
+    crashed run that had it on, and the card is charged twice.
+    """
+    off, _ = await run_turn(
+        tmp_path,
+        WRITE_THEN_READ,
+        predicted=None,
+        gap_ms=25.0,
+        db="key-off.db",
+        speculation=False,
+    )
+    on, _ = await run_turn(
+        tmp_path,
+        WRITE_THEN_READ,
+        predicted=ToolCall("fetch_runbook", {"section": "restart"}),
+        gap_ms=25.0,
+        db="key-on.db",
+    )
+    assert off.ok and on.ok
+
+    off_keys = {(r.call.name, r.step_index) for r in off.ledger.rows}
+    on_keys = {(r.call.name, r.step_index) for r in on.ledger.rows}
+    assert off_keys == on_keys, f"speculating moved the write: {off_keys} vs {on_keys}"
+
+
+@pytest.mark.timeout(60)
+async def test_the_two_arms_agree_under_the_rule_9_relation(tmp_path: Path) -> None:
+    """The project's own mandatory relation, over the turn shape that exposed this."""
+    off, off_world = await run_turn(
+        tmp_path,
+        WRITE_THEN_READ,
+        predicted=None,
+        gap_ms=25.0,
+        db="r9-off.db",
+        speculation=False,
+    )
+    on, on_world = await run_turn(
+        tmp_path,
+        WRITE_THEN_READ,
+        predicted=ToolCall("fetch_runbook", {"section": "restart"}),
+        gap_ms=25.0,
+        db="r9-on.db",
+    )
+    assert_equivalent(off.ledger, on.ledger, off_world.mutations, on_world.mutations, expect_rows=1)
+
+
+@pytest.mark.timeout(60)
+async def test_two_writes_and_a_trailing_read_do_not_collide(tmp_path: Path) -> None:
+    """No speculation, no crash -- and one of two authorised writes used to be lost.
+
+    The trailing read bumps the cursor past both writes' reserved slots before either is
+    staged, so both collapsed onto one step index and collided on ``nkey``. The second raised
+    ``HazardViolation`` *after* the first had already reached the world, and the message told
+    the caller to "take a fresh step index per call" -- which it had; ``stage`` discarded it.
+    """
+    turn = (
+        ("restart_job", {"job_id": "etl-1"}),
+        ("charge_card", {"customer_id": "cus-1", "amount": 25.0}),
+        ("fetch_runbook", {"section": "restart"}),
+    )
+    result, world = await run_turn(
+        tmp_path, turn, predicted=None, gap_ms=25.0, db="collide.db", speculation=False
+    )
+
+    assert result.ok, result.error
+    assert sorted(m.tool for m in world.mutations) == ["charge_card", "restart_job"], (
+        "an authorised write was lost to a key collision"
+    )
+    steps = sorted(r.step_index for r in result.ledger.rows)
+    assert len(set(steps)) == len(steps), f"two effects share a program position: {steps}"

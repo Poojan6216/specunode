@@ -60,6 +60,7 @@ from specunode.journal.journal import Journal
 from specunode.journal.ledger import Ledger, build_ledger
 from specunode.journal.replay import recover
 from specunode.verify.gate import resolve_decision
+from specunode.verify.witness import validate_reads
 
 __all__ = ["BranchOutcome", "RunResult", "Scheduler", "SchedulerError", "SpeculativeTurn"]
 
@@ -100,6 +101,10 @@ class _Counters:
     effects_dead_lettered: int = 0
     effects_discarded: int = 0
     speculative_reads_upstream: int = 0
+    #: E3's tallies. Zero on a run with no speculative reads, which is honest; they were zero
+    #: on *every* run while ``validate_reads`` had no caller, which was not.
+    reads_validated: int = 0
+    reads_stale: int = 0
     context_divergences: int = 0
     wasted_tokens: int = 0
     stalls_by_hazard: dict[str, int] = field(default_factory=dict)
@@ -169,7 +174,10 @@ class BranchTools:
         if spec.effect is EffectClass.READ:
             return await scheduler.execute_read(branch, call, spec, call_id, step, self._node_id)
 
-        effect = await scheduler.buffer.stage(branch, call, spec, node_id=self._node_id)
+        # ``step``, not the cursor: this call's program position is the one reserved above.
+        effect = await scheduler.buffer.stage(
+            branch, call, spec, node_id=self._node_id, step=step
+        )
         scheduler.counters.effects_staged += 1
         ack = scheduler.buffer.ack_for(effect.id)
         # Parking, not blocking: the scheduler is told the branch is waiting on a future only
@@ -229,15 +237,22 @@ class Scheduler:
         return event
 
     def mark_parked(self, branch: Branch) -> None:
-        """Signal the branch whose quiesce loop decides when to drain.
+        """Signal this branch's own quiesce loop. Deliberately not resolved through adoption.
 
-        Resolved through adoption rather than taken as given. Park events are keyed by branch
-        id, and a confirmed speculation that stages *after* its buffer was adopted would
-        otherwise set an event on its own key -- which nothing waits on, because only the
-        canonical branch's loop is running. The effect then sits correctly placed on the
-        parent's list and still never leaves, which is the same silent hang by a subtler route.
+        Resolving through adoption looked right and cancelled another fix. An adopted child
+        keeps running, and when it stages it calls this -- so the *parent's* event was set while
+        the parent's node was still streaming its turn. The parent woke, reported PARKED, and
+        drained a buffer holding the adopted effect and nothing else, because the writes from
+        blocks the model emitted *earlier* are staged after the stream ends. The predicted call
+        then reached the world before the call that preceded it, which is Hard Rule 9 failing on
+        ordering, intermittently, so it reads as flakiness.
+
+        The parent is woken where it actually needs the ack: the results loop signals before it
+        awaits an adopted slot, by which time everything emitted earlier is staged and the drain
+        walks them in program order. An effect staged late by an adopted child is still placed
+        on the parent's list by :meth:`StoreBuffer.stage`, so it is picked up by that drain.
         """
-        self._park_event(self.buffer.drain_owner_id(branch)).set()
+        self._park_event(branch.id).set()
 
     def record_stall(self, step: int, hazard: Hazard) -> None:
         self._stalls.append((step, hazard))
@@ -541,7 +556,18 @@ class Scheduler:
 
         task: asyncio.Task[JsonValue] = asyncio.create_task(run())
         branch.task = task
-        await self._quiesce(branch, task)  # type: ignore[arg-type]
+        outcome = await self._quiesce(branch, task)  # type: ignore[arg-type]
+        if outcome is BranchOutcome.FAULTED:
+            # The scheduler-driven loop returns here too. This path used to throw the outcome
+            # away and retire regardless, so a node that raised had its branch squashed by
+            # ``_quiesce`` and then confirmed by ``_retire`` -- and its staged write dispatched
+            # on the strength of that forged status. ``Branch.confirm`` now refuses as well;
+            # both halves are kept, because one of them is the guard and the other is not
+            # asking it a question it should never be asked.
+            await self._journal_faulted(branch, node_id)
+            raise SchedulerError(
+                f"node {node_id} failed: {branch.reason or 'no reason recorded'}"
+            )
         # State on this path belongs to the framework's checkpointer, so no delta is journaled
         # and none is passed here.
         await self._retire(branch, node_id)
@@ -679,6 +705,20 @@ class Scheduler:
             return BranchOutcome.DONE
         return BranchOutcome.PARKED
 
+    async def _journal_faulted(self, branch: Branch, node_id: str) -> None:
+        """Close a faulted branch's lifecycle in the durable record."""
+        await self.journal.append_async(
+            self.run_id,
+            "branch_resolved",
+            {
+                "v": 1,
+                "branch_id": branch.id,
+                "step": branch.fork_step,
+                "status": "faulted",
+                "reason": branch.reason or f"node {node_id} raised",
+            },
+        )
+
     def _verify_context(self, branch: Branch) -> int:
         """Hard Rule 13 at retirement. Returns how many prompts were actually re-checked.
 
@@ -724,7 +764,53 @@ class Scheduler:
         committed: CommittedState | None = None,
         reducers: Mapping[str, Reducer] | None = None,
     ) -> tuple[bool, CommittedState | None]:
-        """R5 through R9: confirm, make it durable, drain, then retire."""
+        """R5 through R9: validate reads, confirm, make it durable, drain, then retire."""
+        # E3, before anything is confirmed. ``validate_reads`` is the retirement-time witness
+        # re-check the spec calls "the ordering that carries most of the integrity", and it had
+        # no caller anywhere in ``src/`` -- only a unit test and an attack script, both of which
+        # hand-build a Branch and call it directly. So a branch whose witnessed speculative
+        # reads had gone stale retired anyway and drained its writes; ``policy.on_stale_read``
+        # was dead config that was nonetheless journaled into ``run_started`` and rendered as
+        # though it applied; and the ledger printed "reads validated at retirement: 0/0 fresh"
+        # on every run, which is the difference between a receipt and a reassurance.
+        validation = await validate_reads(branch, self.registry)
+        if validation.verdicts:
+            await self.journal.append_async(
+                self.run_id,
+                "read_validated",
+                {
+                    "v": 1,
+                    "branch_id": branch.id,
+                    "step": branch.cursor.step_index,
+                    "fresh": validation.fresh,
+                    "stale": validation.stale,
+                    "unwitnessed": validation.unwitnessed,
+                    "total": len(validation.verdicts),
+                    "probes": validation.probes,
+                },
+            )
+            self.counters.reads_validated += validation.fresh
+            self.counters.reads_stale += validation.stale
+        if validation.stale and self.policy.on_stale_read == "squash":
+            # The branch computed its arguments from a value that has since changed. Its writes
+            # are not authorised by anything the world still agrees with, so it does not retire
+            # and the store buffer discards what it staged, unsent.
+            branch.squash(f"{validation.stale} witnessed read(s) went stale before retirement")
+            discarded = await self.buffer.discard_and_journal(branch, "stale_read")
+            self.counters.effects_discarded += discarded
+            await self.journal.append_async(
+                self.run_id,
+                "branch_resolved",
+                {
+                    "v": 1,
+                    "branch_id": branch.id,
+                    "step": branch.fork_step,
+                    "status": "squashed",
+                    "reason": branch.reason or "stale read",
+                },
+            )
+            return False, committed
+
         branch.confirm()
         checked = self._verify_context(branch)
         confirmed_offset = await self.journal.append_async(

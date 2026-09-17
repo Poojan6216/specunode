@@ -137,7 +137,11 @@ async def test_the_read_really_ran_and_returned_a_value(tmp_path: Path) -> None:
     """A read that was never issued would also trivially finish 'before' the stream ended."""
     scheduler, world, _journal, run_id, graph = build(tmp_path)
     await scheduler.run(run_id, {})
-    assert [r.tool for r in world.reads] == ["get_pipeline_status"]
+    # Two, not one: the model asked for this read, and lattice rule E3 re-fetches it at
+    # retirement to check the witness has not moved. That second call is a real upstream call
+    # and the design counts it rather than hiding it -- speculation is not free, and a read
+    # that is validated costs two.
+    assert [r.tool for r in world.reads] == ["get_pipeline_status", "get_pipeline_status"]
     assert isinstance(graph.results[0], dict) and "witness" in graph.results[0]
 
 
@@ -163,7 +167,11 @@ async def test_the_read_is_recorded_as_speculative_and_the_writes_are_not(
     """The read went out before the turn was durable, so it is counted as a speculation."""
     scheduler, world, _journal, run_id, _graph = build(tmp_path)
     await scheduler.run(run_id, {})
-    assert [r.speculative for r in world.reads] == [True]
+    # The model-emitted read was issued before its turn was durable, so it is speculative.
+    # E3's retirement-time re-fetch is not: by then the turn is journaled and the branch is
+    # confirmed, and marking the validation probe speculative would inflate the very count
+    # attack 7.2 exists to report honestly.
+    assert [r.speculative for r in world.reads] == [True, False]
     assert all(not m.speculative for m in world.mutations)
 
 
