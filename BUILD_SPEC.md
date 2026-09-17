@@ -1014,9 +1014,15 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**The audit found 23 defects behind 697 passing tests, two of them critical, and all 23 are
-fixed.** That number is the most useful thing in this report, so it is at the top rather than
-buried: the version of this document written a day earlier described a finished project.
+**Two independent adversarial audits have found 40 defects here, six of them critical, and all
+40 are fixed.** That number is the most useful thing in this report, so it is at the top rather
+than buried: the version of this document written a day earlier described a finished project.
+
+The second audit is the one worth reading twice. It was told to assume the first round's fixes
+were incomplete, and **two of its four criticals were inside those fixes** — one of them was two
+fixes from the same commit cancelling each other out. The lesson is not that the fixes were
+careless; it is that a defect and its repair are written by the same judgment, and that judgment
+is exactly what failed the first time.
 
 ### What was built, in five sentences
 
@@ -1109,7 +1115,40 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (8 predictions, 8 squashed, 2,000 wasted tokens, 0 leaks) and 7.8
 replay under model drift (both cases diverge at step 0).
 
-### What an independent audit found, after I had called it done
+### What the second audit found, in the first audit's fixes
+
+**`stage()` ignored the program position the caller had just reserved.** `Branch.reserve_step`
+exists precisely so a call's position cannot depend on whether the runtime speculated — its own
+docstring says so — and `StoreBuffer.stage` went on deriving the step, and both idempotency
+keys, from a cursor that `reserve_step` leaves as a running *maximum*. Three harms, all
+reproduced: a resume with a different speculation outcome charges a non-idempotent card a second
+time; Hard Rule 9 fails; and a turn of `[write, write, read]` collapses both writes onto one
+position and loses one of them after the other has already reached the world — with no crash and
+no speculation at all. Every shipped workload puts reads before writes, which is why the suite
+was green.
+
+**Two fixes in one commit cancelled each other.** `_resolve_prediction` stopped signalling a
+park at adoption, with a comment explaining exactly why that ordering mattered — and
+`mark_parked`, changed eight lines away, began resolving through adoption, so the adopted child's
+own staging woke the parent mid-stream anyway.
+
+**A squashed branch could be promoted to CONFIRMED and drained**, on the self-driving path, which
+threw away the outcome from `_quiesce` and retired regardless. `Branch.confirm` had no lifecycle
+guard while `Branch.retire` did.
+
+**Lattice rule E3 had no caller.** `validate_reads` — the retirement-time witness re-check the
+spec calls "the ordering that carries most of the integrity" — was defined, unit-tested, and
+invoked only by a test and an attack script that hand-build a `Branch`. `policy.on_stale_read`
+was dead configuration that was nonetheless journaled and rendered as though it applied.
+
+**`BranchStatus.STALLED` was unreachable**, so the ledger's stall list was empty on every run
+ever produced, on runs where hazards demonstrably fired. **`READ_AFTER_STAGED_WRITE` could not
+fire for the one shape it is named for**, because a turn stages its writes after the stream ends
+while reads are issued as their blocks parse. And **three MCP defects composed into a realistic
+double-write**: a confirmed write returned nothing to its caller, a timed-out write was reported
+as discarded while still being held, and one decision dispatched every matching held write.
+
+### What the first audit found, after I had called it done
 
 Six reviewers, told to assume the author had fooled himself, each finding then adversarially
 verified. 23 confirmed, 1 dissolved. Two were critical and both were in code I had committed
@@ -1317,11 +1356,25 @@ shape four more times: the Postgres backend, the online runner, Rule 13's gate a
 headline row. Every place this codebase tests a policy without the thing that carries it
 deserves the same suspicion.
 
-**Get somebody else to look.** I closed four coverage gaps, found nine defects, wrote a Final
-Report, and called it done. An independent audit then found 23 more behind 730 passing tests,
-two of them critical, two of them in fixes I had committed hours earlier. My own assessment of
-my own work was the judgment that had already failed; the cheapest thing I did all project was
-stop trusting it.
+**Get somebody else to look, and then do it again.** I closed four coverage gaps, found nine
+defects, wrote a Final Report and called it done. An independent audit found 23 more behind 730
+passing tests. I fixed all 23, verified every fix against the broken code, and wrote the report
+again. A second audit found 17 more — including four criticals, two of them *inside* the fixes
+I had just written, one of them two fixes from the same commit cancelling each other out.
+
+The counts are 23 then 17. That is a decline, not a convergence, and nobody should read the
+second number as "nearly done". The honest inference from two data points is that a third pass
+finds more, and the useful question is not whether this codebase is finished but how much
+independent scrutiny per change it turns out to need. For work of this shape — one author, deep
+invariants, a test suite written by the same person who wrote the bugs — the answer measured
+here is: a great deal more than feels necessary at the time.
+
+**Distrust a fix more than the defect it repairs.** A defect is written once. Its repair is
+written by the same judgment, under more time pressure, with the satisfaction of having found
+something — and it touches code that is by definition subtle enough to have been got wrong
+already. Six of the 40 defects here were in repairs. Every fix in the last two rounds was
+therefore verified by reverting it and watching the new test fail first, which is cheap and
+caught two tests that would otherwise have passed against the unfixed code.
 
 **Widen the coverage matrix again, and expect it to find more.** One workload at one tier became
 three at two, and one demo became three, and that found nine defects. That is not a comfortable
