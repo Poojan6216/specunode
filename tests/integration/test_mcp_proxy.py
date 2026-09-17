@@ -143,12 +143,17 @@ async def test_a_decision_releases_a_waiting_blocking_client() -> None:
         # What the real control tool does between these two lines is forward the call and
         # record what came back.
         proxy.record_result(held, [{"type": "text", "text": "charged"}])
-        proxy.publish()
+        # Scoped to the calls this decision resolved.
+        proxy.publish([held])
 
     task = asyncio.create_task(decide_shortly())
-    assert await proxy.wait_for_decision(deadline_s=2.0) is True
+    # Waiting on *this* call, not on "has anything been decided". A shared event released
+    # callers whose own write the decision never touched, and callers whose result had not
+    # been written yet.
+    assert await proxy.wait_for_call(held, deadline_s=2.0) is True
     await task
     assert len(proxy.dispatched) == 1
+    assert proxy.outcome_of(held) == "dispatched"
     assert proxy.result_of(held) is not None, (
         "the client was released before its result was recorded"
     )
@@ -158,11 +163,11 @@ async def test_deciding_alone_does_not_release_a_waiting_client() -> None:
     """The half that makes the split worth having: no result yet means no release yet."""
     proxy = state(ClientMode.BLOCKING)
     args = {"customer_id": "cus-1", "amount": 10.0}
-    proxy.stage("charge_card", args)
+    held = proxy.stage("charge_card", args)
 
     proxy.retire(ToolCall("charge_card", args))
 
-    assert await proxy.wait_for_decision(deadline_s=0.1) is False, (
+    assert await proxy.wait_for_call(held, deadline_s=0.1) is False, (
         "retire() released the waiter before any result had been recorded"
     )
 
@@ -224,3 +229,53 @@ def test_staged_writes_keep_their_order() -> None:
     first = proxy.stage("charge_card", {"customer_id": "cus-1", "amount": 10.0})
     second = proxy.stage("send_email", {"to": "a@b.c", "subject": "s", "body": "b"})
     assert [c.stage_index for c in (first, second)] == [0, 1]
+
+
+# -- per-call resolution ------------------------------------------------------------------------
+
+
+async def test_a_decision_does_not_release_a_caller_it_never_touched() -> None:
+    """One shared event released callers whose own write the decision never resolved.
+
+    ``publish()`` was reachable from every ``specunode.retire`` and from ``discard_all``, and
+    set a single global event. While one retire was awaiting its upstream round trip, any other
+    call to either woke every blocked caller -- each of which then found its call not in
+    ``dispatched`` and returned. Resolution is per call now.
+    """
+    proxy = state(ClientMode.BLOCKING)
+    mine = proxy.stage("charge_card", {"customer_id": "cus-1", "amount": 10.0})
+    theirs = proxy.stage("charge_card", {"customer_id": "cus-2", "amount": 20.0})
+
+    # A decision about *their* write only.
+    confirmed, _dropped = proxy.retire(ToolCall("charge_card", theirs.args))
+    proxy.record_result(theirs, [{"type": "text", "text": "charged"}])
+    proxy.publish(confirmed)
+
+    assert proxy.outcome_of(theirs) == "dispatched"
+    assert await proxy.wait_for_call(mine, deadline_s=0.1) is False, (
+        "a decision about another write released this caller"
+    )
+
+
+async def test_a_write_staged_during_a_decision_is_not_told_it_was_discarded() -> None:
+    """``retire`` empties ``staged`` synchronously and publishes only after the round trip.
+
+    A write staged inside that window used to see the shared event already set, find itself not
+    in ``dispatched``, and be told ``{"discarded": true}`` -- while it was still held, still
+    listed by ``specunode.status``, and still due to be forwarded by the next matching
+    decision. A client told its write was thrown away reissues it, and then both go out.
+    """
+    proxy = state(ClientMode.BLOCKING)
+    first = proxy.stage("charge_card", {"customer_id": "cus-1", "amount": 10.0})
+
+    confirmed, _dropped = proxy.retire(ToolCall("charge_card", first.args))
+    # The window: the decision has resolved, the upstream round trip has not happened yet.
+    late = proxy.stage("charge_card", {"customer_id": "cus-9", "amount": 99.0})
+    proxy.record_result(first, [{"type": "text", "text": "charged"}])
+    proxy.publish(confirmed)
+
+    assert proxy.outcome_of(late) is None, "a write staged mid-decision was resolved by it"
+    assert late in proxy.staged, "the late write is not held, but it was never sent either"
+    assert await proxy.wait_for_call(late, deadline_s=0.1) is False, (
+        "the late write's caller was released by a decision taken before it was staged"
+    )

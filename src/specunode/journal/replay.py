@@ -313,8 +313,21 @@ class Recovery:
     finished: bool
 
     @property
+    def exists(self) -> bool:
+        """Whether the journal has any record of this run at all.
+
+        A run id nobody has seen produces a Recovery with ``last_offset == -1`` and empty
+        everything -- and ``resumable`` answered True for it, because an unstarted run is
+        certainly "not finished". ``Scheduler.resume`` then drove the graph from empty state
+        and dispatched every write the workload contains. Since the run id is new, every
+        idempotency key is new, so the dedupe table -- the thing that makes a resume safe --
+        had nothing to match against. A typo in a run id sent real writes.
+        """
+        return self.last_offset >= 0
+
+    @property
     def resumable(self) -> bool:
-        return not self.finished or bool(self.confirmed_not_retired)
+        return self.exists and (not self.finished or bool(self.confirmed_not_retired))
 
 
 def _cursor_from(payload: JsonValue, fallback: StepCursor) -> StepCursor:

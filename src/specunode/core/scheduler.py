@@ -194,9 +194,7 @@ class BranchTools:
             return await scheduler.execute_read(branch, call, spec, call_id, step, self._node_id)
 
         # ``step``, not the cursor: this call's program position is the one reserved above.
-        effect = await scheduler.buffer.stage(
-            branch, call, spec, node_id=self._node_id, step=step
-        )
+        effect = await scheduler.buffer.stage(branch, call, spec, node_id=self._node_id, step=step)
         scheduler.counters.effects_staged += 1
         ack = scheduler.buffer.ack_for(effect.id)
         # Parking, not blocking: the scheduler is told the branch is waiting on a future only
@@ -453,6 +451,16 @@ class Scheduler:
         context-checked or witness-validated.
         """
         recovery = recover(self.journal, run_id)
+        if not recovery.exists:
+            # A run id the journal has never seen. Driving the graph from empty state here
+            # dispatches every write the workload contains, under brand-new idempotency keys
+            # that the dedupe table cannot match against anything -- so a typo in a run id
+            # sends real writes and calls it a resume.
+            raise SchedulerError(
+                f"run {run_id!r} has no entries in this journal, so there is nothing to "
+                "resume. Check the run id with `specunode runs`; resuming an unknown run "
+                "would start a fresh one and dispatch its writes."
+            )
         self.run_id = run_id
         self.buffer.run_id = run_id
         self.buffer.scheduler_task = asyncio.current_task()
@@ -584,9 +592,7 @@ class Scheduler:
             # both halves are kept, because one of them is the guard and the other is not
             # asking it a question it should never be asked.
             await self._journal_faulted(branch, node_id)
-            raise SchedulerError(
-                f"node {node_id} failed: {branch.reason or 'no reason recorded'}"
-            )
+            raise SchedulerError(f"node {node_id} failed: {branch.reason or 'no reason recorded'}")
         # State on this path belongs to the framework's checkpointer, so no delta is journaled
         # and none is passed here.
         #
@@ -829,9 +835,7 @@ class Scheduler:
         # and rendered either way -- but refusing on it by default pre-empts the drain, whose
         # failure handling dead-letters the effect by name and is strictly more informative
         # when the upstream is simply unreachable.
-        refuse = refuse or (
-            validation.unreadable and self.policy.on_unverifiable_read == "squash"
-        )
+        refuse = refuse or (validation.unreadable and self.policy.on_unverifiable_read == "squash")
         if refuse:
             # The branch computed its arguments from a value the world may no longer agree
             # with. Its writes are not authorised by anything that has been confirmed, so it

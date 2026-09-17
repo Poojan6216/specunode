@@ -510,6 +510,14 @@ class StoreBuffer:
     def pending(self, branch_id: str) -> tuple[StagedEffect, ...]:
         return tuple(self._staged.get(branch_id, ()))
 
+    def branch_ids(self) -> tuple[str, ...]:
+        """Every branch this buffer currently holds staged effects for."""
+        return tuple(self._staged)
+
+    def has_staged(self) -> bool:
+        """Whether anything at all is held. Cheap, and does not expose the effects."""
+        return any(self._staged.values())
+
     def ack_for(self, effect_id: str) -> asyncio.Future[JsonValue]:
         """The future a node body awaits for a staged write's real result.
 

@@ -64,6 +64,24 @@ class ClientMode(Enum):
     BLOCKING = "blocking"
 
 
+class _Absent:
+    """A private sentinel for "the client did not send this argument".
+
+    Not ``None``, because ``None`` is a value a client can legitimately send and the two must
+    stay distinguishable: forwarding an invented null broke every upstream tool with a
+    non-nullable optional parameter, and silently changed the argument hash of every staged
+    write that had one.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<absent>"
+
+
+_ABSENT = _Absent()
+
+
 #: How long a blocking client's write waits for a decision before giving up, in seconds.
 #:
 #: Generous, because the decision legitimately comes from outside the proxy and a model turn
@@ -118,8 +136,20 @@ class ProxyState:
     #: said yes for a call this turn's decision had just discarded. The proxy forwarded a write
     #: it had explicitly refused, which is the one thing this whole project exists to prevent.
     _seq: int = 0
-    #: Set when a decision arrives, so a blocking client's call can return.
-    _decided: asyncio.Event = field(default_factory=asyncio.Event)
+    #: One event per staged call, created when it is staged and set only when *that* call has
+    #: been resolved and its result recorded.
+    #:
+    #: A single shared event was wrong twice over. ``publish()`` is reachable from every
+    #: ``specunode.retire`` and from ``discard_all``, so while one retire was awaiting its
+    #: upstream round trip any other call to either could release a blocked caller whose result
+    #: had not been recorded yet -- handing the client an empty answer for a write that really
+    #: did reach the world. And a write staged *during* that window saw the event already set,
+    #: found itself not in ``dispatched``, and was told it had been discarded -- while it was
+    #: still held, still listed by ``specunode.status``, and still due to be forwarded by the
+    #: next matching decision.
+    _events: dict[str, asyncio.Event] = field(default_factory=dict)
+    #: What happened to each resolved call, by effect id.
+    _outcome: dict[str, str] = field(default_factory=dict)
 
     @property
     def context_identity(self) -> str:
@@ -143,6 +173,7 @@ class ProxyState:
             handle=f"$specunode.handle:{effect_id}",
         )
         self.staged.append(call)
+        self._events[call.effect_id] = asyncio.Event()
         return call
 
     def result_for(self, call: StagedCall) -> Mapping[str, JsonValue]:
@@ -181,16 +212,30 @@ class ProxyState:
         self.staged = []
         self.dispatched.extend(confirmed)
         self.discarded.extend(dropped)
-        # Deliberately NOT ``self._decided.set()`` here. The caller forwards the confirmed call
-        # and records its result *after* this returns, and setting the event now releases the
-        # blocked client first -- so it read ``results`` before anything was in it and every
-        # confirmed write returned nothing to the client that issued it. Publishing is a
-        # separate step: see :meth:`publish`.
+        for call in confirmed:
+            self._outcome[call.effect_id] = "dispatched"
+        for call in dropped:
+            self._outcome[call.effect_id] = "discarded"
+        # Deliberately no event is set here. The caller forwards each confirmed call and
+        # records its result *after* this returns, and releasing the blocked client first meant
+        # it read ``results`` before anything was in it. Publishing is a separate step.
         return confirmed, dropped
 
-    def publish(self) -> None:
-        """Release blocked callers, once every confirmed call's result has been recorded."""
-        self._decided.set()
+    def publish(self, calls: Sequence[StagedCall]) -> None:
+        """Release the callers waiting on *these* calls, now their results are recorded.
+
+        Scoped to the calls a decision actually resolved. A blanket release reached callers
+        whose own write was untouched by this decision, and callers whose result had not been
+        written yet.
+        """
+        for call in calls:
+            event = self._events.get(call.effect_id)
+            if event is not None:
+                event.set()
+
+    def outcome_of(self, call: StagedCall) -> str | None:
+        """``"dispatched"``, ``"discarded"``, or ``None`` while the call is still held."""
+        return self._outcome.get(call.effect_id)
 
     def was_confirmed(self, call: StagedCall) -> bool:
         """Did *this* call retire? Compared by effect id, never by value.
@@ -208,37 +253,57 @@ class ProxyState:
         return self.results.get(call.effect_id)
 
     def discard_all(self, reason: str = "squashed") -> int:
-        count = len(self.staged)
-        self.discarded.extend(self.staged)
+        dropped = list(self.staged)
+        count = len(dropped)
+        self.discarded.extend(dropped)
         self.staged = []
-        # Safe to publish immediately: nothing was confirmed, so there is no result to wait for.
-        self.publish()
+        for call in dropped:
+            self._outcome[call.effect_id] = "discarded"
+        # Safe to release immediately, and only these: nothing was confirmed, so there is no
+        # result to wait for.
+        self.publish(dropped)
         return count
 
-    async def wait_for_decision(self, deadline_s: float | None = None) -> bool:
-        """Block a non-handle client's call until a decision arrives.
-
-        Named ``deadline_s`` rather than ``timeout`` so it is not mistaken for asyncio's own
-        cancellation timeout: a caller that gives up here has not cancelled the staged write,
-        it is still held and still waiting for a decision.
-
-        **Bounded by default.** This used to default to waiting forever, in the proxy's default
-        mode, with the documented escape being a ``specunode retire`` CLI command that does not
-        exist -- and a single-threaded client blocked on the outstanding write call cannot issue
-        the ``specunode.retire`` tool that does. The default configuration therefore hung on the
-        first write with no working way out. It now gives up after
-        :data:`DEFAULT_DECISION_DEADLINE_S` and says so; the write stays held and unsent, which
-        is the safe side of the choice.
-        """
-        self._decided.clear()
+    async def wait_for_call(self, call: StagedCall, deadline_s: float | None = None) -> bool:
+        """Wait until *this* call has been resolved and its result recorded."""
+        event = self._events.get(call.effect_id)
+        if event is None:  # pragma: no cover - a call that was never staged here
+            return False
         try:
             await asyncio.wait_for(
-                self._decided.wait(),
+                event.wait(),
                 self.decision_deadline_s if deadline_s is None else deadline_s,
             )
         except TimeoutError:
             return False
         return True
+
+    async def wait_for_decision(self, deadline_s: float | None = None) -> bool:
+        """Wait until *any* call is resolved. Kept for callers that hold no particular one.
+
+        Prefer :meth:`wait_for_call`. This answers a question with no owner -- "has something
+        been decided?" -- and a blocking client needs "has *mine*?". Using it for that is how a
+        caller came to be released by a decision about somebody else's write.
+        """
+        if not self._events:
+            return False
+        waiters = [
+            asyncio.ensure_future(event.wait())
+            for effect_id, event in list(self._events.items())
+            if not self._outcome.get(effect_id)
+        ]
+        if not waiters:
+            return True
+        try:
+            done, _pending = await asyncio.wait(
+                waiters,
+                timeout=self.decision_deadline_s if deadline_s is None else deadline_s,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+        return bool(done)
 
     def status(self) -> Mapping[str, JsonValue]:
         return {
@@ -444,6 +509,8 @@ def _register_proxied(server: Any, upstream: Any, state: ProxyState, tool: Any, 
     """
 
     async def proxied(**kwargs: Any) -> Any:
+        # Drop the parameters the client did not send. See ``_with_upstream_signature``.
+        kwargs = {name: value for name, value in kwargs.items() if value is not _ABSENT}
         spec = state.classify(tool.name)
         if spec.effect is EffectClass.READ:
             state.reads_forwarded += 1
@@ -462,8 +529,8 @@ def _register_proxied(server: Any, upstream: Any, state: ProxyState, tool: Any, 
         # caller has already returned by the time a decision arrives, so a write confirmed
         # there used to be reported as dispatched and never sent), and what stops the two paths
         # from both sending in BLOCKING mode.
-        decided = await state.wait_for_decision()
-        if state.was_confirmed(held):
+        decided = await state.wait_for_call(held)
+        if state.outcome_of(held) == "dispatched":
             return state.result_of(held)
         if not decided:
             # A timeout is NOT a discard, and saying it was is the more dangerous of the two
@@ -516,11 +583,18 @@ def _with_upstream_signature(fn: Any, schema: Any) -> Any:
         return fn
     required = schema.get("required")
     required_names = set(required) if isinstance(required, Sequence) else set()
+    # Optional parameters default to a private sentinel, not to ``None``. The SDK builds its
+    # argument model from this signature and materialises the default into ``**kwargs``, so a
+    # ``None`` default meant an argument the client never sent arrived at the forwarder as an
+    # explicit null -- which was then forwarded upstream, where any optional parameter that is
+    # not nullable rejects it outright, and which also changed the canonical argument hash a
+    # staged write is keyed and compared on. The forwarder strips the sentinel before it
+    # forwards, so "absent" stays absent.
     parameters = [
         inspect.Parameter(
             name,
             inspect.Parameter.KEYWORD_ONLY,
-            default=inspect.Parameter.empty if name in required_names else None,
+            default=inspect.Parameter.empty if name in required_names else _ABSENT,
             annotation=Any,
         )
         for name in properties
@@ -590,9 +664,9 @@ def _register_control_tools(server: Any, upstream: Any, state: ProxyState) -> No
                 sent.append(call.effect_id)
         finally:
             # After the results are recorded, and in a ``finally`` so a blocked client is
-            # released even if this tool raises. Releasing before the results existed handed
-            # every confirmed write's caller an empty answer.
-            state.publish()
+            # released even if this tool raises. Scoped to the calls this decision resolved:
+            # a blanket release reached callers this decision never touched.
+            state.publish([*confirmed, *dropped])
         return {
             "dispatched": sent,
             "discarded": [c.effect_id for c in dropped],
