@@ -157,8 +157,6 @@ Known gaps, stated rather than left to be discovered:
 
 - **No wall-clock figure exists anywhere in this repository.** The online latency benchmark
   needs an API key and has not been run.
-- **The Postgres journal backend is written and type-checked but has never been executed** —
-  it needs the CI job.
 - One sample workload, not three. The invariant tests hold on it and on tiers 0 and 1.
 
 `BUILD_SPEC.md`'s Final Report lists every one of these with the reason it is open.

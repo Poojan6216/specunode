@@ -38,7 +38,10 @@ jobs:
           enable-cache: true
       - run: uv python install 3.11
         if: steps.gate.outputs.run == 'true'
-      - run: uv sync --all-extras --dev
+      # Not --all-extras: that pulls the local-draft extra's torch, which has no wheel for
+      # every runner in this matrix, so the job fails at install before a test runs. The
+      # tier-2 local drafter is exercised by its own job where a wheel exists.
+      - run: uv sync --extra anthropic --extra langgraph --extra mcp --extra postgres --extra bench --dev
         if: steps.gate.outputs.run == 'true'
       - name: online latency bench, budget-capped
         if: steps.gate.outputs.run == 'true'

@@ -311,7 +311,13 @@ class _PostgresBackend:
             raise JournalConfigError(
                 "the postgres journal needs the optional extra: pip install 'specunode[postgres]'"
             ) from exc
-        self._conn = psycopg.connect(dsn, autocommit=True)
+        from psycopg.rows import dict_row
+
+        # Every query in this module indexes its result by column name (``row["offset"]``,
+        # ``row["kind"]``). psycopg returns tuples by default, so without this the backend
+        # raises ``TypeError`` on the first row it reads -- which is where it would have failed
+        # had anything ever actually connected it.
+        self._conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
         self._conn.execute("SET synchronous_commit = on")
         for statement in _load_schema_statements():
             self._conn.execute(statement)
@@ -332,12 +338,72 @@ class _PostgresBackend:
         self._conn.close()
 
 
+#: Schemes that mean "this is a Postgres DSN, not a filesystem path".
+_POSTGRES_SCHEMES = ("postgresql://", "postgres://")
+
+
+def is_postgres_dsn(location: Path | str) -> bool:
+    """True when this names a Postgres server rather than a file.
+
+    Needed because ``Journal`` takes one argument for both. It used to coerce whatever it was
+    given with ``Path(...)``, so a DSN became a relative filename and opened a perfectly good
+    SQLite database -- including in the test named "the same journal on Postgres", which passed
+    without ever opening a connection.
+    """
+    return isinstance(location, str) and location.startswith(_POSTGRES_SCHEMES)
+
+
+def _backend_for(
+    location: Path | str, *, fullfsync: bool = False, read_only: bool = False
+) -> _SqliteBackend | _PostgresBackend:
+    if is_postgres_dsn(location):
+        # Postgres has no separate read-only handle here: a second connection to the same
+        # server is a second connection, and ``query_only`` is a SQLite concept.
+        return _PostgresBackend(str(location))
+    return _SqliteBackend(Path(location), fullfsync=fullfsync, read_only=read_only)
+
+
+def _integrity_errors() -> tuple[type[BaseException], ...]:
+    """Every "a unique constraint said no" class, across the backends that are wired.
+
+    ``sqlite3.IntegrityError`` alone was enough while only SQLite could ever run. psycopg
+    raises its own, and catching only SQLite's turns a concurrent-offset collision -- the case
+    the hash chain exists to refuse -- into an unhandled exception that escapes as a generic
+    write failure, losing the diagnosis.
+    """
+    errors: list[type[BaseException]] = [sqlite3.IntegrityError]
+    try:  # pragma: no cover - depends on the extras installed
+        import psycopg
+
+        errors.append(psycopg.errors.IntegrityError)
+    except ImportError:
+        pass
+    return tuple(errors)
+
+
+def _operational_errors() -> tuple[type[BaseException], ...]:
+    """Every "the database could not do that right now" class."""
+    errors: list[type[BaseException]] = [sqlite3.OperationalError]
+    try:  # pragma: no cover - depends on the extras installed
+        import psycopg
+
+        errors.append(psycopg.errors.OperationalError)
+    except ImportError:
+        pass
+    return tuple(errors)
+
+
+#: Resolved once at import; the set of installed drivers does not change at run time.
+_INTEGRITY_ERRORS = _integrity_errors()
+_OPERATIONAL_ERRORS = _operational_errors()
+
+
 class _JournalWriter:
     """One connection and one thread per database file, shared by every run in the process."""
 
-    def __init__(self, path: Path, *, fullfsync: bool = False) -> None:
+    def __init__(self, path: Path | str, *, fullfsync: bool = False) -> None:
         self.path = path
-        self._backend = _SqliteBackend(path, fullfsync=fullfsync)
+        self._backend = _backend_for(path, fullfsync=fullfsync)
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="specunode-journal")
         self._head: dict[str, ChainHead] = {}
         self._max_step: dict[str, int] = {}
@@ -381,7 +447,7 @@ class _JournalWriter:
                     "ts": ts,
                 },
             )
-        except sqlite3.IntegrityError as exc:
+        except _INTEGRITY_ERRORS as exc:
             # Someone else owns this offset. Never silently re-seed and retry: that would
             # reorder two entries whose order is the thing the chain exists to fix.
             self._head.pop(run_id, None)
@@ -389,7 +455,7 @@ class _JournalWriter:
                 f"offset {offset} of run {run_id} is already taken; another writer holds this "
                 f"journal ({self.path})"
             ) from exc
-        except sqlite3.OperationalError as exc:
+        except _OPERATIONAL_ERRORS as exc:
             self._head.pop(run_id, None)
             if "locked" in str(exc).lower() or "busy" in str(exc).lower():
                 raise JournalBusy(f"{self.path}: {exc}") from exc
@@ -438,7 +504,7 @@ class _JournalWriter:
         if row is None:
             try:
                 self._backend.execute(_INSERT_CLAIM, claim.as_params(_utc_now()))
-            except sqlite3.IntegrityError as exc:
+            except _INTEGRITY_ERRORS as exc:
                 # The nkey was free, so this is the other unique index: one effect id already
                 # has a dispatch row under a different key. That means the same effect was
                 # keyed two ways, which would let it be dispatched twice.
@@ -559,12 +625,14 @@ _writers: dict[str, _JournalWriter] = {}
 _writers_lock = threading.Lock()
 
 
-def _writer_for(path: Path, *, fullfsync: bool = False) -> _JournalWriter:
-    key = os.path.realpath(path)
+def _writer_for(path: Path | str, *, fullfsync: bool = False) -> _JournalWriter:
+    # A DSN is its own key. ``realpath`` on one produces a nonsense relative path, and two
+    # different DSNs could collapse onto the same entry.
+    key = str(path) if is_postgres_dsn(path) else os.path.realpath(path)
     with _writers_lock:
         writer = _writers.get(key)
         if writer is None:
-            writer = _JournalWriter(Path(key), fullfsync=fullfsync)
+            writer = _JournalWriter(key if is_postgres_dsn(key) else Path(key), fullfsync=fullfsync)
             _writers[key] = writer
         return writer
 
@@ -581,8 +649,15 @@ class Journal:
     """Append-only, hash-chained, durable before return."""
 
     def __init__(self, path: Path | str, *, fullfsync: bool = False) -> None:
-        self.path = Path(path)
-        self._writer = _writer_for(self.path, fullfsync=fullfsync)
+        #: Kept as given. A Postgres DSN is not a path, and coercing it to one is how the
+        #: Postgres backend came to be unreachable while its test reported success.
+        self.location: Path | str = str(path) if is_postgres_dsn(path) else Path(path)
+        self.path = Path(path) if not is_postgres_dsn(path) else Path(str(path))
+        self._writer = _writer_for(self.location, fullfsync=fullfsync)
+
+    @property
+    def is_postgres(self) -> bool:
+        return is_postgres_dsn(self.location)
 
     # -- writing -----------------------------------------------------------------------------
 
@@ -606,11 +681,11 @@ class Journal:
 
     # -- reading -----------------------------------------------------------------------------
 
-    def _reader(self) -> _SqliteBackend:
+    def _reader(self) -> _SqliteBackend | _PostgresBackend:
         # A separate read-only connection, never the writer's. query_only rather than a
         # mode=ro URI, because a read-only URI connection fails when the -shm file has to be
         # created.
-        return _SqliteBackend(self.path, read_only=True)
+        return _backend_for(self.location, read_only=True)
 
     def read(
         self, run_id: str, after: int = -1, kinds: Sequence[str] | None = None, chunk: int = 512
