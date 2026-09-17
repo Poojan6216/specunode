@@ -280,6 +280,22 @@ class Branch:
             tier=tier,
         )
 
+    def reserve_step(self, step: int) -> int:
+        """Take a *named* program position, rather than the next one.
+
+        A model-emitted call's position is its ordinal in the turn, not the order the runtime
+        happened to execute it in. Early issue runs a read before the writes emitted before it
+        are staged, and a speculation runs the predicted call before any of them -- so a cursor
+        advanced at execution time hands out positions in a different order depending on whether
+        the runtime speculated, and every idempotency key derived from them differs between the
+        two arms. That is Hard Rule 9 failing for a reason that has nothing to do with what
+        reached the world.
+
+        Reservations within a branch are monotonic, so this never moves the cursor backwards.
+        """
+        self.cursor = replace(self.cursor, step_index=max(self.cursor.step_index, step))
+        return step
+
     def advance_step(self) -> int:
         """Take the next program position for a call this branch is about to make.
 

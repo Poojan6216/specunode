@@ -417,8 +417,6 @@ async def _durability_attempt(tmp_path: Path) -> None:
     assert world.mutations == []
 
 
-
-
 _TIERS = ("t0", "t1")
 
 
@@ -454,6 +452,7 @@ async def _run_workload(
     run_id = new_ulid()
     result = await scheduler.run(run_id, dict(workload.seed))
     return result, journal, run_id
+
 
 # -- the same invariant, over the real runtime on the real workloads ----------------------------
 #
@@ -559,14 +558,9 @@ async def test_a_deliberately_wrong_prediction_on_a_real_workload_leaks_nothing(
     result = await scheduler.run(run_id, dict(workload.seed))
     assert result.ok
 
-    resolutions = [
-        entry.payload
-        for entry in journal.read(run_id, kinds=["branch_resolved"])
-    ]
+    resolutions = [entry.payload for entry in journal.read(run_id, kinds=["branch_resolved"])]
     squashed = {
-        str(payload["branch_id"])
-        for payload in resolutions
-        if payload.get("status") == "squashed"
+        str(payload["branch_id"]) for payload in resolutions if payload.get("status") == "squashed"
     }
     assert squashed, "the mistrained index still guessed right; this proves nothing"
 

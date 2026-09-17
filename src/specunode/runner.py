@@ -51,7 +51,7 @@ def build_graph(config: Config) -> tuple[GraphAdapter, ToolRegistry]:
     if config.graph is None:
         raise RunnerError(
             "this config has no 'graph:' entry, so there is nothing to re-drive. Add "
-            "graph: \"your_module:build\" naming a callable that returns "
+            'graph: "your_module:build" naming a callable that returns '
             "(graph_adapter, tool_registry)."
         )
     builder = load_reference(config.graph)

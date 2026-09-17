@@ -191,11 +191,15 @@ class StoreBuffer:
             )
 
         effect_id = new_ulid()
-        staged = self._staged.setdefault(branch.id, [])
+        # Where this effect will actually be drained from, which is not always this branch: a
+        # speculation whose prediction was confirmed has had its buffer adopted by the branch
+        # that will retire, and anything it stages afterwards belongs there too.
+        owner_id, owner_lineage = self._drain_owner(branch)
+        staged = self._staged.setdefault(owner_id, [])
         effect = StagedEffect(
             id=effect_id,
-            branch_id=branch.id,
-            lineage=branch.lineage,
+            branch_id=owner_id,
+            lineage=owner_lineage,
             step=branch.cursor.step_index,
             node_id=node_id,
             call=call,
@@ -239,7 +243,7 @@ class StoreBuffer:
             )
         staged.append(effect)
         self._acks[effect.id] = asyncio.get_running_loop().create_future()
-        self._lineages[branch.id] = branch.lineage
+        self._lineages[owner_id] = owner_lineage
         await self.journal.append_async(
             self.run_id,
             "effect_staged",
@@ -265,6 +269,29 @@ class StoreBuffer:
             },
         )
         return effect
+
+    def _drain_owner(self, branch: Branch) -> tuple[str, tuple[str, ...]]:
+        """The branch id whose drain will dispatch an effect staged by ``branch``, and its lineage.
+
+        Normally the branch itself. After :meth:`adopt`, a confirmed speculation's effects belong
+        to the branch that will retire -- and so does anything the speculation stages *later*,
+        because its task keeps running until it returns the ack it is waiting for. Following the
+        map here is what stops a late stage from landing in a list no drain visits.
+
+        The map is followed transitively and with a cycle guard. Adoption is a chain in principle
+        (a confirmed speculation can itself be adopted), and a runtime that spun here would hang
+        in a different place than the bug this method exists to close.
+        """
+        seen: set[str] = set()
+        owner = branch.id
+        lineage = branch.lineage
+        while True:
+            parent = self._adopted_into.get(owner)
+            if parent is None or parent in seen:
+                return owner, lineage
+            seen.add(owner)
+            owner = parent
+            lineage = self._lineages.get(parent, lineage)
 
     # -- what a branch can see ----------------------------------------------------------------
 
@@ -336,27 +363,28 @@ class StoreBuffer:
         adoption happens mid-stream, before the parent stages anything the turn's later blocks
         ask for, so appending is the order the sequential run would have produced.
         """
+        # Recorded *before* the move, and never only after it. ``adopt`` is a point-in-time
+        # transfer, but the child's task may not have reached :meth:`stage` yet -- the model can
+        # emit the confirming block while the speculation is still awaiting its own journal
+        # append. Anything it stages after this line has to land where a drain will find it,
+        # and :meth:`stage` reads this map to decide that. Recording the adoption only when
+        # there was something to move left exactly that window open: the late effect went into
+        # the child's list, no drain ever visits it, and the node body waits on an ack nobody
+        # will ever complete. The run hangs with no error and no ``run_finished`` entry, which
+        # is the worst of the three outcomes because nothing reports it.
+        self._adopted_into[child.id] = parent.id
+        self._lineages[parent.id] = parent.lineage
+
         moved = self._staged.pop(child.id, [])
         if not moved:
-            # Nothing staged -- a predicted read, which is the common case. Still record the
-            # adoption so the child's lineage does not silently keep receiving stages.
-            self._adopted_into[child.id] = parent.id
             return 0
 
         target = self._staged.setdefault(parent.id, [])
-        adopted: list[StagedEffect] = []
-        for offset, effect in enumerate(moved):
-            adopted.append(
-                replace(
-                    effect,
-                    branch_id=parent.id,
-                    lineage=parent.lineage,
-                    stage_index=len(target) + offset,
-                )
-            )
+        adopted: list[StagedEffect] = [
+            _reattributed(effect, parent, len(target) + offset)
+            for offset, effect in enumerate(moved)
+        ]
         target.extend(adopted)
-        self._adopted_into[child.id] = parent.id
-        self._lineages[parent.id] = parent.lineage
         await self.journal.append_async(
             self.run_id,
             "effect_adopted",
@@ -374,6 +402,11 @@ class StoreBuffer:
     def adopted_into(self, branch_id: str) -> str | None:
         """The branch a confirmed speculation's effects were moved to, if any."""
         return self._adopted_into.get(branch_id)
+
+    def drain_owner_id(self, branch: Branch) -> str:
+        """Which branch's drain will dispatch what ``branch`` stages, following adoption."""
+        owner, _lineage = self._drain_owner(branch)
+        return owner
 
     # -- discard ---------------------------------------------------------------------------
 
@@ -518,21 +551,33 @@ class StoreBuffer:
         halted_at: int | None = None
         ok = True
         settled = self._settled.setdefault(branch.id, set())
-        index = -1
+        attempted: set[str] = set()
 
-        # The list is read live, by index, and never snapshotted: completing one effect's ack
-        # can resume a node body that stages the next write from the value it just received.
-        # Positional, never sorted -- not by key and not by effect id. Effect ids are ULIDs, so
+        # The list is read live and never snapshotted: completing one effect's ack can resume a
+        # node body that stages the next write from the value it just received, and that write
+        # has to be picked up by this same drain.
+        #
+        # Ordered by *program position*, not by insertion. Those are the same thing for a run
+        # that never speculated, and differ for one that did: a confirmed speculation's effect
+        # is adopted mid-stream, before the writes from blocks emitted *earlier* have been
+        # staged at all. Dispatching by insertion order then put the later call into the world
+        # first, so the order effects arrived depended on whether the runtime speculated --
+        # which is Hard Rule 9 failing in the one dimension the ledger comparison is most
+        # likely to be read for.
+        #
+        # This is deliberately not a sort by key or by effect id. Effect ids are ULIDs, so
         # sorting by one usually *reproduces* insertion order, which would make a reordering
-        # bug invisible in testing and surface only under clock skew.
+        # bug invisible in testing and surface only under clock skew. ``step`` is the position
+        # the model put the call at, which is the order being asserted.
         while True:
-            index += 1
             live = self._staged.get(branch.id, [])
-            if index >= len(live):
+            pending = [
+                effect for effect in live if effect.id not in settled and effect.id not in attempted
+            ]
+            if not pending:
                 break
-            effect = live[index]
-            if effect.id in settled:
-                continue
+            effect = min(pending, key=lambda staged: (staged.step, staged.stage_index))
+            attempted.add(effect.id)
 
             if halted_at is not None:
                 outcomes.append((effect.id, EffectOutcome.NOT_ATTEMPTED))
@@ -675,3 +720,15 @@ class StoreBuffer:
             },
         )
         self._fail_ack(effect.id, error)
+
+
+def _reattributed(effect: StagedEffect, parent: Branch, stage_index: int) -> StagedEffect:
+    """An effect moved onto the branch that will retire it.
+
+    ``branch_id`` and ``lineage`` follow the new owner because Hard Rule 3's audit asks that
+    every effect in the world trace to a branch that *retired*, and the speculation never does.
+    ``nkey`` deliberately does not move: it is the token the tool is handed, and an idempotency
+    key that shifted when a guess turned out right would make a retry after adoption look to the
+    upstream like a different call.
+    """
+    return replace(effect, branch_id=parent.id, lineage=parent.lineage, stage_index=stage_index)

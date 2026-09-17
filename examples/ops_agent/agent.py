@@ -136,9 +136,7 @@ async def triage(session: RunSession) -> Decision:
     )
     session.state["pipeline_id"] = pipeline_id
     restart = results[-1] if results else None
-    session.state["restarts"] = (
-        restart.get("applied") if isinstance(restart, Mapping) else None
-    )
+    session.state["restarts"] = restart.get("applied") if isinstance(restart, Mapping) else None
     session.state["triaged"] = True
     return ToolCall("restart_job", {"job_id": pipeline_id})
 

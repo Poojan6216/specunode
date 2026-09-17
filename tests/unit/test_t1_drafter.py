@@ -75,8 +75,10 @@ def test_free_text_is_not_a_tool_signature() -> None:
 def test_the_index_backs_off_to_a_shorter_context() -> None:
     """An unseen order-2 window still predicts, from the order-1 counts underneath it."""
     index = trained()
-    unseen = [ToolCall("send_receipt", {"customer_id": "c", "charge_id": "x"}),
-              ToolCall("get_ticket", {"ticket_id": "tkt-1"})]
+    unseen = [
+        ToolCall("send_receipt", {"customer_id": "c", "charge_id": "x"}),
+        ToolCall("get_ticket", {"ticket_id": "tkt-1"}),
+    ]
     assert index.rank(unseen), "backoff produced no candidate at all"
     assert index.rank(unseen)[0][0] == "lookup_customer(customer_id)"
 

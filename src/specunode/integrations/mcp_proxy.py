@@ -361,6 +361,7 @@ def _upstream_schema(tool: Any) -> Mapping[str, Any] | None:
         "running a proxy that advertises a schema the upstream did not declare."
     )
 
+
 def _register_proxied(server: Any, upstream: Any, state: ProxyState, tool: Any, types: Any) -> None:
     """Expose one upstream tool, classified and either forwarded or held.
 
@@ -442,6 +443,7 @@ def _with_upstream_signature(fn: Any, schema: Any) -> Any:
     fn.__annotations__ = {name: Any for name in properties if name.isidentifier()}
     fn.__annotations__["return"] = Any
     return fn
+
 
 def _register_control_tools(server: Any, state: ProxyState) -> None:
     """The proxy's own six tools, so a client can see and steer what is held.

@@ -114,9 +114,7 @@ async def run_arm(
 
 
 def _cases() -> list[pytest.param]:  # type: ignore[valid-type]
-    return [
-        pytest.param(w, tier, id=f"{w.name}-{tier}") for w in WORKLOADS for tier in TIERS
-    ]
+    return [pytest.param(w, tier, id=f"{w.name}-{tier}") for w in WORKLOADS for tier in TIERS]
 
 
 @pytest.mark.parametrize(("workload", "tier"), _cases())
@@ -168,25 +166,25 @@ async def test_each_arms_ledger_matches_its_own_world(
 async def test_the_tier_1_arm_was_really_consulted(tmp_path: Path, workload: Workload) -> None:
     """The drafter is wired in and asked -- and on these workloads it offers nothing.
 
-    That second half is a measured property of the workloads, not a defect, and writing it
-    down as an assertion is the only way it stays true by choice rather than by accident.
+        That second half is a measured property of the workloads, not a defect, and writing it
+        down as an assertion is the only way it stays true by choice rather than by accident.
 
-Two separate reasons a workload may not speculate, and the test distinguishes them because
-    conflating them would hide either one.
+    Two separate reasons a workload may not speculate, and the test distinguishes them because
+        conflating them would hide either one.
 
-    ``support_agent`` and ``research_agent`` call the model directly and issue each tool
-    themselves. Early issue and the drafters live inside the turn the runtime drives, so those
-    runs consult no drafter at all -- the tier parameter changes nothing for them beyond
-    proving that attaching a predictor does not perturb the ledger.
+        ``support_agent`` and ``research_agent`` call the model directly and issue each tool
+        themselves. Early issue and the drafters live inside the turn the runtime drives, so those
+        runs consult no drafter at all -- the tier parameter changes nothing for them beyond
+        proving that attaching a predictor does not perturb the ledger.
 
-    ``ops_agent`` hands its turn to the runtime and emits several calls in it, so there the
-    drafter really is asked, really predicts, and is really confirmed. The one-call-per-turn
-    shape the other two have is the shape the offline corpus measured at 1.0000 of tool calls,
-    which is why a suite where tier 1 fired everywhere would be a suite whose workloads did not
-    resemble anything real.
+        ``ops_agent`` hands its turn to the runtime and emits several calls in it, so there the
+        drafter really is asked, really predicts, and is really confirmed. The one-call-per-turn
+        shape the other two have is the shape the offline corpus measured at 1.0000 of tool calls,
+        which is why a suite where tier 1 fired everywhere would be a suite whose workloads did not
+        resemble anything real.
 
-    Tier 1 genuinely predicting, being confirmed, and being squashed is covered by
-    ``tests/integration/test_t1_end_to_end.py``, on a turn that emits several calls.
+        Tier 1 genuinely predicting, being confirmed, and being squashed is covered by
+        ``tests/integration/test_t1_end_to_end.py``, on a turn that emits several calls.
     """
     world = standard_world()
     adapter, registry = workload.make(world)
@@ -266,9 +264,7 @@ async def test_the_comparison_is_not_vacuous(tmp_path: Path, workload: Workload)
 
 
 @pytest.mark.parametrize("workload", WORKLOADS, ids=lambda w: w.name)
-async def test_the_relation_notices_an_extra_effect(
-    tmp_path: Path, workload: Workload
-) -> None:
+async def test_the_relation_notices_an_extra_effect(tmp_path: Path, workload: Workload) -> None:
     """The shape a leak has: the speculative arm did something the sequential one did not."""
     from dataclasses import replace
 

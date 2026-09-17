@@ -118,12 +118,21 @@ class BranchTools:
         self._branch = branch
         self._node_id = node_id
 
-    async def call(self, name: str, args: Mapping[str, JsonValue]) -> JsonValue:
+    async def call(
+        self, name: str, args: Mapping[str, JsonValue], *, step: int | None = None
+    ) -> JsonValue:
+        """Issue one tool call. ``step`` names the program position instead of taking the next.
+
+        A node body calling this directly takes the next position, which is right: the runtime
+        has no other notion of where it is. A model-emitted block passes its *ordinal*, because
+        the position a call occupies is where the model put it, not when the runtime got round
+        to running it -- and early issue and speculation both run calls out of that order.
+        """
         scheduler = self._scheduler
         branch = self._branch
         spec = scheduler.registry.get(name)
         call = ToolCall(name=name, args=dict(args))
-        step = branch.advance_step()
+        step = branch.advance_step() if step is None else branch.reserve_step(step)
 
         hazard = analyse(
             branch,
@@ -220,7 +229,15 @@ class Scheduler:
         return event
 
     def mark_parked(self, branch: Branch) -> None:
-        self._park_event(branch.id).set()
+        """Signal the branch whose quiesce loop decides when to drain.
+
+        Resolved through adoption rather than taken as given. Park events are keyed by branch
+        id, and a confirmed speculation that stages *after* its buffer was adopted would
+        otherwise set an event on its own key -- which nothing waits on, because only the
+        canonical branch's loop is running. The effect then sits correctly placed on the
+        parent's list and still never leaves, which is the same silent hang by a subtler route.
+        """
+        self._park_event(self.buffer.drain_owner_id(branch)).set()
 
     def record_stall(self, step: int, hazard: Hazard) -> None:
         self._stalls.append((step, hazard))
@@ -874,6 +891,10 @@ class SpeculativeTurn:
         self.confirmed = 0
         self.squashed = 0
         self.stalled = 0
+        self._base = 0
+        #: Slot tasks whose work was adopted from a confirmed speculation. They may be parked
+        #: on an ack this branch has to drain, which an ordinary slot task never is.
+        self._adopted_tasks: set[asyncio.Task[JsonValue]] = set()
         self._history: list[ToolCall] = []
         self._results_so_far: list[JsonValue] = []
         self._predicted: ToolCall | None = None
@@ -886,6 +907,10 @@ class SpeculativeTurn:
         scheduler = self._scheduler
         branch = self._branch
         tools = BranchTools(scheduler, branch, self._node_id)
+        # Program positions for this turn are reserved from here by ordinal, so block k always
+        # occupies base + k + 1 whether it was issued early, staged after the stream, or run on
+        # a speculation that was later adopted.
+        self._base = branch.cursor.step_index
 
         # Slots are preallocated as blocks parse and filled by ordinal. Program order is
         # structural: a result never appends on completion, because the order the model asked
@@ -928,9 +953,22 @@ class SpeculativeTurn:
         for ordinal, emitted in enumerate(self.decisions):
             task = slots[ordinal]
             if task is not None:
+                if task in self._adopted_tasks and not task.done():
+                    # The only slot this branch cannot finish on its own: an adopted
+                    # speculation parked on a staged write's ack, which only the drain
+                    # completes. Signalled here rather than at adoption so that every write
+                    # emitted before this block is already staged and the drain dispatches
+                    # them in the order the model asked for.
+                    scheduler.mark_parked(branch)
                 results.append(await task)
                 continue
-            results.append(await tools.call(emitted.name, emitted.args))
+            results.append(
+                await tools.call(emitted.name, emitted.args, step=self._base + ordinal + 1)
+            )
+        # The turn consumed exactly one position per emitted block, however they were executed.
+        # Set rather than accumulated: an adopted block was run on the child, so the parent's
+        # cursor never passed through its position on the way here.
+        branch.reserve_step(self._base + len(self.decisions))
         return results
 
     async def _speculate_next(self, after: ToolCall) -> None:
@@ -992,13 +1030,30 @@ class SpeculativeTurn:
         self._speculative = child
         self._tier = prediction.tier
         tools = BranchTools(scheduler, child, self._node_id)
-        self._open = asyncio.create_task(self._run_speculation(tools, child, decision))
+        # The block this predicts would be the next one the model emits, so it occupies the
+        # next ordinal. Reserving it here is what keeps a confirmed speculation's effect at the
+        # same program position the sequential run would have given it.
+        predicted_step = self._base + len(self.decisions) + 1
+        self._open = asyncio.create_task(
+            self._run_speculation(tools, child, decision, predicted_step)
+        )
 
     async def _run_speculation(
-        self, tools: BranchTools, child: Branch, decision: ToolCall
+        self, tools: BranchTools, child: Branch, decision: ToolCall, step: int
     ) -> JsonValue:
-        child.advance_step()
-        return await tools.call(decision.name, decision.args)
+        """Run the predicted call on the child, at the program position the parent would use.
+
+        Exactly one step is taken, by ``BranchTools.call`` -- the same single advance the
+        canonical branch makes for the same call. An extra ``child.advance_step()`` here made
+        the child burn two positions for one call, which the parent's single advance at confirm
+        then cancelled *only by coincidence*: the two off-by-ones agreed when one parent-issued
+        early read happened to be pending-unstarted at fork time, and diverged otherwise. When
+        they diverged the adopted effect's step index was wrong, so its idempotency key was
+        wrong, so a resume with speculation off would not dedupe against a crashed run that had
+        it on -- and the effect would be delivered twice. Hard Rule 9 sees it as a ledger
+        mismatch; Hard Rule 8 is what it actually breaks.
+        """
+        return await tools.call(decision.name, decision.args, step=step)
 
     async def _resolve_prediction(self, actual: ToolCall) -> None:
         """The model just said what it actually wants. Compare, and keep or throw away."""
@@ -1018,22 +1073,20 @@ class SpeculativeTurn:
             # canonical branch retires, and the drain dispatches by branch id, so an effect
             # left behind here is one no drain will ever find and one whose ack the node body
             # waits on forever.
-            # The canonical branch is about to *not* make this call -- it takes the child's
-            # completed work instead. It must still take the program position the call would
-            # have occupied, because every later call's idempotency key is derived from the
-            # step index. Without this the same run dispatches the same effects under
-            # different keys depending on whether it happened to speculate, so a resume with
-            # speculation off would not dedupe against a crashed run that had it on, and the
-            # effect would be delivered twice. Hard Rule 9 catches it as a ledger mismatch.
-            self._branch.advance_step()
-            adopted = await scheduler.buffer.adopt(child, self._branch)
-            if adopted:
-                # Park events are keyed by branch id, and the one the child set when it staged
-                # is on the child's key -- which nothing waits on. The canonical branch is the
-                # one whose quiesce loop decides when to drain, so it has to be told that it
-                # now holds an effect a node body is blocked on. Without this the effect moves
-                # to the right list and still never leaves.
-                scheduler.mark_parked(self._branch)
+            # No cursor arithmetic here any more. The canonical branch does not make this
+            # call, but the position it would have occupied was reserved by ordinal before the
+            # speculation ran, and the end of the turn sets the cursor past it. An advance here
+            # used to compensate for the child taking two positions for one call, and the two
+            # errors cancelled only by coincidence.
+            await scheduler.buffer.adopt(child, self._branch)
+            # Deliberately no park signal here. Waking the scheduler at this point drains a
+            # buffer that holds the adopted effect and nothing else -- the writes from blocks
+            # the model emitted *earlier* are staged after the stream ends, so they are not
+            # there yet. The adopted call then reached the world before the call that preceded
+            # it, and the order effects arrived depended on whether the runtime speculated.
+            # The parent parks when it actually needs this ack, which is in the results loop.
+            if self._open is not None:
+                self._adopted_tasks.add(self._open)
             await scheduler.journal.append_async(
                 scheduler.run_id,
                 "branch_resolved",
@@ -1103,7 +1156,7 @@ class SpeculativeTurn:
         """
         self._branch.unjournaled_reads += 1
         try:
-            value = await tools.call(decision.name, decision.args)
+            value = await tools.call(decision.name, decision.args, step=self._base + ordinal + 1)
         finally:
             self._branch.unjournaled_reads -= 1
         self._results_so_far.append(value)

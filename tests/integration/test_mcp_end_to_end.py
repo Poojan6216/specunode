@@ -125,9 +125,7 @@ async def test_the_upstreams_own_schema_is_what_the_client_is_shown(tmp_path: Pa
 
 async def test_a_read_reaches_the_upstream_immediately(tmp_path: Path) -> None:
     async with proxy_client(tmp_path) as session:
-        result = await asyncio.wait_for(
-            session.call_tool("get_ticket", {"ticket_id": "tkt-1"}), 60
-        )
+        result = await asyncio.wait_for(session.call_tool("get_ticket", {"ticket_id": "tkt-1"}), 60)
         assert "cus-1" in text_of(result), text_of(result)
     assert upstream_calls(tmp_path / "upstream.log") == ["get_ticket"]
 

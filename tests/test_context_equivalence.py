@@ -54,9 +54,7 @@ TIERS = ("t0", "t1")
 
 
 def _cases() -> list[object]:
-    return [
-        pytest.param(w, tier, id=f"{w.name}-{tier}") for w in WORKLOADS for tier in TIERS
-    ]
+    return [pytest.param(w, tier, id=f"{w.name}-{tier}") for w in WORKLOADS for tier in TIERS]
 
 
 def run_with(

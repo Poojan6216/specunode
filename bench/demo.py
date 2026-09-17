@@ -551,13 +551,18 @@ async def demo_past_write(as_json: bool = False) -> int:
 
 # -- Demo 3's world and tools, shared with bench/_demo3_agent.py -------------------------------
 
+
 def demo3_world(directory: Path) -> World:
     """A world backed by a durable log, so a resume can see what the dead process sent."""
     world = World(log_path=directory / "world.jsonl")
     if not world.tables["jobs"]:
         for index in range(1, 4):
             world.seed(
-                "jobs", f"etl-{index}", job_id=f"etl-{index}", status="failed", restarts=0,
+                "jobs",
+                f"etl-{index}",
+                job_id=f"etl-{index}",
+                status="failed",
+                restarts=0,
                 reserved=0,
             )
         world.seed("docs", "restart", text="Restart the job, then confirm it flips to running.")
@@ -592,6 +597,7 @@ def demo3_registry(world: World) -> ToolRegistry:
         ToolSpec(name="post_summary", effect=EffectClass.WRITE, fn=world.post_summary)
     )
     return registry
+
 
 # -- Demo 3: the honest one -------------------------------------------------------------------
 
@@ -688,9 +694,7 @@ async def _replay(
     registry = demo3_registry(world)
     source = Journal(directory / "journal.db")
     recovery = recover(source, run_id)
-    target = ReplayModel(
-        journal=source, run_id=run_id, retired_branches=recovery.retired_branches
-    )
+    target = ReplayModel(journal=source, run_id=run_id, retired_branches=recovery.retired_branches)
     fresh = Journal(directory / f"replay-{'on' if speculation else 'off'}.db")
     scheduler = Scheduler(
         graph=PastWriteGraph("specunode", system=system),  # type: ignore[arg-type]
