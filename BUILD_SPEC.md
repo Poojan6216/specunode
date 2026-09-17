@@ -1014,8 +1014,8 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Two independent adversarial audits have found 40 defects here, six of them critical, and all
-40 are fixed.** That number is the most useful thing in this report, so it is at the top rather
+**Three independent adversarial audits have found 53 defects here, nine of them critical, and
+all 53 are fixed.** The counts, in order, were **23, 17, 13.** That number is the most useful thing in this report, so it is at the top rather
 than buried: the version of this document written a day earlier described a finished project.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
@@ -1114,6 +1114,32 @@ Ten strategies run; eight defeat the runtime.
 
 Held: 7.7 drafter poisoning (8 predictions, 8 squashed, 2,000 wasted tokens, 0 leaks) and 7.8
 replay under model drift (both cases diverge at step 0).
+
+### What the third audit found, in the second audit's fixes
+
+Three criticals, all inside the lattice-rule-E3 wiring committed the day before.
+
+**Turning speculation on disabled the check that makes speculation safe.** `adopt()` moved a
+confirmed speculation's staged *effects* to the branch that retires and left its `read_set`
+behind on the child. A confirmed speculation never retires, so `validate_reads` never ran over
+it — and the reads it made are by definition the ones issued on a guess, which are the only
+reads E3 exists to re-check. Measured: with speculation off the run refused and nothing reached
+the world; with it on the run returned `ok=True` and the write went out.
+
+**`_run_in_node` discarded `_retire`'s verdict** — the twin of a bug fixed three lines above it
+in the same commit. **A re-probe that raised retired the branch as if fresh**, and `unreadable`
+was excluded from `witnessed`, so a run where every probe errored rendered as `0/0 fresh`.
+
+One agent was asked only to plant bugs in `src/` and report which ones the three mandatory tests
+failed to catch. **Three plants survived**: an effect dispatched with different arguments than
+were staged (the world join compared idempotency keys, which are labels, and never the call);
+Rule 3's ordering invariant never being applied to a real scheduler run; and the Rule 13
+fail-closed refusal being deletable outright. All three are now caught.
+
+It also found `specunode resume <unknown-run-id>` starting a fresh run and dispatching every
+write in the workload — under brand-new keys the dedupe table could not match — and
+`specunode verify-ledger` being structurally incapable of verifying anything, because
+`sign-ledger` printed the signature and stored it nowhere.
 
 ### What the second audit found, in the first audit's fixes
 
@@ -1362,17 +1388,21 @@ passing tests. I fixed all 23, verified every fix against the broken code, and w
 again. A second audit found 17 more — including four criticals, two of them *inside* the fixes
 I had just written, one of them two fixes from the same commit cancelling each other out.
 
-The counts are 23 then 17. That is a decline, not a convergence, and nobody should read the
-second number as "nearly done". The honest inference from two data points is that a third pass
-finds more, and the useful question is not whether this codebase is finished but how much
+The counts are 23, 17, 13. That is a decline and it is not a convergence, and nobody should read
+the third number as "nearly done" — the second audit said the same thing about the second number
+and was wrong. The useful question is not whether this codebase is finished but how much
 independent scrutiny per change it turns out to need. For work of this shape — one author, deep
 invariants, a test suite written by the same person who wrote the bugs — the answer measured
-here is: a great deal more than feels necessary at the time.
+here is: a great deal more than feels necessary at the time, and more than one round.
+
+**Nine of the fifty-three defects were inside repairs**, and every one of those repairs was
+written immediately after finding something, which is exactly when judgment is least
+trustworthy and feels most reliable.
 
 **Distrust a fix more than the defect it repairs.** A defect is written once. Its repair is
 written by the same judgment, under more time pressure, with the satisfaction of having found
 something — and it touches code that is by definition subtle enough to have been got wrong
-already. Six of the 40 defects here were in repairs. Every fix in the last two rounds was
+already. Nine of the 53 defects here were in repairs. Every fix in the last three rounds was
 therefore verified by reverting it and watching the new test fail first, which is cheap and
 caught two tests that would otherwise have passed against the unfixed code.
 
