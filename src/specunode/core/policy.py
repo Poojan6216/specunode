@@ -19,9 +19,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-__all__ = ["AlphaWindow", "Budget", "Policy", "StaleReadAction"]
+__all__ = [
+    "AlphaWindow",
+    "Budget",
+    "Policy",
+    "StaleReadAction",
+    "UnverifiableReadAction",
+]
 
 StaleReadAction = Literal["squash", "stall"]
+#: What to do when a witnessed read cannot be re-checked at retirement at all -- the probe
+#: raised, or the tool cannot be re-fetched.
+UnverifiableReadAction = Literal["proceed", "squash"]
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,17 @@ class Policy:
     #: on is legitimate and is measured in attack 7.9, and the docs say why it is not default.
     stage_irreversible: bool = False
     on_stale_read: StaleReadAction = "squash"
+    #: A read whose *re-check* failed is not the same fact as a read that went stale, and the
+    #: default reflects that. An upstream that cannot answer the probe is usually an upstream
+    #: that is about to fail the dispatch too -- and the drain's own handling is strictly more
+    #: informative there, because it dead-letters the effect by name and leaves a human a
+    #: specific thing to resolve. Squashing first replaces that with "unverifiable", which is
+    #: less useful and pre-empts the project's whole answer to the two-generals problem.
+    #:
+    #: Set to ``"squash"`` where an upstream that can fail a read while succeeding a write is a
+    #: real threat. Either way the count is journaled and rendered: an unchecked read is never
+    #: reported as a checked one, which is the property that actually has to hold.
+    on_unverifiable_read: UnverifiableReadAction = "proceed"
 
     def __post_init__(self) -> None:
         if self.max_inflight_branches < 1:

@@ -589,7 +589,19 @@ class Scheduler:
             )
         # State on this path belongs to the framework's checkpointer, so no delta is journaled
         # and none is passed here.
-        await self._retire(branch, node_id)
+        #
+        # The verdict is checked, not discarded. ``_retire`` returns False when it refuses --
+        # today that is lattice rule E3 finding a witnessed read went stale -- and the
+        # scheduler-driven loop has always consumed that flag. This path threw it away, so on
+        # the LangGraph adapter a branch whose read had gone stale was squashed, its writes
+        # discarded, and the run then walked on to the next node and dispatched *its* writes,
+        # returning ok=True with a clean ledger. The twin of this bug, ``_quiesce``'s outcome
+        # being discarded, was fixed three lines above and this one was left.
+        drained, _state = await self._retire(branch, node_id)
+        if not drained:
+            raise SchedulerError(
+                f"node {node_id} did not retire: {branch.reason or 'no reason recorded'}"
+            )
         self._cursor = branch.cursor
         self._steps += 1
         # LangGraph owns reducers and channel semantics, and a second copy in the journal would
@@ -804,17 +816,32 @@ class Scheduler:
                     "fresh": validation.fresh,
                     "stale": validation.stale,
                     "unwitnessed": validation.unwitnessed,
+                    "unreadable": validation.unreadable,
                     "total": len(validation.verdicts),
                     "probes": validation.probes,
                 },
             )
             self.counters.reads_validated += validation.fresh
             self.counters.reads_stale += validation.stale
-        if validation.stale and self.policy.on_stale_read == "squash":
-            # The branch computed its arguments from a value that has since changed. Its writes
-            # are not authorised by anything the world still agrees with, so it does not retire
-            # and the store buffer discards what it staged, unsent.
-            branch.squash(f"{validation.stale} witnessed read(s) went stale before retirement")
+        refuse = validation.stale and self.policy.on_stale_read == "squash"
+        # A read whose re-check *failed* is a different fact from one that went stale, and it
+        # gets its own policy. It is never silently treated as fresh -- the count is journaled
+        # and rendered either way -- but refusing on it by default pre-empts the drain, whose
+        # failure handling dead-letters the effect by name and is strictly more informative
+        # when the upstream is simply unreachable.
+        refuse = refuse or (
+            validation.unreadable and self.policy.on_unverifiable_read == "squash"
+        )
+        if refuse:
+            # The branch computed its arguments from a value the world may no longer agree
+            # with. Its writes are not authorised by anything that has been confirmed, so it
+            # does not retire and the store buffer discards what it staged, unsent.
+            detail = (
+                f"{validation.stale} stale, {validation.unreadable} unreadable"
+                if validation.unreadable
+                else f"{validation.stale} witnessed read(s) went stale"
+            )
+            branch.squash(f"{detail} before retirement")
             discarded = await self.buffer.discard_and_journal(branch, "stale_read")
             self.counters.effects_discarded += discarded
             await self.journal.append_async(

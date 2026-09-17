@@ -161,3 +161,220 @@ async def test_the_policy_is_read_rather_than_journaled_and_ignored(tmp_path: Pa
     assert [m.tool for m in squash_world.mutations] == []
     # Different setting, different outcome. That is the whole assertion.
     assert stall_result.ok is not squash_result.ok or bool(stall_world.mutations)  # type: ignore[attr-defined]
+
+
+# -- the reads E3 exists for --------------------------------------------------------------------
+
+
+async def read_arm(
+    tmp_path: Path, *, speculate: bool, db: str
+) -> tuple[object, World, Journal, str]:
+    """A three-call turn whose middle read is the one a speculation runs ahead."""
+    from tests.integration.test_speculation import FixedDrafter, OneTurnGraph
+
+    from specunode.core.decision import ToolCall
+
+    world = standard_world()
+    registry = registry_with_concurrent_writer(world, interfere=True)
+    registry.register(
+        ToolSpec(name="fetch_runbook", effect=EffectClass.READ, fn=world.fetch_runbook)
+    )
+    journal = Journal(tmp_path / db)
+    scheduler = Scheduler(
+        graph=OneTurnGraph(),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(
+            ScriptedModel(
+                turns=[
+                    tool_turn(
+                        ("fetch_runbook", {"section": "restart"}),
+                        ("get_pipeline_status", {"pipeline_id": "etl-1"}),
+                        ("restart_job", {"job_id": "etl-1"}),
+                        turn=0,
+                    )
+                ],
+                block_delay_ms=25.0,
+            ),
+            journal,
+            provider="scripted",
+        ),
+        policy=Policy(speculation=True, on_stale_read="squash"),
+        predictor=(
+            FixedDrafter(ToolCall("get_pipeline_status", {"pipeline_id": "etl-1"}))
+            if speculate
+            else None
+        ),
+    )
+    run_id = new_ulid()
+    return await scheduler.run(run_id, {}), world, journal, run_id
+
+
+@pytest.mark.timeout(60)
+async def test_a_stale_read_made_by_a_confirmed_speculation_is_still_caught(
+    tmp_path: Path,
+) -> None:
+    """Turning speculation ON used to disable the check that makes speculation safe.
+
+    ``adopt`` moved a confirmed speculation's staged *effects* to the branch that retires, and
+    left its ``read_set`` behind on the child. A confirmed speculation never retires, so
+    ``validate_reads`` never ran over it -- and the reads it made are by definition the ones
+    issued on a guess, which are the only reads lattice rule E3 exists to re-check. E3 was
+    validating the canonical branch's own reads, which by the module's own doctrine need no
+    validation, and skipping the genuine guesses.
+
+    Measured before the fix on exactly this turn: with speculation off the run refused and
+    nothing reached the world; with it on the run returned ok=True, ``restart_job`` reached the
+    world, and the tally showed one read validated instead of two.
+    """
+    sequential, seq_world, _, _ = await read_arm(tmp_path, speculate=False, db="e3-seq.db")
+    speculative, spec_world, journal, run_id = await read_arm(
+        tmp_path, speculate=True, db="e3-spec.db"
+    )
+
+    assert not sequential.ok  # type: ignore[attr-defined]
+    assert [m.tool for m in seq_world.mutations] == []
+
+    assert not speculative.ok, (  # type: ignore[attr-defined]
+        "the speculative arm retired despite a stale read -- E3 skipped the read the "
+        "speculation itself made"
+    )
+    assert [m.tool for m in spec_world.mutations] == [], (
+        "a write computed from a stale speculative read reached the world"
+    )
+
+    validated = [entry.payload for entry in journal.read(run_id, kinds=["read_validated"])]
+    assert any(int(p["stale"]) > 0 for p in validated), "the speculation's stale read was missed"
+    assert sum(int(p["total"]) for p in validated) >= 2, (
+        "the speculation's read was never counted, so it was never re-checked"
+    )
+
+
+@pytest.mark.timeout(60)
+async def test_a_reprobe_that_raises_does_not_count_as_fresh(tmp_path: Path) -> None:
+    """An unchecked read is not a checked one -- the docstring said so and the gate did not.
+
+    ``validate_reads`` recorded ``unreadable`` for a probe that raised, and nothing consulted
+    it: ``_retire`` gated on ``stale`` alone, so the write dispatched. ``unreadable`` also had
+    no counter, was absent from the journal payload, and was excluded from ``witnessed`` -- so
+    the read vanished from both the numerator and the denominator, and a run where every probe
+    errored rendered as ``0/0 fresh``. Any flaky or hostile upstream turned E3 off silently.
+    """
+    world = standard_world()
+    registry = ToolRegistry()
+    calls = {"n": 0}
+
+    async def flaky_status(pipeline_id: str) -> JsonValue:
+        calls["n"] += 1
+        if calls["n"] > 1:  # the retirement-time re-probe
+            raise RuntimeError("upstream refused the re-check")
+        return await world.get_pipeline_status(pipeline_id=pipeline_id)
+
+    registry.register(
+        ToolSpec(
+            name="get_pipeline_status",
+            effect=EffectClass.READ,
+            fn=flaky_status,
+            witness=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="restart_job", effect=EffectClass.WRITE, fn=world.restart_job, idempotent=True
+        )
+    )
+    journal = Journal(tmp_path / "flaky.db")
+    scheduler = Scheduler(
+        graph=OneTurnGraph(),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(
+            ScriptedModel(turns=[tool_turn(*TURN, turn=0)], block_delay_ms=20.0),
+            journal,
+            provider="scripted",
+        ),
+        policy=Policy(speculation=True, on_stale_read="squash", on_unverifiable_read="squash"),
+    )
+    run_id = new_ulid()
+    result = await scheduler.run(run_id, {})
+
+    assert not result.ok, "a read whose re-check raised was treated as freshly validated"
+    assert [m.tool for m in world.mutations] == [], (
+        "a write backed by a read nobody could re-check reached the world"
+    )
+    validated = [entry.payload for entry in journal.read(run_id, kinds=["read_validated"])]
+    assert any(int(p.get("unreadable", 0)) > 0 for p in validated), (
+        "the failed re-probe was not recorded as unreadable"
+    )
+    # And it is never folded into the fresh count, under either policy.
+    assert all(int(p["fresh"]) == 0 for p in validated), (
+        "an unchecked read was counted as a checked one"
+    )
+
+
+@pytest.mark.timeout(60)
+async def test_an_unreadable_probe_is_visible_even_when_the_policy_proceeds(
+    tmp_path: Path,
+) -> None:
+    """The default lets the drain decide, and still refuses to call the read fresh.
+
+    ``on_unverifiable_read`` defaults to ``proceed`` because an upstream that cannot answer a
+    re-probe is usually one that is about to fail the dispatch too, and the drain's handling is
+    strictly more informative there: it dead-letters the effect by name. Refusing first replaces
+    a specific dead letter with "unverifiable" and pre-empts the project's whole answer to the
+    two-generals problem -- the chaos matrix and the partition test both stopped exercising it.
+
+    What must hold under either policy is that the read is never reported as checked.
+    """
+    world = standard_world()
+    registry = ToolRegistry()
+    calls = {"n": 0}
+
+    async def flaky_status(pipeline_id: str) -> JsonValue:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("upstream refused the re-check")
+        return await world.get_pipeline_status(pipeline_id=pipeline_id)
+
+    registry.register(
+        ToolSpec(
+            name="get_pipeline_status",
+            effect=EffectClass.READ,
+            fn=flaky_status,
+            witness=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="restart_job", effect=EffectClass.WRITE, fn=world.restart_job, idempotent=True
+        )
+    )
+    journal = Journal(tmp_path / "flaky-proceed.db")
+    scheduler = Scheduler(
+        graph=OneTurnGraph(),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(
+            ScriptedModel(turns=[tool_turn(*TURN, turn=0)], block_delay_ms=20.0),
+            journal,
+            provider="scripted",
+        ),
+        policy=Policy(speculation=True),  # on_unverifiable_read defaults to "proceed"
+    )
+    run_id = new_ulid()
+    result = await scheduler.run(run_id, {})
+    assert result.ok, result.error
+
+    validated = [entry.payload for entry in journal.read(run_id, kinds=["read_validated"])]
+    assert any(int(p.get("unreadable", 0)) > 0 for p in validated), (
+        "the failed re-probe left no trace at all, which is the silent-disable this guards"
+    )
+    assert all(int(p["fresh"]) == 0 for p in validated), (
+        "an unchecked read was counted as a checked one"
+    )

@@ -69,6 +69,29 @@ class ReadValidation:
         return sum(1 for v in self.verdicts if v.verdict == "unwitnessed")
 
     @property
+    def unreadable(self) -> int:
+        """Reads the re-probe could not complete: it raised, or the tool cannot be re-fetched.
+
+        Counted, because an unchecked read is not a checked one. This had no counter at all, so
+        it was absent from the journal payload and from the rendered tally, and ``_retire``
+        gated only on ``stale`` -- meaning a probe that raised was treated exactly like a probe
+        that came back fresh, and the write dispatched. Any flaky or hostile upstream turned E3
+        off silently, and the ledger printed 100% fresh while doing it.
+        """
+        return sum(1 for v in self.verdicts if v.verdict == "unreadable")
+
+    @property
+    def unverified(self) -> int:
+        """Everything that was *not* positively confirmed fresh and is not a known unknown.
+
+        Stale and unreadable both mean "this branch's writes are not backed by a value the
+        world still agrees with". ``unwitnessed`` is deliberately excluded: it is a third
+        verdict the design reports honestly rather than a failure, because a read with no
+        witness was never checkable and refusing every one of them would stop most workloads.
+        """
+        return self.stale + self.unreadable
+
+    @property
     def raced_drain(self) -> int:
         return sum(1 for v in self.verdicts if v.raced_drain)
 

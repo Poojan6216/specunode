@@ -207,6 +207,11 @@ class Branch:
     #: pre-read status afterwards and silently demoted a CONFIRMED branch back to SPECULATIVE.
     #: The same shape could have promoted a squashed branch, which Hard Rule 3 forbids.
     unjournaled_reads: int = 0
+    #: How many entries of ``read_set`` were copied from the parent at fork time. Everything
+    #: after that index is a read *this* branch made, which is what adoption has to hand back:
+    #: a confirmed speculation never retires, so a read it made on a guess would otherwise be
+    #: the one read lattice rule E3 never re-checks.
+    inherited_reads: int = 0
     reason: str | None = None
     cursor: StepCursor = field(default_factory=StepCursor)
     #: The branch's working copy. A BranchState rather than a plain dict so that the fork is
@@ -277,6 +282,7 @@ class Branch:
             state=self.state.fork(),
             context=list(self.context),
             read_set=list(self.read_set),
+            inherited_reads=len(self.read_set),
             tier=tier,
         )
 
@@ -376,6 +382,10 @@ class Branch:
     def reads_to_validate(self) -> Sequence[ReadRecord]:
         """Reads issued while this branch was still a guess -- the only ones E3 re-checks."""
         return [record for record in self.read_set if record.issued_while_speculative]
+
+    def own_reads(self) -> Sequence[ReadRecord]:
+        """Reads this branch made itself, excluding the ones it inherited at fork time."""
+        return self.read_set[self.inherited_reads :]
 
     def has_staged_slot(self) -> bool:
         """Whether any turn is waiting on a result that will never arrive."""

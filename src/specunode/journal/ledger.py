@@ -261,12 +261,22 @@ class ReadTally:
     fresh: int = 0
     stale: int = 0
     unwitnessed: int = 0
+    #: Re-probes that could not complete. A separate verdict again, and for the same reason:
+    #: folding it into ``fresh`` would report an unchecked read as a checked one, and dropping
+    #: it entirely removed it from both the numerator and the denominator of the rendered line.
+    unreadable: int = 0
     total: int = 0
 
     @property
     def witnessed(self) -> int:
-        """Reads that could be validated. ``fresh + stale`` by construction."""
-        return self.fresh + self.stale
+        """Reads that carried a witness, and so were *meant* to be validated.
+
+        ``fresh + stale + unreadable``. It used to be ``fresh + stale``, which dropped a read
+        whose re-probe raised from both the numerator and the denominator -- so a run where
+        every probe errored rendered as ``0/0 fresh`` rather than as nothing having been
+        checked. A denominator that shrinks when a check fails reports the failure as absence.
+        """
+        return self.fresh + self.stale + self.unreadable
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,6 +487,7 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
                 fresh=reads.fresh + max(0, _as_int(payload, "fresh", 0)),
                 stale=reads.stale + max(0, _as_int(payload, "stale", 0)),
                 unwitnessed=reads.unwitnessed + max(0, _as_int(payload, "unwitnessed", 0)),
+                unreadable=reads.unreadable + max(0, _as_int(payload, "unreadable", 0)),
                 total=reads.total + max(0, _as_int(payload, "total", 0)),
             )
             raced_from_validation += max(0, _as_int(payload, "raced_drain", 0))
@@ -1275,7 +1286,7 @@ def _summary(ledger: Ledger, *, ellipsis: str, equivalence_digest: str | None) -
         f"staged effects discarded: {ledger.discarded_effects}   "
         f"stalls: {len(ledger.stalls)}{stall_detail}",
         f"reads validated at retirement: {tally.fresh}/{tally.witnessed} fresh, "
-        f"{tally.unwitnessed} unwitnessed   "
+        f"{tally.unwitnessed} unwitnessed, {tally.unreadable} unreadable   "
         f"speculative reads upstream: {ledger.speculative_reads_upstream}   "
         f"reads racing a drain: {ledger.reads_raced_drain}",
         f"wasted tokens: {ledger.wasted_tokens:,}   alpha (window {window}): {alpha}{gate}   "

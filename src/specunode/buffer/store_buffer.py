@@ -399,6 +399,14 @@ class StoreBuffer:
         self._adopted_into[child.id] = parent.id
         self._lineages[parent.id] = parent.lineage
 
+        # The child's *reads* move too, and this is not bookkeeping. A confirmed speculation
+        # never retires, so ``validate_reads`` never runs over it -- and the reads it made are
+        # by definition the ones issued on a guess, which are the only reads lattice rule E3
+        # exists to re-check. Leaving them behind meant E3 validated the canonical branch's own
+        # reads (which need no validation by the module's own doctrine) and skipped the genuine
+        # guesses, so turning speculation *on* disabled the check that makes speculation safe.
+        parent.read_set.extend(child.own_reads())
+
         moved = self._staged.pop(child.id, [])
         if not moved:
             return 0
