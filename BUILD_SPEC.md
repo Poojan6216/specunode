@@ -1007,11 +1007,16 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 
 ## Final Report
 
-**Written 2026-09-16, after 65 of 71 tasks. The six that are open are listed below, and every
-one of them is blocked on a credential, a CI run, or a spend cap — not on more work I could do
-here.**
+**Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit.**
 
-**697 tests pass, 27 skip. `ruff` and the configured `mypy --strict` are clean.**
+**730 tests pass, 24 skip — 8 of them against a real Postgres 16 server.** `ruff check`,
+`ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
+stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
+list and was not installed, so a whole adapter had been type-checking against `Any`.
+
+**The audit found 23 defects behind 697 passing tests, two of them critical, and all 23 are
+fixed.** That number is the most useful thing in this report, so it is at the top rather than
+buried: the version of this document written a day earlier described a finished project.
 
 ### What was built, in five sentences
 
@@ -1100,7 +1105,48 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (8 predictions, 8 squashed, 2,000 wasted tokens, 0 leaks) and 7.8
 replay under model drift (both cases diverge at step 0).
 
-### What the coverage work found, and why none of it was visible before
+### What an independent audit found, after I had called it done
+
+Six reviewers, told to assume the author had fooled himself, each finding then adversarially
+verified. 23 confirmed, 1 dissolved. Two were critical and both were in code I had committed
+that same day as a fix:
+
+**The deadlock was not fixed.** `adopt()` is a point-in-time move, and the model can emit the
+confirming block while the speculation is still awaiting its own journal append — so it moved
+zero effects and the child staged into a list no drain visits. `_adopted_into` existed, was
+recorded, had a public accessor and a comment describing exactly this guard, and was read by
+nothing. Reproduced hanging at the shipped bench's own block delay.
+
+**The step-cursor fix was a coincidence.** A child burned two positions for one call and the
+parent's compensating advance cancelled it only when one early read happened to be pending at
+fork time. The real fault was that positions were handed out at *execution* time while early
+issue and speculation both execute out of program order. Fixing it properly exposed a third
+defect: effects reached the world in a different **order** with speculation on.
+
+**The MCP proxy could not register a single tool** — shipped, documented and "tested" in a state
+where it died before serving one request, because only its rules were tested and never its
+transport. Three more defects sat behind that one.
+
+**The Postgres backend was unreachable and its test proved nothing**: `Journal(dsn)` coerced the
+DSN to a file path and opened SQLite. Postgres 16 turned out to be installed on this machine, so
+it is now genuinely run — and three further defects had to be fixed before one row landed.
+
+**`bench/online/run_latency.py` did not exist** while four documents named that path and this
+report described it as written and blocked only on a credential.
+
+**Two checks cancelled each other out.** Rule 13's stamp was hard-coded true and its counter was
+hard-coded non-zero; a flag that never varies and a counter that never varies read as a working
+check while neither half does anything. The same shape appeared twice more: `CallScope.speculative`
+was never set on a model request, and the leak test's second invariant could not detect the fault
+class its own docstring named.
+
+The pattern underneath all of it, in one reviewer's words: *"the mechanisms are written,
+unit-tested and eloquently justified, but four of them are never wired into `Scheduler`, and a
+grep for call sites disproves what the docstrings assert."* And about the honesty apparatus I
+was proudest of: *"it verifies numbers and vocabulary rigorously, and never once asks whether a
+named file exists."*
+
+### What the earlier coverage work found, and why none of it was visible before
 
 The three mandatory tests originally ran on one workload at one tier, the demos were one of
 three, neither CLI command the spec names existed, and the MCP proxy had never been driven by a
@@ -1199,12 +1245,21 @@ The Progress Log has 130+ entries; these changed the shape of the build.
 |---|---|
 | Wheel on 3.11/3.12/3.13, macOS **and Ubuntu** | Verified on macOS for all three. Ubuntu is CI-only and CI has not been run. |
 | The three tests on every workload, every tier, **every CI job** | They run, are never skipped, and cover all three sample apps at tiers 0 and 1. Tier 2 is a draft *model* behind an optional extra — requiring it would make a mandatory test skippable, which is the one property these files may never have, so it has its own tests. The open clause is **every CI job**. |
-| Offline ✓, overhead ✓, adversarial ✓, **online latency** | Needs an API key. Not run. |
+| Offline ✓, overhead ✓, adversarial ✓, **online latency** | The runner exists and CI exercises all of it on every push with `--model scripted`. A real measurement needs an API key; a scripted report is stamped `is_real_model: false`. |
 | Published to PyPI; demoed from the published wheel | Needs credentials. |
 
-Also unverified, and stated rather than left to be discovered: **the Postgres journal backend is
-written and type-checked but has never been executed** — this machine has no Postgres and no
-Docker, and it needs the CI job.
+**The Postgres journal backend now runs.** Postgres 16.15 was installed on this machine, so it
+was stood up and the journal driven against it: append, read with an exclusive `after`, the
+dispatch-claim table and chain verification, with every row read back through a `psycopg`
+connection the `Journal` knows nothing about. Three defects had to be fixed first — it was
+unreachable, it never set `row_factory=dict_row` while every query indexes by column name, and
+the writer caught only `sqlite3` exceptions. The tests now prove which backend they are on
+before they assert anything, because the previous version passed by writing SQLite to a file
+named after the connection string.
+
+**Four CI jobs would have failed at install.** `uv sync --all-extras --dev` pulls the
+`local-draft` extra's `torch`, which has no wheel for every runner in the matrix. They now
+install the extras the tests need.
 
 Phase Gate 4's blocking half is met: the proxy works with a generic client, demonstrated against
 a real upstream server. Its remaining clause — that the ledger match the LangGraph integration's
@@ -1253,8 +1308,16 @@ entirely on numbers that need an API key.
 
 **Test transports, not only rules.** The single most expensive mistake here was testing the MCP
 proxy's rules without its transport. The reasoning was sound — the rules carry the correctness
-claims — and the result was a component that had never once started. Every place this codebase
-tests a policy without the thing that carries it deserves the same suspicion.
+claims — and the result was a component that had never once started. The audit found the same
+shape four more times: the Postgres backend, the online runner, Rule 13's gate and Demo 1's own
+headline row. Every place this codebase tests a policy without the thing that carries it
+deserves the same suspicion.
+
+**Get somebody else to look.** I closed four coverage gaps, found nine defects, wrote a Final
+Report, and called it done. An independent audit then found 23 more behind 730 passing tests,
+two of them critical, two of them in fixes I had committed hours earlier. My own assessment of
+my own work was the judgment that had already failed; the cheapest thing I did all project was
+stop trusting it.
 
 **Widen the coverage matrix again, and expect it to find more.** One workload at one tier became
 three at two, and one demo became three, and that found nine defects. That is not a comfortable
