@@ -85,15 +85,26 @@ stays complete.
 
 ## Anything the runtime did not derive must be declared
 
-Hard Rule 13's check rebuilds each prompt from the journal and compares it to what was sent.
-Material the runtime cannot re-derive — a system message assembled from graph state, a retrieved
-document, a templated turn — must pass through `PromptBuilder.inject()`, which records it so the
-derivable part stays under an exact comparison and the rest is counted.
+Hard Rule 13's check is **designed** to rebuild each prompt from the journal and compare it to
+what was sent. Material the runtime cannot re-derive — a system message assembled from graph
+state, a retrieved document, a templated turn — is meant to pass through
+`PromptBuilder.inject()`, which records it so the derivable part stays under an exact comparison
+and the rest is counted.
 
-Without that, the check reports a divergence on every step of every ordinary app, and the repair
-that suggests itself is to rebuild from the branch's own message list — which compares that list
-to itself and can never fail. A Rule 13 implementation that never fires is worse than none,
-because it still prints a stamp.
+**That rebuild is not implemented, and the runtime fails closed instead.** A branch that sent no
+request while speculating has nothing to rebuild, which is every run any shipped configuration
+produces: a speculative child runs a single tool call and never opens a turn of its own. A
+branch that *did* send one is refused at retirement — the store buffer declines to drain it and
+the run stops — rather than being stamped as checked. The ledger reads `context_identity:
+unchecked` on every run, and that stamp is the truth rather than a formality.
+
+Why it is refused rather than approximated: `fold_context` reconstructs the message list, while
+the recorded `request_hash` covers the whole projected envelope, so hashing one against the
+other can never match. The repair that suggests itself — rebuild from the branch's own message
+list — compares that list to itself and passes every time. A Rule 13 implementation that never
+fires is worse than none, because it still prints a stamp; for a while this one printed the
+stamp with no implementation behind it at all, which is how that sentence came to be written
+about its own author.
 
 ## The adapter suite
 

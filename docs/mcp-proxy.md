@@ -56,7 +56,13 @@ that it has not happened.
 **Hard Rule 13 cannot be enforced here.** The rule says a placeholder must never enter a model
 prompt. The proxy has no visibility of prompts, so it cannot check. Every run through the proxy
 is stamped `context_identity: unenforced`, and that stamp is the honest answer rather than a
-disclaimer — the in-process integrations stamp `enforced` because they actually checked.
+disclaimer.
+
+The in-process integrations do **not** stamp `enforced`; they stamp `unchecked`, because the
+retirement-time rebuild Rule 13 describes is not implemented there either. They fail closed
+instead — a branch that sent a request while speculating is refused at retirement rather than
+approved. See `docs/adapters.md`. This paragraph previously claimed those integrations
+"actually checked", which was not true of any of them.
 
 ## Two modes, and why the client chooses
 

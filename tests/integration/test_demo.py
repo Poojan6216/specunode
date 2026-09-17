@@ -195,3 +195,34 @@ def test_replay_with_speculation_off_completes() -> None:
     report = run_replay_demo()
     assert report["replay_with_speculation_off_ok"] is True
     assert report["replay_ledger_digest"]
+
+
+def test_demo_ones_specunode_row_is_produced_by_the_real_runtime() -> None:
+    """The front page's evidence table has to exercise the thing it is evidence for.
+
+    This row used to be a conditional in ``bench/baselines.py``, which by design cannot import
+    ``specunode.buffer`` -- the naive-parallel baseline has to be *able* to leak or the demo
+    measures nothing. That isolation is right for the baselines and meant SpecuNode's own row
+    was a description of a store buffer rather than a run of one. The numbers did not change
+    when it was rewired, which is the point: they were not wrong, they were just not
+    measurements of this software.
+
+    Asserted structurally rather than by eye, because "did this number come from the product?"
+    is exactly the question a table cannot answer about itself.
+    """
+    import bench.real_arm as real_arm
+
+    source = (REPO / "bench" / "real_arm.py").read_text(encoding="utf-8")
+    for required in (
+        "from specunode.core.scheduler import Scheduler",
+        "from specunode.buffer.store_buffer import StoreBuffer",
+        "from specunode.buffer.dispatcher import Dispatcher",
+    ):
+        assert required in source, f"the specunode arm no longer uses the real runtime: {required}"
+    assert hasattr(real_arm, "run_specunode_arm")
+
+    # And the counts it reports come from the runtime's own counters, not from the arm's
+    # arithmetic: a discarded effect is one the store buffer actually held back.
+    spec = arm(run_demo(), "specunode")
+    assert spec["staged_and_discarded"] == spec["mispredictions"] > 0
+    assert spec["effects_from_squashed_branches"] == 0

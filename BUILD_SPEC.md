@@ -1215,9 +1215,22 @@ accept that the clause holds only for clients that report node ids.
 ### Manual steps left for you
 
 1. **An Anthropic API key and a spend cap**, for the online latency benchmark (task 6.4). Set
-   `ANTHROPIC_API_KEY` and `SPECUNODE_BENCH_BUDGET_USD` (default 25). Decision Gate D2 says to
-   report the reduced *n* and its wider interval rather than raising the cap, and the runner is
-   written to do that.
+   `ANTHROPIC_API_KEY` and `SPECUNODE_BENCH_BUDGET_USD` (default 25), then run
+   `python bench/online/run_latency.py --out bench/results/latency.json`.
+
+   The runner exists and CI exercises the whole of it on every push via
+   `--model scripted`: the three arms, the timing, the spend accounting, the budget gate and
+   the bootstrap. What a key buys is the one thing a stand-in cannot provide, which is real
+   model latency; a scripted report is labelled `is_real_model: false` and says in its own
+   output that its numbers are not figures anyone should quote.
+
+   Decision Gate D2 says to report the reduced *n* and its wider interval rather than raising
+   the cap. The runner halts at the cap, records where it halted, and a test drives that gate.
+
+   **An earlier version of this report said the runner was "written to do that" while
+   `bench/online/` was an empty directory.** That was false, in the section of a project whose
+   stated purpose is to make such a claim impossible. It is recorded here rather than quietly
+   corrected.
 2. **PyPI credentials**, for task 9.3. `uv build` works and the wheel installs and runs on 3.11,
    3.12 and 3.13 locally.
 3. **Run CI once.** The Ubuntu matrix, the Postgres 16 job and the extras matrix have never

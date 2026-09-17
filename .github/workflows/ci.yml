@@ -125,6 +125,22 @@ jobs:
       - name: the journal's Postgres tests, against a real Postgres 16
         run: uv run pytest -q -m postgres
 
+  online-harness:
+    # The latency benchmark's *harness*, against a scripted target. Not a latency measurement,
+    # and the runner labels every report it writes that way. It runs here because the runner
+    # spent most of this project's life not existing while three documents named its path, and
+    # a benchmark nobody can execute without a credential is a benchmark nobody has executed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.11
+      - run: uv sync --extra anthropic --extra langgraph --extra mcp --extra postgres --extra bench --dev
+      - name: the online latency harness, with no API key
+        run: uv run python bench/online/run_latency.py --model scripted --tasks 3 --out /tmp/latency.json
+
   wheel:
     # Phase Gate 0 and task 9.3: the wheel must install and run on a clean interpreter.
     strategy:

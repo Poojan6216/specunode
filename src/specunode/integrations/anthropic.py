@@ -17,7 +17,7 @@ constructed from that configuration alone.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from specunode.canonical import JsonValue
 from specunode.core.model import (
@@ -170,15 +170,31 @@ class AnthropicModel:
                 "the Anthropic provider needs the optional extra: "
                 "pip install 'specunode[anthropic]'"
             ) from exc
+        # Same boundary, same reason as ``_params`` below: the SDK types each constructor
+        # keyword individually and a ``dict[str, object]`` cannot be matched against them.
         kwargs: dict[str, object] = {"max_retries": max_retries}
         if api_key is not None:
             kwargs["api_key"] = api_key
         if base_url is not None:
             kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        self._client = AsyncAnthropic(**cast(Any, kwargs))
+
+    # ``envelope_to_params`` returns a JSON-shaped mapping this module builds and validates
+    # itself. The SDK types each request field as its own TypedDict, which cannot be expressed
+    # through ``**kwargs`` of a ``dict[str, JsonValue]`` -- so mypy reports one error per field
+    # it cannot match, about thirty of them, none of which is a real defect.
+    #
+    # Worth recording why this only appeared now: ``anthropic`` is in mypy's
+    # ``ignore_missing_imports`` list and was not installed in the dev environment, so every
+    # one of these calls type-checked against ``Any`` and "mypy --strict clean" meant nothing
+    # here. Installing the extra is what made the checker look. The cast is narrow and
+    # deliberate; the alternative of leaving the package uninstalled is how a whole file
+    # escapes the type checker while appearing to pass it.
+    def _params(self, envelope: RequestEnvelope) -> Any:
+        return cast(Any, envelope_to_params(envelope))
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
-        raw = await self._client.messages.create(**envelope_to_params(envelope))
+        raw = await self._client.messages.create(**self._params(envelope))
         return ModelResponse(
             model=str(getattr(raw, "model", envelope.model)),
             content=_blocks_from_api(getattr(raw, "content", [])),
@@ -192,8 +208,7 @@ class AnthropicModel:
         That is the whole of the tier-0 drafter's input, and the reason it can issue a read
         before the turn ends. The pattern is Claude Code's streaming tool executor.
         """
-        params = envelope_to_params(envelope)
-        async with self._client.messages.stream(**params) as stream:
+        async with self._client.messages.stream(**self._params(envelope)) as stream:
             index = 0
             async for event in stream:
                 event_type = getattr(event, "type", "")

@@ -54,8 +54,23 @@ can tell afterwards whether the effect took place. That is the two-generals prob
 amount of bookkeeping removes it. What the runtime does instead is refuse to guess: a tool that
 declared `idempotent=True` is redelivered, and a tool that did not is **dead-lettered** and the
 run halts for a human. The consequence, visible in the kill/resume tests, is that a resumed run
-can reach a *prefix* of the effects an uninterrupted run reached. It will never reach effects
-the uninterrupted run did not, and it will never deliver one twice.
+can reach a *prefix* of the effects an uninterrupted run reached.
+
+**The dedupe guarantee is conditional, and the condition is that the model answers the same
+way twice.** An idempotency key is derived from the run, the node, the program position, the
+tool and the *arguments*. A resume re-asks the model for every turn the journal does not
+already hold. If it answers identically — which a recorded or scripted model always does — the
+key matches, the dedupe table sees the earlier attempt, and nothing is sent twice. If it answers
+differently, as a real model at non-zero temperature may, the resumed run produces a different
+call at the same position, derives a different key, and the dedupe table has nothing to match
+it against. The world then receives both, and no bookkeeping in this design connects them.
+
+So the honest statement is: **a resumed run never delivers the same call twice, and can deliver
+a second, different call the uninterrupted run would not have made.** Set `temperature: 0.0`
+(the config default) to make that window as small as a provider allows; it does not close it.
+
+Every kill/resume test here uses a deterministic `ScriptedModel`, so none of them can see this.
+That is a property of the fixtures, not evidence about the runtime.
 
 The docs say "at-least-once dispatch with deterministic idempotency keys". They do not say
 "exactly-once", and a vocabulary test fails the build if they ever do.

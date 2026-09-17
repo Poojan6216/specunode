@@ -20,6 +20,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from specunode.canonical import JsonValue
 from specunode.core.effects import EffectClass, ToolSpec, forward_keys_from_template
 from specunode.core.policy import Policy, StaleReadAction
 
@@ -73,9 +74,27 @@ class TargetConfig(_Model):
     provider: str = "anthropic"
     model: str = "claude-sonnet-5"
     #: Hard Rule 11: requests go to the endpoint the developer named, and nowhere else.
+    #: Passed to the adapter by :func:`specunode.runner.build_target`.
     base_url: str | None = None
     max_tokens: int = 4096
     temperature: float = 0.0
+
+    def envelope_defaults(self) -> dict[str, JsonValue]:
+        """Defaults for application code that builds its own ``RequestEnvelope``.
+
+        The runtime deliberately does **not** apply these. Hard Rule 13 makes the request the
+        unit of identity, so a runtime that quietly rewrote a developer's envelope -- swapping
+        the model, capping the tokens -- would make the journal's record of what was asked
+        untrue, and a replay would then refuse against a prompt nobody wrote.
+
+        They are here so an application has one place to read them from, and so this method is
+        the honest answer to "what reads these fields?" rather than "nothing does".
+        """
+        return {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+        }
 
 
 class DrafterConfig(_Model):

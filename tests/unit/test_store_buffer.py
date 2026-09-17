@@ -84,9 +84,16 @@ def build(tmp_path: Path) -> tuple[StoreBuffer, Journal, World, Dispatcher]:
 
 
 def speculative(branch_id: str = "br-1", parent: Branch | None = None) -> Branch:
+    """A branch that is running on a guess.
+
+    ``predicted`` is set even for the parentless case. Every branch is SPECULATIVE while its
+    node runs -- the canonical one included, until retirement confirms it -- so status alone
+    does not distinguish "this is a guess" from "this has not finished yet", and a fixture that
+    relied on status was asserting something weaker than its name.
+    """
     if parent is not None:
         return parent.fork(branch_id, predicted=ToolCall("x", {}), step=1)
-    return Branch(id=branch_id, status=BranchStatus.SPECULATIVE)
+    return Branch(id=branch_id, status=BranchStatus.SPECULATIVE, predicted=ToolCall("x", {}))
 
 
 def registry_of(dispatcher: Dispatcher, name: str) -> ToolSpec:

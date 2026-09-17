@@ -197,9 +197,7 @@ async def test_a_confirmed_write_reaches_the_upstream_in_handles_mode(tmp_path: 
     """
     log = tmp_path / "upstream.log"
     async with proxy_client(tmp_path, "--handles") as session:
-        held = await asyncio.wait_for(
-            session.call_tool("close_ticket", {"ticket_id": "tkt-1"}), 60
-        )
+        held = await asyncio.wait_for(session.call_tool("close_ticket", {"ticket_id": "tkt-1"}), 60)
         # The client is handed a placeholder, not a result, and nothing has been sent yet.
         assert "$specunode.handle:" in text_of(held), text_of(held)
         assert upstream_calls(log) == []

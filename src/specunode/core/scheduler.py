@@ -667,6 +667,44 @@ class Scheduler:
             return BranchOutcome.DONE
         return BranchOutcome.PARKED
 
+    def _verify_context(self, branch: Branch) -> int:
+        """Hard Rule 13 at retirement. Returns how many prompts were actually re-checked.
+
+        This used to be ``branch.context_verified = True`` with a hard-coded zero, which made
+        the store buffer's Rule 13 gate unreachable -- both drain call sites are below it. The
+        ledger stamp stayed honest (it reads ``unchecked`` at zero checks), but a branch that
+        *had* sent a request while guessing would have been marked verified without anything
+        looking at it, and its writes would have drained on the strength of that stamp.
+
+        **A branch that sent no speculative request has nothing to rebuild.** Saying so is not
+        the same as claiming a check, and it is the case every run takes today: a speculative
+        child runs a single tool call and never opens a turn of its own.
+
+        **A branch that did send one is refused.** Not rebuilt-and-compared, because that
+        comparison is not implementable correctly here yet: ``fold_context`` reconstructs the
+        *message list*, while the recorded ``request_hash`` covers the whole projected envelope
+        -- system blocks, tool declarations and all -- so hashing one against the other would
+        never match, and the repair that suggests itself (rebuild from the branch's own message
+        list) compares that list to itself and passes every time. That is by far the most
+        likely way to ship Rule 13 dead.
+
+        So this fails closed. The drain refuses, the run stops, and nothing downstream of a
+        request nobody verified reaches the world. A refusal on a path no shipped configuration
+        reaches costs nothing today and is the correct answer the day one does.
+        """
+        if not branch.speculative_prompts:
+            branch.context_verified = True
+            return 0
+
+        branch.context_verified = False
+        branch.reason = (
+            f"branch {branch.id} sent {branch.speculative_prompts} request(s) while "
+            "speculating, and the retirement-time rebuild is not implemented. Refusing rather "
+            "than stamping a check nobody performed (Hard Rule 13)."
+        )
+        self.counters.context_divergences += 1
+        return 0
+
     async def _retire(
         self,
         branch: Branch,
@@ -676,10 +714,7 @@ class Scheduler:
     ) -> tuple[bool, CommittedState | None]:
         """R5 through R9: confirm, make it durable, drain, then retire."""
         branch.confirm()
-        # Nothing to rebuild in sequential mode: every request this branch sent carried real
-        # values, because it never ran on a prediction. The count is what the ledger reports,
-        # and it is zero here rather than a claim that something was checked.
-        branch.context_verified = True
+        checked = self._verify_context(branch)
         confirmed_offset = await self.journal.append_async(
             self.run_id,
             "branch_resolved",
@@ -688,8 +723,8 @@ class Scheduler:
                 "branch_id": branch.id,
                 "step": branch.fork_step,
                 "status": "confirmed",
-                "context_verified": True,
-                "context_checks": [0, len(branch.prompts_sent)],
+                "context_verified": branch.context_verified,
+                "context_checks": [checked, len(branch.prompts_sent)],
             },
         )
         # Drain, let the node make progress, drain again. A node released by one drain can

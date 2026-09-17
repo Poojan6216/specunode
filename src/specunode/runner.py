@@ -115,4 +115,7 @@ def build_target(config: Config) -> ModelClient:
         )
     from specunode.integrations.anthropic import AnthropicModel
 
-    return AnthropicModel()
+    # base_url is passed, not ignored. It sits under a Hard Rule 11 comment -- "requests go to
+    # the endpoint the developer named, and nowhere else" -- and a config field that states a
+    # rule while being read by nothing states the opposite of that rule.
+    return AnthropicModel(base_url=config.target.base_url)

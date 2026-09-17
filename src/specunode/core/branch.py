@@ -311,8 +311,23 @@ class Branch:
         return self.cursor.step_index
 
     def record_prompt(self, step: int, request_hash: str) -> None:
+        """Record a request this branch sent, and whether it was sent on a guess.
+
+        "On a guess" means this branch exists because something *predicted* a decision --
+        ``predicted is not None`` -- not merely that its status is SPECULATIVE. Every branch is
+        SPECULATIVE while its node runs, including the canonical one, which is only confirmed
+        at retirement. Counting by status therefore marked every prompt in every run as
+        speculative, including the run's own real question.
+
+        That miscalibration was invisible only because ``_retire`` stamped ``context_verified``
+        unconditionally: the store buffer's Hard Rule 13 gate reads
+        ``speculative_prompts and not context_verified``, so the moment the stamp became
+        conditional the gate refused every branch in every run. A counter that is always
+        non-zero and a flag that is always true cancel out, and the pair reads as a working
+        check while neither half is doing anything.
+        """
         self.prompts_sent.append((step, request_hash))
-        if self.status is BranchStatus.SPECULATIVE:
+        if self.predicted is not None:
             self.speculative_prompts += 1
 
     def squash(self, reason: str) -> None:

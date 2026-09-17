@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bench.baselines import ArmResult, Runtime, Transcript, run_arm
+from bench.real_arm import run_specunode_arm
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
 from specunode.canonical import JsonValue, chash_bytes
@@ -101,6 +102,17 @@ async def demo_leak(as_json: bool = False) -> int:
     for runtime in (Runtime.NAIVE_PARALLEL, Runtime.SPECUNODE, Runtime.SEQUENTIAL):
         world = standard_world()
         registry = registry_for(world)
+
+        if runtime is Runtime.SPECUNODE:
+            # The real Scheduler, StoreBuffer and Dispatcher -- not a description of them.
+            # This row used to be a conditional in bench/baselines.py, which by design cannot
+            # import the store buffer (B_naive_parallel has to be able to leak). That was the
+            # right isolation for the baselines and meant the README's front-page evidence
+            # table never exercised the product whose row it was reporting.
+            results.append(
+                await run_specunode_arm(scripts, world, registry, measured_tool=MEASURED_TOOL)
+            )
+            continue
 
         def factory(seeded: World = world) -> World:
             return seeded
