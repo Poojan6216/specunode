@@ -13,10 +13,22 @@ a dirty one goes to the wire reports zero divergences forever and passes any tes
 against its own bookkeeping. ``RecordingModel`` sits at the wire and keeps the projection of
 every request, and that is what is compared.
 
-It runs over every workload in ``bench/workloads/``, at tier 0 and tier 1. That matters most
-for ``ops_agent``, which is the one workload that hands its turn to the runtime and therefore
-the only one where a speculative branch exists to send a prompt at all -- on the others the
-comparison is still made, and still has to hold, but it is the easy direction.
+It runs over every workload in ``bench/workloads/``, at tier 0 and tier 1.
+
+**What these runs actually prove, and what they do not.** Every workload has one model decision
+point, so each run records exactly one request, sent by the canonical branch before any branch
+has been forked. The two arms' requests are compared byte for byte and must match -- that is
+real, and it is the direction that catches a runtime perturbing a prompt by speculating near
+it. What is *not* exercised is the harder claim: that a request sent **by a speculative branch**
+is one the sequential run could have sent. No shipped path produces one. A speculative child
+runs a single tool call and never opens a turn of its own, so ``speculative_prompts`` is zero in
+every run here.
+
+That is asserted rather than assumed, by ``test_no_branch_ever_sends_a_request_while_guessing``.
+If speculation ever crosses a model turn, that test fails and someone has to come back and build
+the check this file is named for -- rather than the vacuous case quietly continuing to pass. The
+retirement-time rebuild Hard Rule 13 describes is deliberately not implemented; a branch that
+did send a request while guessing is refused at retirement instead. See ``docs/adapters.md``.
 """
 
 from __future__ import annotations
@@ -138,6 +150,22 @@ async def test_no_request_ever_carried_a_placeholder(
 
 
 # -- the structural check, and its planted bugs -------------------------------------------------
+#
+# READ THIS BEFORE TREATING THE TESTS BELOW AS EVIDENCE ABOUT THE RUNTIME.
+#
+# ``check_structural``, ``PromptBuilder`` and ``analyse_model_request`` are **not wired into the
+# shipped runtime**. The scheduler calls ``analyse()`` and ``analyse_decision()``, never
+# ``analyse_model_request``; nothing constructs a ``PromptBuilder``; nothing calls
+# ``check_structural``. The write-barrier tests further construct ``TurnFrame`` and
+# ``ResultSlot`` values that ``src/`` never produces, so ``Branch.has_staged_slot()`` is
+# permanently False in a real run.
+#
+# They are kept because the components are correct and are the intended implementation of Hard
+# Rule 13, and deleting them would throw away work that the day someone wires it will want. They
+# are NOT evidence that Rule 13 is enforced, and this file's opening paragraph -- "an
+# implementation that hashes a clean envelope while a dirty one goes to the wire reports zero
+# divergences forever and passes any test written against its own bookkeeping" -- described this
+# very section for most of the project's life.
 
 
 def _envelope(*messages: Message) -> RequestEnvelope:
@@ -260,3 +288,47 @@ def test_a_branch_with_only_filled_slots_may_call_the_model() -> None:
     frame.slots[0].status = SlotStatus.FILLED
     branch.frames.append(frame)
     assert analyse_model_request(branch, b"{}", Policy()) is None
+
+
+# -- the assumption the two run-based tests rest on ---------------------------------------------
+
+
+@pytest.mark.parametrize(("workload", "tier"), _cases())
+async def test_no_branch_ever_sends_a_request_while_guessing(
+    tmp_path: Path, workload: Workload, tier: str
+) -> None:
+    """The reason the harder half of Hard Rule 13 is not exercised, asserted rather than assumed.
+
+    A speculative child runs one tool call and never opens a turn, so no request in any of these
+    runs is sent on a guess. That makes "a speculative branch's prompt is one the sequential run
+    could send" vacuously true here -- and a vacuous truth that nobody has written down is
+    indistinguishable from a checked one.
+
+    If speculation ever crosses a model turn, this fails. That is the intent: the correct
+    response is to build the retirement-time rebuild, not to widen this test.
+    """
+    scheduler, recorder, run_id = run_with(
+        tmp_path,
+        workload,
+        standard_world(),
+        speculation=True,
+        tier=tier,
+        db=f"{workload.name}-{tier}-guessing.db",
+    )
+    result = await scheduler.run(run_id, dict(workload.seed))
+    assert result.ok, result.error
+    assert recorder.calls, "the run asked the model nothing, so this proves nothing"
+
+    speculative = [
+        entry.payload
+        for entry in Journal(tmp_path / f"{workload.name}-{tier}-guessing.db").read(
+            result.run_id, kinds=["model_request"]
+        )
+        if entry.payload.get("speculative") is True
+    ]
+    assert speculative == [], (
+        "a branch sent a model request while running on a guess. Hard Rule 13's "
+        "retirement-time rebuild is not implemented, so that request cannot be verified -- "
+        "the runtime will refuse the branch at retirement, and this file's stronger claim now "
+        "needs a real check rather than a vacuous one."
+    )

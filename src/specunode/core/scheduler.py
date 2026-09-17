@@ -523,6 +523,12 @@ class Scheduler:
             step=branch.cursor.step_index,
             node_id=node_id,
             record_prompt=branch.record_prompt,
+            # Whether this request is being sent on a guess. Always False before, which made
+            # every ``model_request`` entry claim it was authorised work -- and a field that
+            # never varies reads as a check while recording nothing. "On a guess" is the same
+            # test ``Branch.record_prompt`` uses: this branch exists because something
+            # predicted a decision, not merely that it has yet to be confirmed.
+            speculative=branch.predicted is not None,
         )
 
         async def run() -> JsonValue:
@@ -605,6 +611,12 @@ class Scheduler:
             step=branch.cursor.step_index,
             node_id=node_id,
             record_prompt=branch.record_prompt,
+            # Whether this request is being sent on a guess. Always False before, which made
+            # every ``model_request`` entry claim it was authorised work -- and a field that
+            # never varies reads as a check while recording nothing. "On a guess" is the same
+            # test ``Branch.record_prompt`` uses: this branch exists because something
+            # predicted a decision, not merely that it has yet to be confirmed.
+            speculative=branch.predicted is not None,
         )
 
         async def body() -> Decision:
