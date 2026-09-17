@@ -459,6 +459,11 @@ def fold_context(
             pending.extend([None] * len(rebuilt.tool_uses))
             pending_ids.extend(block.id for block in rebuilt.tool_uses)
         elif entry.kind == "tool_result":
+            # NOTE: ``tool_result`` and ``effect_staged`` do not carry ``program_order`` --
+            # only ``tool_request`` does -- so this is always None and every result slot stays
+            # empty. Hard Rule 13's rebuild is not wired (the runtime fails closed instead of
+            # comparing), so this is latent rather than harmful, and it is written down here
+            # because a reader would otherwise assume the rebuild works.
             ordinal = payload.get("program_order")
             index = ordinal if isinstance(ordinal, int) and not isinstance(ordinal, bool) else None
             if index is None or index >= len(pending):

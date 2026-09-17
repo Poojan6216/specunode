@@ -454,9 +454,20 @@ class _JournalWriter:
         )
 
     def _append(self, run_id: str, kind: str, payload_json: str, payload_hash: str) -> int:
-        head = self._head.get(run_id)
-        if head is None:
-            head = self._seed_head(run_id)
+        # Inside the mapping, not before it. This is the first database statement of an append,
+        # and it sat outside the try -- so a driver error here escaped raw instead of becoming
+        # a JournalBusy or JournalWriteError. It is also the statement most likely to be hit
+        # after a failure, because every failure handler pops the cached head -- so the next
+        # append necessarily takes this path, and the second failure in a row always escaped.
+        try:
+            head = self._head.get(run_id)
+            if head is None:
+                head = self._seed_head(run_id)
+        except _OPERATIONAL_ERRORS as exc:
+            self._head.pop(run_id, None)
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise JournalBusy(f"{self.path}: {exc}") from exc
+            raise JournalWriteError(f"{self.path}: {exc}") from exc
         offset = 0 if head is None else head.offset + 1
         prev = genesis_prev_hash(run_id) if head is None else head.entry_hash
         ts = _utc_now()

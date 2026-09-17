@@ -130,10 +130,20 @@ acknowledgement being recorded, nobody can tell afterwards whether it took effec
 declared `idempotent=True` is redelivered; one that did not is **dead-lettered** and the run
 halts for a human.
 
-So a resumed run can reach a *prefix* of the effects an uninterrupted run reached. It will never
-reach effects the uninterrupted run did not, and it will never deliver one twice. That pair —
+So a resumed run can reach a *prefix* of the effects an uninterrupted run reached. That pair —
 never duplicated, never invented — is what the kill/resume tests assert, and the dead letter is
 required whenever the run falls short.
+
+**Both halves of that pair are conditional on the model answering the same way twice.** An
+idempotency key is derived from the run, the node, the program position, the tool and the
+*arguments*. A resume re-asks the model for every turn the journal does not already hold; if it
+answers identically — which a recorded or scripted model always does — the key matches and the
+dedupe table catches the earlier attempt. If it answers differently, as a real model at non-zero
+temperature may, the resumed run makes a *different* call at the same position, derives a
+different key, and nothing connects the two. The world then receives both.
+
+Every kill/resume test here uses a deterministic `ScriptedModel`, so none of them can see that.
+It is a property of the fixtures, not evidence about the runtime. See `docs/limitations.md`.
 
 ### On the LangGraph path
 

@@ -75,11 +75,23 @@ client said it understands.
 placeholder handle with a `_specunode` block saying the write has not happened, and the buffer
 drains when a decision arrives. This is the mode that buys latency.
 
-**Any other client blocks.** The call does not return until a decision arrives. That is slower
-and it is the correct default, because a client that does not understand a handle will put it
-straight into its next prompt — which is exactly what Rule 13 forbids, and the proxy cannot see
-the prompt to stop it. Returning a handle to such a client would trade a correctness property
-for latency without telling anyone.
+**Any other client blocks.** The call does not return until a decision arrives, or until the
+decision deadline expires (`--deadline`, 300s by default). That is slower and it is the correct
+default, because a client that does not understand a handle will put it straight into its next
+prompt — which is exactly what Rule 13 forbids, and the proxy cannot see the prompt to stop it.
+Returning a handle to such a client would trade a correctness property for latency without
+telling anyone.
+
+**On deadline expiry the write is still held and still unsent**, and the client is told exactly
+that. It is *not* reported as discarded, because it is not: `specunode.status` still lists it and
+a later matching `specunode.retire` will forward it. Telling a client its write was discarded
+when a later decision would still send it is how one intended write becomes two — the client
+reissues, and then both go out. Call `specunode.discard` to drop it unsent.
+
+**A single decision authorises a single held write.** Two structurally identical staged calls do
+not both go out on one `specunode.retire`; the next one can be confirmed by the next decision.
+The proxy computes no idempotency key and keeps no dedupe table, so nothing downstream would
+absorb a repeat.
 
 The mode is read from the client's advertised capabilities, not from a flag with a convenient
 default. `--handles` forces the first mode; use it only if you know your client.

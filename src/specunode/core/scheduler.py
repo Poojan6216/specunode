@@ -43,7 +43,7 @@ from specunode.core.branch import Branch, BranchStatus, ReadRecord, StepCursor
 from specunode.core.decision import Decision, ToolCall, decision_key, decision_payload, is_barrier
 from specunode.core.effects import EffectClass, ToolRegistry
 from specunode.core.graph import END, GraphAdapter, NodeRef, RunSession, session_scope
-from specunode.core.hazards import Hazard, analyse
+from specunode.core.hazards import Hazard, analyse, keys_touched
 from specunode.core.model import (
     CallScope,
     ModelClient,
@@ -124,7 +124,12 @@ class BranchTools:
         self._node_id = node_id
 
     async def call(
-        self, name: str, args: Mapping[str, JsonValue], *, step: int | None = None
+        self,
+        name: str,
+        args: Mapping[str, JsonValue],
+        *,
+        step: int | None = None,
+        pending_writes: Sequence[frozenset[str]] = (),
     ) -> JsonValue:
         """Issue one tool call. ``step`` names the program position instead of taking the next.
 
@@ -144,7 +149,14 @@ class BranchTools:
             call,
             spec,
             scheduler.policy,
-            staged_keys=scheduler.buffer.staged_keys(branch),
+            # The buffer's staged writes, PLUS writes this turn has already emitted but not
+            # yet staged. A turn stages its writes only after the stream ends -- deliberately,
+            # so a staged effect never precedes a durable turn -- while reads are issued as
+            # their blocks parse. So for the one shape READ_AFTER_STAGED_WRITE exists to catch,
+            # a read that follows a write *inside a single model turn*, the buffer was empty at
+            # the moment the read was analysed and the hazard could not fire. The model was
+            # handed a pre-write value with no stall and no note in the ledger.
+            staged_keys=(*scheduler.buffer.staged_keys(branch), *pending_writes),
         )
         if hazard is not None:
             scheduler.record_stall(step, hazard)
@@ -167,7 +179,14 @@ class BranchTools:
                 "idempotent": spec.idempotent,
                 "mode": "executed" if spec.effect is EffectClass.READ else "staged",
                 "speculative": branch.status is BranchStatus.SPECULATIVE,
-                "program_order": len(branch.read_set),
+                # The program position this call occupies, which is what Rule 13 would
+                # assemble results by. It used to journal ``len(branch.read_set)`` -- the
+                # number of reads completed so far -- so every staged write recorded 0, the
+                # counter never reset per turn, and several calls in one turn shared an
+                # ordinal. A field documented as "the ordering key Rule 13 assembles results
+                # by -- never completion order" was recording something close to completion
+                # order, for reads only.
+                "program_order": step,
             },
         )
 
@@ -1069,6 +1088,12 @@ class SpeculativeTurn:
         self.squashed = 0
         self.stalled = 0
         self._base = 0
+        #: What the WRITE blocks emitted so far in this turn touch. They are not in the store
+        #: buffer yet -- a turn stages its writes only after the stream ends, so that a staged
+        #: effect never precedes a durable turn -- while reads are issued as their blocks parse.
+        #: Without this, READ_AFTER_STAGED_WRITE could not fire for the one shape it exists to
+        #: catch: a read that follows a write inside a single model turn.
+        self._pending_write_keys: list[frozenset[str]] = []
         #: Slot tasks whose work was adopted from a confirmed speculation. They may be parked
         #: on an ack this branch has to drain, which an ordinary slot task never is.
         self._adopted_tasks: set[asyncio.Task[JsonValue]] = set()
@@ -1103,6 +1128,8 @@ class SpeculativeTurn:
                 self.issued_at.append(time.monotonic())
                 spec = scheduler.registry.get(actual.name)
                 ordinal = len(slots)
+                if spec.effect is not EffectClass.READ:
+                    self._pending_write_keys.append(keys_touched(spec, actual.args))
                 if spec.effect is EffectClass.READ and self._adopted is None:
                     self.reads_issued_early += 1
                     slots.append(asyncio.create_task(self._timed_read(tools, actual, ordinal)))
@@ -1197,8 +1224,37 @@ class SpeculativeTurn:
             budget=scheduler.budget,
         )
         if hazard is not None:
+            # Journaled, not merely counted. ``Branch.stall`` had no caller anywhere in the
+            # runtime, so no branch ever reached STALLED and no ``branch_resolved{stalled}``
+            # entry was ever written -- and the ledger's stall reader selects on exactly that
+            # status. ``Ledger.stalls`` was therefore empty on every run ever produced, and
+            # ``branches_stalled`` was always 0, on runs where hazards demonstrably fired.
+            # branch.py's own docstring says a branch ends "in exactly one of retired, squashed
+            # or stalled"; one of the three was unreachable.
+            #
+            # Recorded as a resolution and deliberately NOT as a fork. This branch never ran:
+            # it was considered and refused before anything was issued on it, so journaling a
+            # ``branch_forked`` for it would inflate the fork count and make a refusal look
+            # like an attempt. The resolution carries the hazard, the node and the call that
+            # was refused, which is everything needed to attribute it.
             scheduler.record_stall(child.cursor.step_index, hazard)
             self.stalled += 1
+            child.stall(hazard.name)
+            await scheduler.journal.append_async(
+                scheduler.run_id,
+                "branch_resolved",
+                {
+                    "v": 1,
+                    "branch_id": child.id,
+                    "step": child.cursor.step_index,
+                    "status": "stalled",
+                    "hazard": hazard.name,
+                    "node_id": self._node_id,
+                    "reason": hazard.name,
+                    "refused": decision_payload(decision),
+                },
+            )
+            scheduler.counters.branches_stalled += 1
             return
 
         await scheduler._journal_fork(child, self._node_id)
@@ -1333,7 +1389,12 @@ class SpeculativeTurn:
         """
         self._branch.unjournaled_reads += 1
         try:
-            value = await tools.call(decision.name, decision.args, step=self._base + ordinal + 1)
+            value = await tools.call(
+                decision.name,
+                decision.args,
+                step=self._base + ordinal + 1,
+                pending_writes=tuple(self._pending_write_keys),
+            )
         finally:
             self._branch.unjournaled_reads -= 1
         self._results_so_far.append(value)

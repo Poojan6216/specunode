@@ -235,3 +235,65 @@ async def test_the_run_still_does_what_it_was_asked_whatever_the_drafter_guessed
         await scheduler.run(run_id, {})
         outcomes.append([(m.tool, m.args_hash) for m in world.mutations])
     assert outcomes[0] == outcomes[1]
+
+
+async def test_a_stalled_speculation_reaches_the_ledger(tmp_path: Path) -> None:
+    """``Branch.stall`` had no caller, so ``BranchStatus.STALLED`` was unreachable.
+
+    ``record_stall`` only appended to an in-memory list and bumped a counter; no branch ever
+    reached STALLED and no ``branch_resolved{stalled}`` entry was ever written. The ledger's
+    stall reader selects on exactly that status, so ``Ledger.stalls`` was empty and
+    ``branches_stalled`` was 0 on every run ever produced -- including runs where hazards
+    demonstrably fired. ``branch.py``'s own docstring says a branch ends "in exactly one of
+    retired, squashed or stalled"; one of the three could not happen.
+
+    An irreversible prediction with ``stage_irreversible`` off is a barrier, which is the
+    cheapest real hazard to provoke.
+    """
+    from specunode.core.effects import EffectClass, ToolSpec
+    from specunode.journal.ledger import build_ledger
+
+    world = standard_world()
+    registry = registry_for(world)
+    registry.register(
+        ToolSpec(name="send_email", effect=EffectClass.IRREVERSIBLE, fn=world.send_email)
+    )
+    journal = Journal(tmp_path / "stalled.db")
+    scheduler = Scheduler(
+        graph=OneTurnGraph(),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(
+            ScriptedModel(
+                turns=[
+                    tool_turn(
+                        ("fetch_runbook", {"section": "restart"}),
+                        ("restart_job", {"job_id": "etl-1"}),
+                        turn=0,
+                    )
+                ],
+                block_delay_ms=20.0,
+            ),
+            journal,
+            provider="scripted",
+        ),
+        policy=Policy(speculation=True, stage_irreversible=False),
+        predictor=FixedDrafter(ToolCall("send_email", {"to": "a", "subject": "s", "body": "b"})),
+    )
+    run_id = new_ulid()
+    result = await scheduler.run(run_id, {})
+    assert result.ok, result.error
+
+    ledger = build_ledger(journal, run_id)
+    assert ledger.stalls, "a hazard fired and the ledger recorded no stall"
+    assert scheduler.counters.branches_stalled == len(ledger.stalls)
+    assert ledger.stalls[0].hazard is not None, "the stall reached the ledger without its hazard"
+    # And the branch really is journaled as stalled, which is the status the reader selects on.
+    stalled = [
+        entry.payload
+        for entry in journal.read(run_id, kinds=["branch_resolved"])
+        if entry.payload.get("status") == "stalled"
+    ]
+    assert stalled, "no branch_resolved{stalled} entry was written"

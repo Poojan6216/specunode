@@ -183,8 +183,17 @@ so a runtime that dispatched nothing cannot pass by comparing two empty ledgers.
 
 **The context-equivalence test** (Hard Rule 13). The speculative arm asked the model the same
 questions as the sequential arm. It asserts on what a model *received*, never on what the runtime
-says it sent — the live check and the retirement-time rebuild share a prompt builder and can be
-wrong in the same way while agreeing with each other.
+says it sent.
+
+Be clear about what it does **not** prove. Every workload has one model decision point, so each
+run records one request, sent before anything forks — the two arms are compared byte for byte
+and must match, which catches a runtime perturbing a prompt by speculating near it. The harder
+claim, that a request sent *by a speculative branch* is one the sequential run could send, is
+never evaluated, because no shipped path produces one: a speculative child runs a single tool
+call and never opens a turn. The test asserts that too, so if speculation ever crosses a model
+turn it fails rather than passing vacuously. The retirement-time rebuild the rule describes is
+not implemented; a branch that did send a request while guessing is refused at retirement
+instead. See [`docs/adapters.md`](docs/adapters.md).
 
 ---
 

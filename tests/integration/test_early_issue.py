@@ -249,3 +249,72 @@ async def test_a_read_still_in_flight_at_retirement_does_not_demote_the_branch(
     assert [hit for hit in world.reads if hit.speculative], (
         "the early-issued read stopped being reported as speculative"
     )
+
+
+async def test_a_read_after_a_write_in_the_same_turn_is_seen_as_a_hazard(
+    tmp_path: Path,
+) -> None:
+    """The one shape ``READ_AFTER_STAGED_WRITE`` exists for, and it could not fire.
+
+    A turn stages its writes only after the stream ends -- deliberately, so a staged effect
+    never precedes a durable turn -- while reads are issued as their blocks parse. So when
+    hazard analysis ran for an early-issued read, the same turn's earlier write was not in the
+    store buffer yet and ``staged_keys`` was empty. A read that follows a write *inside a single
+    model turn* therefore returned a pre-write value with no stall, no forwarding and no note in
+    the ledger, which is precisely the read-after-write the hazard is named for.
+
+    Both tools declare ``forward_keys`` over the same resource, so the conflict is declared
+    rather than inferred -- an under-declared ``forward_keys`` is its own documented limitation.
+    """
+    from specunode.core.effects import ToolSpec, forward_keys_from_template
+
+    world = standard_world()
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="restart_job",
+            effect=EffectClass.WRITE,
+            fn=world.restart_job,
+            idempotent=True,
+            forward_keys=forward_keys_from_template("job:{args.job_id}"),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="get_pipeline_status",
+            effect=EffectClass.READ,
+            fn=world.get_pipeline_status,
+            witness=True,
+            forward_keys=forward_keys_from_template("job:{args.pipeline_id}"),
+        )
+    )
+    journal = Journal(tmp_path / "raw.db")
+    scheduler = Scheduler(
+        graph=OneTurnGraph(),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(
+            ScriptedModel(
+                turns=[
+                    tool_turn(
+                        ("restart_job", {"job_id": "etl-1"}),
+                        ("get_pipeline_status", {"pipeline_id": "etl-1"}),
+                        turn=0,
+                    )
+                ],
+                block_delay_ms=20.0,
+            ),
+            journal,
+            provider="scripted",
+        ),
+        policy=Policy(speculation=True),
+    )
+    result = await scheduler.run(new_ulid(), {})
+
+    assert result.ok, result.error
+    assert "READ_AFTER_STAGED_WRITE" in scheduler.counters.stalls_by_hazard, (
+        "a read touching the same key as a write emitted earlier in the same turn was not "
+        f"reported as a hazard; saw {dict(scheduler.counters.stalls_by_hazard)}"
+    )

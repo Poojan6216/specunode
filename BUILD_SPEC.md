@@ -1026,9 +1026,13 @@ only thing that can release a write. Every model output and tool result is journ
 before the runtime acts on it, so a crashed run resumes and a finished run replays, and the
 replay refuses the moment the run would ask the model a different question. Three never-skipped
 tests hold the invariants across three sample workloads and two drafter tiers: nothing reaches
-the world from a branch that did not retire, the effect ledger with speculation on equals the
-ledger with it off, and the speculative arm asked the model the same questions as the sequential
-arm. It ships a LangGraph integration that runs an unchanged graph file, a plain-Python API, an
+the world from a branch that did not retire, and the effect ledger with speculation on equals
+the ledger with it off. The third — that the speculative arm asked the model the same questions
+as the sequential arm — holds in the only form these workloads can exercise, which is that both
+arms send byte-identical prompts; **no shipped path makes a speculative branch send a request at
+all**, so the harder half of Hard Rule 13 is vacuously true rather than checked, and the
+retirement-time rebuild the rule describes is not implemented. The runtime refuses such a branch
+at retirement instead of stamping it. It ships a LangGraph integration that runs an unchanged graph file, a plain-Python API, an
 MCP proxy driven end to end by a generic client, three drafter tiers, three demos, and a
 benchmark suite whose numbers are all read from committed files. The most useful thing it
 produced is a negative result.
