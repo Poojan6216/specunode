@@ -148,6 +148,8 @@ class StoreBuffer:
     #: prediction was confirmed. Kept so a late stage on an adopted child lands where
     #: it will actually be drained rather than in a list nothing reads.
     _adopted_into: dict[str, str] = field(default_factory=dict)
+    #: What the last :meth:`discard` actually dropped, so the journal can name them.
+    _last_discarded: tuple[StagedEffect, ...] = ()
     _closed: set[str] = field(default_factory=set)
     _drained: set[str] = field(default_factory=set)
     #: Effects that already reached a terminal outcome, so a second drain of the same branch
@@ -435,6 +437,10 @@ class StoreBuffer:
     def discard(self, branch: Branch) -> int:
         """Drop this branch's staged effects and every descendant's. Never dispatches.
 
+        Returns the count. :meth:`discard_reporting` returns the effects themselves, which is
+        what the journal entry needs -- naming them by re-deriving a list afterwards got the
+        wrong ones.
+
         Idempotent: the scheduler may also discard each squashed descendant individually, and
         without idempotence the ledger's discarded count would double and Demo 1 would print a
         number no run produced.
@@ -455,11 +461,29 @@ class StoreBuffer:
             ack = self._acks.pop(effect.id, None)
             if ack is not None and not ack.done():
                 ack.cancel()
+        self._last_discarded = tuple(dropped)
         return len(dropped)
 
+    def discard_reporting(self, branch: Branch) -> tuple[StagedEffect, ...]:
+        """Discard, and return exactly the effects that were dropped."""
+        self.discard(branch)
+        return self._last_discarded
+
     async def discard_and_journal(self, branch: Branch, reason: str) -> int:
-        dropped_ids = [effect.id for effect in self.staged_in_lineage(branch)]
-        count = self.discard(branch)
+        """Discard, and record in the journal exactly which effects were discarded.
+
+        The ids used to be re-derived from ``staged_in_lineage(branch)``, which walks the
+        branch's *lineage* and therefore lists every ancestor's staged effects first, and were
+        then truncated with ``[:count]``. When the retiring parent still held staged entries --
+        the staged list is not pruned after dispatch -- that slice took the parent's effects. So
+        the durable record named writes that had reached the world as discarded, and the
+        speculative write that really was thrown away unsent appeared in no discard entry at
+        all. Both halves of that are wrong in the direction that matters: this journal is the
+        only evidence there is about what did and did not happen.
+        """
+        dropped = self.discard_reporting(branch)
+        dropped_ids = [effect.id for effect in dropped]
+        count = len(dropped)
         if count:
             await self.journal.append_async(
                 self.run_id,
@@ -468,7 +492,7 @@ class StoreBuffer:
                     "v": 1,
                     "branch_id": branch.id,
                     "step": branch.cursor.step_index,
-                    "effect_ids": dropped_ids[:count],
+                    "effect_ids": dropped_ids,
                     "count": count,
                     "reason": reason,
                 },

@@ -99,6 +99,9 @@ class ProxyState:
 
     registry: ToolRegistry
     mode: ClientMode = ClientMode.BLOCKING
+    #: How long a blocking write waits for a decision. Per-state so an operator can tune it;
+    #: see :data:`DEFAULT_DECISION_DEADLINE_S` for why it is finite at all.
+    decision_deadline_s: float = DEFAULT_DECISION_DEADLINE_S
     staged: list[StagedCall] = field(default_factory=list)
     dispatched: list[StagedCall] = field(default_factory=list)
     discarded: list[StagedCall] = field(default_factory=list)
@@ -167,15 +170,27 @@ class ProxyState:
         confirmed: list[StagedCall] = []
         dropped: list[StagedCall] = []
         for call in self.staged:
-            if decisions_equal(call.decision, actual):
+            # One decision authorises **one** call. Every structurally identical held write
+            # used to match, so a single model decision forwarded all of them -- and the proxy
+            # computes no idempotency key and keeps no dedupe table, so nothing downstream
+            # could absorb the repeat. A later decision can still confirm the next one.
+            if not confirmed and decisions_equal(call.decision, actual):
                 confirmed.append(call)
             else:
                 dropped.append(call)
         self.staged = []
         self.dispatched.extend(confirmed)
         self.discarded.extend(dropped)
-        self._decided.set()
+        # Deliberately NOT ``self._decided.set()`` here. The caller forwards the confirmed call
+        # and records its result *after* this returns, and setting the event now releases the
+        # blocked client first -- so it read ``results`` before anything was in it and every
+        # confirmed write returned nothing to the client that issued it. Publishing is a
+        # separate step: see :meth:`publish`.
         return confirmed, dropped
+
+    def publish(self) -> None:
+        """Release blocked callers, once every confirmed call's result has been recorded."""
+        self._decided.set()
 
     def was_confirmed(self, call: StagedCall) -> bool:
         """Did *this* call retire? Compared by effect id, never by value.
@@ -196,7 +211,8 @@ class ProxyState:
         count = len(self.staged)
         self.discarded.extend(self.staged)
         self.staged = []
-        self._decided.set()
+        # Safe to publish immediately: nothing was confirmed, so there is no result to wait for.
+        self.publish()
         return count
 
     async def wait_for_decision(self, deadline_s: float | None = None) -> bool:
@@ -218,7 +234,7 @@ class ProxyState:
         try:
             await asyncio.wait_for(
                 self._decided.wait(),
-                DEFAULT_DECISION_DEADLINE_S if deadline_s is None else deadline_s,
+                self.decision_deadline_s if deadline_s is None else deadline_s,
             )
         except TimeoutError:
             return False
@@ -446,9 +462,27 @@ def _register_proxied(server: Any, upstream: Any, state: ProxyState, tool: Any, 
         # caller has already returned by the time a decision arrives, so a write confirmed
         # there used to be reported as dispatched and never sent), and what stops the two paths
         # from both sending in BLOCKING mode.
-        await state.wait_for_decision()
+        decided = await state.wait_for_decision()
         if state.was_confirmed(held):
             return state.result_of(held)
+        if not decided:
+            # A timeout is NOT a discard, and saying it was is the more dangerous of the two
+            # lies: the call is still in ``state.staged``, ``specunode.status`` still lists it,
+            # and the next matching decision forwards it upstream for real. A client told its
+            # write was discarded reissues it, and then both go out.
+            return {
+                "_specunode": {
+                    "timed_out": True,
+                    "still_held": True,
+                    "effect_id": held.effect_id,
+                    "detail": (
+                        "no decision arrived within the proxy's deadline. This write has NOT "
+                        "been sent and has NOT been discarded -- it is still held, and a "
+                        "later specunode.retire matching it will send it. Call "
+                        "specunode.discard to drop it unsent."
+                    ),
+                }
+            }
         return {"_specunode": {"discarded": True, "effect_id": held.effect_id}}
 
     schema = _upstream_schema(tool)
@@ -541,18 +575,24 @@ def _register_control_tools(server: Any, upstream: Any, state: ProxyState) -> No
         confirmed, dropped = state.retire(ToolCall(name=tool, args=dict(args or {})))
         sent: list[str] = []
         failed: list[dict[str, str]] = []
-        for call in confirmed:
-            try:
-                result = await upstream.call_tool(call.tool, dict(call.args))
-            except Exception as exc:  # an upstream that refused, timed out or died
-                # Recorded rather than raised: the other confirmed calls still have to be
-                # attempted, and a blocked caller is waiting for an answer of some kind.
-                reason = f"{type(exc).__name__}: {exc}"
-                failed.append({"effect_id": call.effect_id, "error": reason})
-                state.record_result(call, {"_specunode": {"error": str(exc)}})
-                continue
-            state.record_result(call, [block.model_dump() for block in result.content])
-            sent.append(call.effect_id)
+        try:
+            for call in confirmed:
+                try:
+                    result = await upstream.call_tool(call.tool, dict(call.args))
+                except Exception as exc:  # an upstream that refused, timed out or died
+                    # Recorded rather than raised: the other confirmed calls still have to be
+                    # attempted, and a blocked caller is waiting for an answer of some kind.
+                    reason = f"{type(exc).__name__}: {exc}"
+                    failed.append({"effect_id": call.effect_id, "error": reason})
+                    state.record_result(call, {"_specunode": {"error": reason}})
+                    continue
+                state.record_result(call, [block.model_dump() for block in result.content])
+                sent.append(call.effect_id)
+        finally:
+            # After the results are recorded, and in a ``finally`` so a blocked client is
+            # released even if this tool raises. Releasing before the results existed handed
+            # every confirmed write's caller an empty answer.
+            state.publish()
         return {
             "dispatched": sent,
             "discarded": [c.effect_id for c in dropped],

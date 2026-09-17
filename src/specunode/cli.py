@@ -324,6 +324,14 @@ def mcp_proxy(
         ..., "--upstream", help="Command that starts the upstream server."
     ),
     config: Path = typer.Option(Path(DEFAULT_CONFIG_NAME), "--config", help="specunode.yaml."),
+    deadline: float = typer.Option(
+        300.0,
+        "--deadline",
+        help=(
+            "Seconds a blocking write waits for a decision before giving up. It is then "
+            "still held and still unsent, and the client is told so."
+        ),
+    ),
     handles: bool = typer.Option(
         False,
         "--handles",
@@ -356,6 +364,7 @@ def mcp_proxy(
     state = ProxyState(
         registry=registry,
         mode=ClientMode.HANDLES if handles else ClientMode.BLOCKING,
+        decision_deadline_s=deadline,
     )
     typer.echo(
         f"proxying {upstream!r} in {state.mode.value} mode; "

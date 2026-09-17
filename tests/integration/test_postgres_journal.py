@@ -18,6 +18,7 @@ cheap; discovering years later that a whole job was theatre is not.
 from __future__ import annotations
 
 import os
+import threading
 
 import pytest
 
@@ -174,3 +175,67 @@ def test_the_chain_verifies_on_postgres() -> None:
     result = journal.verify_chain(run_id)
     assert result.ok and result.entries == 12
     assert server_rows(run_id) == 12
+
+
+def test_concurrent_bootstrap_of_a_fresh_database_does_not_race() -> None:
+    """Postgres's ``CREATE ... IF NOT EXISTS`` is not race-safe, and this runs on every connect.
+
+    Two connections executing the same DDL concurrently collide in the system catalogues and
+    one gets a ``UniqueViolation`` from ``pg_type`` or ``pg_class`` -- a raw driver exception,
+    not a ``JournalError``. Both the writer and every reader open a connection, so a handful of
+    processes starting against a not-yet-bootstrapped database mostly failed. SQLite never
+    showed it, because its write lock serialises the same DDL.
+
+    Measured before the fix with eight concurrent processes over three rounds: 21 of 24 opens
+    failed. Threads are used here rather than processes because the failure is in the server's
+    catalogue, not in the client, so it reproduces either way and this keeps the test cheap.
+    """
+    psycopg = pytest.importorskip("psycopg")
+    from specunode.journal.journal import _PostgresBackend
+
+    with psycopg.connect(dsn(), autocommit=True) as conn:
+        conn.execute("DROP TABLE IF EXISTS entries, effect_dispatch, journal_meta CASCADE")
+
+    errors: list[str] = []
+    backends: list[object] = []
+
+    def bootstrap() -> None:
+        try:
+            backends.append(_PostgresBackend(dsn()))
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=bootstrap) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    for backend in backends:
+        backend.close()  # type: ignore[attr-defined]
+
+    assert errors == [], f"concurrent bootstrap raced: {errors[:3]}"
+
+
+def test_a_dead_writer_can_be_evicted_and_replaced() -> None:
+    """``_writers`` caches one writer per DSN for the life of the process, with no reconnect.
+
+    After the server drops the connection -- a restart, a failover, a pooler's idle timeout --
+    every later append failed forever, and constructing a brand-new ``Journal(dsn)`` handed back
+    the same dead writer. SQLite has no equivalent failure mode, so this only became reachable
+    when the Postgres backend was wired.
+    """
+    pytest.importorskip("psycopg")
+    from specunode.journal.journal import Journal, evict_writer
+
+    run_id = f"01PGEVICT{os.getpid():017d}"[:26]
+    first = Journal(dsn())
+    first.append(run_id, "policy_event", {"v": 1, "event": "tick", "reason": "pg"})
+    before = server_rows(run_id)
+
+    evict_writer(dsn())
+
+    second = Journal(dsn())
+    second.append(run_id, "policy_event", {"v": 1, "event": "tick", "reason": "pg"})
+    assert server_rows(run_id) == before + 1, "the replacement writer did not reach the server"
+    assert second.verify_chain(run_id).ok, "the chain did not survive the writer being replaced"

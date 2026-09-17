@@ -253,3 +253,83 @@ async def test_a_write_discarded_in_a_later_turn_is_not_forwarded(tmp_path: Path
     assert upstream_calls(log) == ["close_ticket"], (
         "the contradicted second write was forwarded because it looked like the first"
     )
+
+
+# -- the three defects that composed into a double-write -----------------------------------------
+
+
+async def test_a_confirmed_write_returns_its_real_result_to_the_blocking_caller(
+    tmp_path: Path,
+) -> None:
+    """The write happened; the client has to be able to learn that.
+
+    ``retire()`` set the decision event synchronously and the tool then *awaited* the upstream
+    before recording the result -- so the blocked caller resumed first, saw its call in
+    ``dispatched``, and read a result that was still ``None``. In BLOCKING mode, which is the
+    default and the only mode a generic client gets, every write the model confirmed returned
+    nothing to the caller that issued it. The natural response to that is to reissue the write.
+    """
+    log = tmp_path / "upstream.log"
+    async with proxy_client(tmp_path) as session:
+        held = asyncio.create_task(session.call_tool("close_ticket", {"ticket_id": "tkt-1"}))
+        await asyncio.sleep(0.5)
+        await asyncio.wait_for(
+            session.call_tool(
+                "specunode.retire", {"tool": "close_ticket", "args": {"ticket_id": "tkt-1"}}
+            ),
+            60,
+        )
+        result = await asyncio.wait_for(held, 60)
+
+    body = text_of(result)
+    assert "closed" in body, f"the caller got no result back: {body!r}"
+    assert upstream_calls(log) == ["close_ticket"]
+
+
+async def test_one_decision_authorises_one_write(tmp_path: Path) -> None:
+    """Two identical held writes, one decision: exactly one goes out.
+
+    Every structurally identical staged call used to match, and the tool forwarded all of them.
+    The proxy computes no idempotency key and keeps no dedupe table, so nothing downstream could
+    absorb the repeat.
+    """
+    log = tmp_path / "upstream.log"
+    async with proxy_client(tmp_path, "--handles") as session:
+        # Handles mode so both can be staged without either blocking.
+        await asyncio.wait_for(session.call_tool("close_ticket", {"ticket_id": "tkt-1"}), 60)
+        await asyncio.wait_for(session.call_tool("close_ticket", {"ticket_id": "tkt-1"}), 60)
+        assert upstream_calls(log) == []
+
+        await asyncio.wait_for(
+            session.call_tool(
+                "specunode.retire", {"tool": "close_ticket", "args": {"ticket_id": "tkt-1"}}
+            ),
+            60,
+        )
+
+    assert upstream_calls(log) == ["close_ticket"], (
+        "one model decision sent the same write more than once"
+    )
+
+
+async def test_a_timed_out_write_is_not_reported_as_discarded(tmp_path: Path) -> None:
+    """A timeout and a contradiction are different facts, and were reported identically.
+
+    The call stays in ``state.staged`` after a timeout -- ``specunode.status`` still lists it and
+    a later matching decision forwards it for real -- so telling the client it was *discarded*
+    invites exactly the reissue that turns one intended write into two.
+    """
+    log = tmp_path / "upstream.log"
+    async with proxy_client(tmp_path, "--deadline", "1") as session:
+        result = await asyncio.wait_for(
+            session.call_tool("close_ticket", {"ticket_id": "tkt-1"}), 60
+        )
+        body = text_of(result)
+        assert "timed_out" in body, body
+        assert "still_held" in body, body
+        assert '"discarded": true' not in body.lower().replace(" ", ""), body
+        assert upstream_calls(log) == [], "a timed-out write was sent anyway"
+
+        # And it really is still held, which is the fact the message now states.
+        status = await asyncio.wait_for(session.call_tool("specunode.status", {}), 60)
+        assert "1" in text_of(status), text_of(status)

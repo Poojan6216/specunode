@@ -29,6 +29,7 @@ branch for the duration of a disk flush.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -319,8 +320,33 @@ class _PostgresBackend:
         # had anything ever actually connected it.
         self._conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
         self._conn.execute("SET synchronous_commit = on")
+        self._bootstrap(psycopg)
+
+    def _bootstrap(self, psycopg: Any) -> None:
+        """Load ``schema.sql``, tolerating another connection loading it at the same moment.
+
+        Postgres's ``CREATE TABLE/INDEX IF NOT EXISTS`` is **not** race-safe: two connections
+        running it concurrently collide in the system catalogues and one gets a
+        ``UniqueViolation`` from ``pg_type`` or ``pg_class``. And this runs on *every*
+        connection -- the writer opens one and every read opens another -- so two processes
+        starting against a fresh database mostly failed, with a raw driver exception rather
+        than a :class:`JournalError`. SQLite never showed it because its write lock serialises
+        the same DDL.
+
+        A lost race means somebody else created the object, which is the outcome this wanted.
+        Anything else is re-raised.
+        """
         for statement in _load_schema_statements():
-            self._conn.execute(statement)
+            try:
+                self._conn.execute(statement)
+            except psycopg.errors.UniqueViolation:
+                # Another connection created it between our IF NOT EXISTS check and our insert
+                # into the catalogue. Idempotent by intent, so this is success.
+                self._conn.execute("ROLLBACK")
+            except psycopg.errors.DuplicateTable:
+                self._conn.execute("ROLLBACK")
+            except psycopg.errors.DuplicateObject:
+                self._conn.execute("ROLLBACK")
 
     def execute(self, sql: str, params: Mapping[str, JsonValue] | None = None) -> Any:
         return self._conn.execute(_to_postgres(sql), dict(params) if params else {})
@@ -623,6 +649,24 @@ class _JournalWriter:
 
 _writers: dict[str, _JournalWriter] = {}
 _writers_lock = threading.Lock()
+
+
+def evict_writer(path: Path | str) -> None:
+    """Drop a cached writer, so the next :class:`Journal` opens a fresh connection.
+
+    ``_writers`` caches one writer per location for the life of the process, and
+    ``_PostgresBackend`` holds a single connection with no reconnect. After the server drops it
+    -- a restart, a failover, a pooler's idle timeout, ``pg_terminate_backend`` -- every later
+    append failed forever, and constructing a brand-new ``Journal(dsn)`` handed back the same
+    dead writer. SQLite has no equivalent failure mode, so this only became reachable when the
+    Postgres backend was wired.
+    """
+    key = str(path) if is_postgres_dsn(path) else os.path.realpath(path)
+    with _writers_lock:
+        writer = _writers.pop(key, None)
+    if writer is not None:
+        with contextlib.suppress(Exception):
+            writer.close()
 
 
 def _writer_for(path: Path | str, *, fullfsync: bool = False) -> _JournalWriter:

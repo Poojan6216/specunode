@@ -126,18 +126,45 @@ async def test_a_blocking_client_waits_rather_than_receiving_a_handle() -> None:
 
 
 async def test_a_decision_releases_a_waiting_blocking_client() -> None:
+    """Deciding and publishing are two steps, and the order is load-bearing.
+
+    ``retire`` resolves the held calls; ``publish`` releases the clients waiting on them. They
+    used to be one step, and the forwarding happens *between* them -- so the blocked caller
+    woke first, found its call in ``dispatched`` and its result still absent, and every
+    confirmed write returned nothing to the client that issued it.
+    """
     proxy = state(ClientMode.BLOCKING)
     args = {"customer_id": "cus-1", "amount": 10.0}
-    proxy.stage("charge_card", args)
+    held = proxy.stage("charge_card", args)
 
     async def decide_shortly() -> None:
         await asyncio.sleep(0.05)
         proxy.retire(ToolCall("charge_card", args))
+        # What the real control tool does between these two lines is forward the call and
+        # record what came back.
+        proxy.record_result(held, [{"type": "text", "text": "charged"}])
+        proxy.publish()
 
     task = asyncio.create_task(decide_shortly())
     assert await proxy.wait_for_decision(deadline_s=2.0) is True
     await task
     assert len(proxy.dispatched) == 1
+    assert proxy.result_of(held) is not None, (
+        "the client was released before its result was recorded"
+    )
+
+
+async def test_deciding_alone_does_not_release_a_waiting_client() -> None:
+    """The half that makes the split worth having: no result yet means no release yet."""
+    proxy = state(ClientMode.BLOCKING)
+    args = {"customer_id": "cus-1", "amount": 10.0}
+    proxy.stage("charge_card", args)
+
+    proxy.retire(ToolCall("charge_card", args))
+
+    assert await proxy.wait_for_decision(deadline_s=0.1) is False, (
+        "retire() released the waiter before any result had been recorded"
+    )
 
 
 # -- the mode is asked for, not assumed -------------------------------------------------
