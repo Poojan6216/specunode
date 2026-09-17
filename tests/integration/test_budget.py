@@ -172,6 +172,10 @@ async def test_the_gate_closing_is_journaled_exactly_once(tmp_path: Path) -> Non
     assert len(closed) == 1
     assert closed[0]["reason"] == "max_speculative_reads"
     assert scheduler.counters.speculation_disabled_reason == "max_speculative_reads"
+    # The summary entry says it too, where a reader looks first.
+    finished = [e.payload for e in journal.read(run_id, kinds=["run_finished"])]
+    assert finished, "the run never wrote run_finished"
+    assert finished[-1]["counters"]["speculation_disabled_reason"] == "max_speculative_reads"
 
 
 class _CostlyDraftClient:

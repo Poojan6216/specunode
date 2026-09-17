@@ -1167,6 +1167,9 @@ class Scheduler:
                     "context_divergences": self.counters.context_divergences,
                     "wasted_tokens": self.counters.wasted_tokens,
                     "stalls_by_hazard": dict(self.counters.stalls_by_hazard),
+                    # Why the gate closed, or None. The policy_event says it at the moment it
+                    # happened; the summary says it where a reader looks first.
+                    "speculation_disabled_reason": self.counters.speculation_disabled_reason,
                 },
             },
         )
