@@ -86,3 +86,67 @@ def _returns_no_registry() -> tuple[object, object]:
 
 def _returns_a_bad_adapter() -> tuple[object, ToolRegistry]:
     return object(), ToolRegistry()
+
+
+# -- tool overrides --------------------------------------------------------------------------
+#
+# config.py calls this table "the part that matters most" and runner.py calls it "the supported
+# way to say 'this one actually writes' without editing someone else's code". Using it used to
+# make the tool permanently uncallable, because the override carries an effect class and no
+# implementation, and registering it wholesale replaced the graph's callable with a stub that
+# raises UnknownTool -- reporting that the tool "was never registered" to the one person who had
+# just registered it.
+
+
+def _graph_with_a_read() -> tuple[object, ToolRegistry]:
+    from specunode.core.effects import EffectClass, ToolSpec
+
+    async def get_ticket(ticket_id: str) -> dict[str, object]:
+        return {"ticket_id": ticket_id}
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec(name="get_ticket", effect=EffectClass.READ, fn=get_ticket))
+    return _MinimalGraph(), registry
+
+
+class _MinimalGraph:
+    def nodes(self) -> list[object]:
+        return []
+
+    def run_node(self, node: object, session: object) -> object:
+        raise NotImplementedError
+
+    def next(self, state: object) -> object:
+        raise NotImplementedError
+
+    def capabilities(self) -> object:
+        raise NotImplementedError
+
+
+def test_an_override_reclassifies_without_destroying_the_implementation() -> None:
+    from specunode.config import ToolOverride
+    from specunode.core.effects import EffectClass
+
+    config = Config(
+        graph="tests.unit.test_runner:_graph_with_a_read",
+        tools={"get_ticket": ToolOverride(effect="write")},
+    )
+    _adapter, registry = build_graph(config)
+
+    spec = registry.get("get_ticket")
+    assert spec.effect is EffectClass.WRITE, "the override did not reclassify the tool"
+    assert spec.fn.__name__ == "get_ticket", (
+        "the override replaced the graph's callable with the unknown-tool stub"
+    )
+
+
+def test_an_override_for_a_tool_the_graph_never_registered_is_refused() -> None:
+    """Silently creating an uncallable tool is how the previous behaviour hid itself."""
+    from specunode.config import ToolOverride
+
+    config = Config(
+        graph="tests.unit.test_runner:_graph_with_a_read",
+        tools={"close_ticket": ToolOverride(effect="write")},
+    )
+    with pytest.raises(RunnerError, match="never registered a tool by that name"):
+        build_graph(config)

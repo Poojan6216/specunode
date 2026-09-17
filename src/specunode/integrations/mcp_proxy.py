@@ -94,6 +94,18 @@ class ProxyState:
     dispatched: list[StagedCall] = field(default_factory=list)
     discarded: list[StagedCall] = field(default_factory=list)
     reads_forwarded: int = 0
+    #: Upstream results for calls that retired, by effect id. A blocking caller reads its own
+    #: result from here rather than sending the call itself, so exactly one party sends.
+    results: dict[str, JsonValue] = field(default_factory=dict)
+    #: Monotonic across the whole session, and never reset by :meth:`retire`.
+    #:
+    #: Effect ids used to be numbered from ``len(self.staged)``, which ``retire`` sets back to
+    #: an empty list -- so the first write of turn 2 got the same id as the first write of
+    #: turn 1. ``StagedCall`` is a frozen dataclass, so two structurally identical calls from
+    #: different turns then compared *equal*, and a membership test against the dispatched list
+    #: said yes for a call this turn's decision had just discarded. The proxy forwarded a write
+    #: it had explicitly refused, which is the one thing this whole project exists to prevent.
+    _seq: int = 0
     #: Set when a decision arrives, so a blocking client's call can return.
     _decided: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -108,7 +120,8 @@ class ProxyState:
     def stage(self, tool: str, args: Mapping[str, JsonValue]) -> StagedCall:
         """Hold a write. Nothing is sent upstream."""
         spec = self.classify(tool)
-        effect_id = f"mcp-{len(self.staged):04d}-{chash(dict(args))[:8]}"
+        self._seq += 1
+        effect_id = f"mcp-{self._seq:04d}-{chash(dict(args))[:8]}"
         call = StagedCall(
             effect_id=effect_id,
             tool=tool,
@@ -154,6 +167,21 @@ class ProxyState:
         self.discarded.extend(dropped)
         self._decided.set()
         return confirmed, dropped
+
+    def was_confirmed(self, call: StagedCall) -> bool:
+        """Did *this* call retire? Compared by effect id, never by value.
+
+        A value comparison answers for any structurally identical call from any earlier turn,
+        which is how a discarded write got forwarded.
+        """
+        return any(sent.effect_id == call.effect_id for sent in self.dispatched)
+
+    def record_result(self, call: StagedCall, result: JsonValue) -> None:
+        """Keep what the upstream returned, so the caller that is waiting can have it."""
+        self.results[call.effect_id] = result
+
+    def result_of(self, call: StagedCall) -> JsonValue:
+        return self.results.get(call.effect_id)
 
     def discard_all(self, reason: str = "squashed") -> int:
         count = len(self.staged)
@@ -328,7 +356,7 @@ async def serve(
 
         for tool in listing.tools:
             _register_proxied(server, upstream, state, tool, types)
-        _register_control_tools(server, state)
+        _register_control_tools(server, upstream, state)
         # ``run_stdio_async`` rather than ``run("stdio")`` in a thread. ``run`` opens its own
         # event loop, which put the served tools on one loop and the upstream ClientSession on
         # another -- so the first forwarded read awaited a session belonging to a loop that was
@@ -392,10 +420,15 @@ def _register_proxied(server: Any, upstream: Any, state: ProxyState, tool: Any, 
 
         # A client that cannot be told "this has not happened yet" waits instead. Returning a
         # handle here would put it in that client's next prompt, unseen by anything.
+        #
+        # It does not send the call itself. ``specunode.retire`` is the single party that
+        # forwards a confirmed write -- which is what makes the HANDLES mode work at all (its
+        # caller has already returned by the time a decision arrives, so a write confirmed
+        # there used to be reported as dispatched and never sent), and what stops the two paths
+        # from both sending in BLOCKING mode.
         await state.wait_for_decision()
-        if held in state.dispatched:
-            result = await upstream.call_tool(tool.name, kwargs)
-            return [block.model_dump() for block in result.content]
+        if state.was_confirmed(held):
+            return state.result_of(held)
         return {"_specunode": {"discarded": True, "effect_id": held.effect_id}}
 
     schema = _upstream_schema(tool)
@@ -445,7 +478,7 @@ def _with_upstream_signature(fn: Any, schema: Any) -> Any:
     return fn
 
 
-def _register_control_tools(server: Any, state: ProxyState) -> None:
+def _register_control_tools(server: Any, upstream: Any, state: ProxyState) -> None:
     """The proxy's own six tools, so a client can see and steer what is held.
 
     Annotated with concrete types rather than ``JsonValue`` for the same reason the proxied
@@ -477,10 +510,33 @@ def _register_control_tools(server: Any, state: ProxyState) -> None:
         return {"discarded": state.discard_all()}
 
     async def retire(tool: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Report the model's decision, and forward whatever it confirms.
+
+        The forwarding happens *here* and nowhere else. It used to happen in the blocked
+        caller, which meant a write confirmed while the client was in HANDLES mode was recorded
+        as dispatched and never actually sent -- the caller had returned a handle and ended
+        long before any decision arrived. Three separate surfaces reported that effect as
+        dispatched while the upstream had never heard of it.
+        """
         confirmed, dropped = state.retire(ToolCall(name=tool, args=dict(args or {})))
+        sent: list[str] = []
+        failed: list[dict[str, str]] = []
+        for call in confirmed:
+            try:
+                result = await upstream.call_tool(call.tool, dict(call.args))
+            except Exception as exc:  # an upstream that refused, timed out or died
+                # Recorded rather than raised: the other confirmed calls still have to be
+                # attempted, and a blocked caller is waiting for an answer of some kind.
+                reason = f"{type(exc).__name__}: {exc}"
+                failed.append({"effect_id": call.effect_id, "error": reason})
+                state.record_result(call, {"_specunode": {"error": str(exc)}})
+                continue
+            state.record_result(call, [block.model_dump() for block in result.content])
+            sent.append(call.effect_id)
         return {
-            "dispatched": [c.effect_id for c in confirmed],
+            "dispatched": sent,
             "discarded": [c.effect_id for c in dropped],
+            "failed": failed,
         }
 
     async def replay_check() -> dict[str, Any]:

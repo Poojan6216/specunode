@@ -367,7 +367,17 @@ class Scheduler:
 
                 drained, updated = await self._retire(branch, node_id, committed, reducers)
                 if not drained:
-                    ok, error = False, f"effects from node {node.name} did not all dispatch"
+                    # Two different failures reach here and they need different words. A node
+                    # that *raised* after its writes went out is not a dispatch failure, and
+                    # reporting it as one sends the operator to look at the wrong subsystem
+                    # while an effect is already in the world.
+                    ok = False
+                    error = (
+                        f"node {node.name} failed after its effects were dispatched: "
+                        f"{branch.reason}"
+                        if branch.reason
+                        else f"effects from node {node.name} did not all dispatch"
+                    )
                 if updated is not None:
                     committed = updated
                 cursor = branch.cursor
@@ -636,7 +646,23 @@ class Scheduler:
                 return BranchOutcome.FAULTED
             exc = task.exception()
             if exc is not None:
-                branch.squash(f"{type(exc).__name__}: {exc}")
+                # A branch that has already been confirmed is NOT squashed here, and the
+                # reason is Hard Rule 3 read in the other direction. ``_retire`` confirms, then
+                # drains, then calls this again to let the node run on -- so by the second call
+                # the branch may hold effects that are already in the world. Squashing it then
+                # marks a branch that changed the world as one that never retired, which is the
+                # invariant the leak test asserts; the next drain refuses with ``BranchClosed``
+                # and the node's real exception is replaced by a fabricated one, so the operator
+                # is told the wrong thing about a run that already had side effects.
+                #
+                # The failure is still a failure: FAULTED is returned either way, ``_retire``
+                # stops, and the run reports the node's own error. Only the status lie is
+                # removed. This is the mirror image of the ``_timed_read`` status race -- that
+                # one could promote a squashed branch, this one demotes a confirmed one.
+                if branch.status is not BranchStatus.CONFIRMED:
+                    branch.squash(f"{type(exc).__name__}: {exc}")
+                else:
+                    branch.reason = f"{type(exc).__name__}: {exc}"
                 return BranchOutcome.FAULTED
             return BranchOutcome.DONE
         return BranchOutcome.PARKED
@@ -709,6 +735,24 @@ class Scheduler:
                 "waiting on something the runtime never completes"
             )
         if isinstance(task, asyncio.Task) and task.done() and task.exception() is not None:
+            # The node failed after its writes were authorised and dispatched. The branch is
+            # not squashed -- its effects were legitimate and are in the world -- but it never
+            # reaches RETIRED either, so without this its lifecycle would simply stop in the
+            # durable record. That is the same open-ended state a process death after dispatch
+            # leaves, and ``Recovery`` already treats it as evidence rather than input; saying
+            # so explicitly is what lets an auditor tell "confirmed, dispatched, then the node
+            # failed" apart from "we have no idea what happened here".
+            await self.journal.append_async(
+                self.run_id,
+                "branch_resolved",
+                {
+                    "v": 1,
+                    "branch_id": branch.id,
+                    "step": branch.fork_step,
+                    "status": "faulted",
+                    "reason": branch.reason or "node raised after dispatch",
+                },
+            )
             return False, committed
         if undrained:
             raise SchedulerError(

@@ -12,6 +12,7 @@ saying so is better than importing something plausible and re-driving the wrong 
 from __future__ import annotations
 
 import importlib
+from dataclasses import replace
 from typing import cast
 
 from specunode.config import Config
@@ -78,9 +79,24 @@ def build_graph(config: Config) -> tuple[GraphAdapter, ToolRegistry]:
             )
     # Overrides last, so a config can reclassify a tool the graph declared -- which is the
     # supported way to say "this one actually writes" without editing someone else's code.
-    for name, spec in config.tool_overrides().items():
-        registry.register(spec)
-        del name
+    #
+    # The override carries an effect class and nothing else: ``ToolOverride.to_tool_spec``
+    # builds a ``ToolSpec`` with no ``fn``, which defaults to the stub that raises
+    # ``UnknownTool``. Registering it wholesale therefore replaced the graph's callable with
+    # that stub, so using the documented feature made the tool permanently uncallable -- and
+    # the error it then raised said the tool "was never registered", pointing the reader away
+    # from the config line that had just unregistered it. The classification is overridden; the
+    # implementation is kept.
+    for name, override in config.tool_overrides().items():
+        declared = registry.get(name) if name in registry.names() else None
+        if declared is None:
+            raise RunnerError(
+                f"specunode.yaml overrides the effect class of {name!r}, but the graph never "
+                f"registered a tool by that name. Known tools: {sorted(registry.names())}. An "
+                "override reclassifies an existing tool; it cannot introduce one, because "
+                "there would be nothing to call."
+            )
+        registry.register(replace(override, fn=declared.fn))
     return cast(GraphAdapter, adapter), registry
 
 

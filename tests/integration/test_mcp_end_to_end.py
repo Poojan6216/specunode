@@ -179,3 +179,79 @@ async def test_a_write_the_decision_contradicts_is_never_sent(tmp_path: Path) ->
         assert "discarded" in text_of(result), text_of(result)
 
     assert upstream_calls(log) == [], "a contradicted write reached the upstream"
+
+
+# -- the two shapes the first version of this file did not cover ---------------------------------
+#
+# It drove BLOCKING mode for exactly one turn, and both of the proxy's remaining Hard Rule 3
+# breaks lived outside that box: one in the other mode, one in the second turn.
+
+
+async def test_a_confirmed_write_reaches_the_upstream_in_handles_mode(tmp_path: Path) -> None:
+    """``--handles`` is a shipped flag, and a write confirmed under it was never sent.
+
+    The forwarder returned the placeholder and its coroutine ended, so nothing was left to do
+    the sending when a decision finally arrived. ``retire`` recorded the call as dispatched and
+    ``specunode.status`` and ``specunode.ledger`` both reported it that way, while the upstream
+    had never heard of it -- three surfaces agreeing on something that had not happened.
+    """
+    log = tmp_path / "upstream.log"
+    async with proxy_client(tmp_path, "--handles") as session:
+        held = await asyncio.wait_for(
+            session.call_tool("close_ticket", {"ticket_id": "tkt-1"}), 60
+        )
+        # The client is handed a placeholder, not a result, and nothing has been sent yet.
+        assert "$specunode.handle:" in text_of(held), text_of(held)
+        assert upstream_calls(log) == []
+
+        result = await asyncio.wait_for(
+            session.call_tool(
+                "specunode.retire", {"tool": "close_ticket", "args": {"ticket_id": "tkt-1"}}
+            ),
+            60,
+        )
+        assert "mcp-" in text_of(result), text_of(result)
+
+    assert upstream_calls(log) == ["close_ticket"], (
+        "the write was reported as dispatched and never reached the upstream"
+    )
+
+
+async def test_a_write_discarded_in_a_later_turn_is_not_forwarded(tmp_path: Path) -> None:
+    """Hard Rule 3 across turns, which is where call identity used to collapse.
+
+    Effect ids were numbered from ``len(staged)``, and ``retire`` empties that list -- so the
+    first write of turn 2 got the id of the first write of turn 1. ``StagedCall`` is frozen, so
+    the two compared equal, and the dispatch guard (a membership test against the dispatched
+    list, by value) answered yes for a call this turn's decision had just discarded.
+    """
+    log = tmp_path / "upstream.log"
+    async with proxy_client(tmp_path) as session:
+        # Turn 1: the model confirms it, so it is sent.
+        first = asyncio.create_task(session.call_tool("close_ticket", {"ticket_id": "tkt-1"}))
+        await asyncio.sleep(0.5)
+        await asyncio.wait_for(
+            session.call_tool(
+                "specunode.retire", {"tool": "close_ticket", "args": {"ticket_id": "tkt-1"}}
+            ),
+            60,
+        )
+        await asyncio.wait_for(first, 60)
+        assert upstream_calls(log) == ["close_ticket"]
+
+        # Turn 2: the same call, structurally identical -- and this time the model asks for
+        # something else.
+        second = asyncio.create_task(session.call_tool("close_ticket", {"ticket_id": "tkt-1"}))
+        await asyncio.sleep(0.5)
+        await asyncio.wait_for(
+            session.call_tool(
+                "specunode.retire", {"tool": "close_ticket", "args": {"ticket_id": "tkt-999"}}
+            ),
+            60,
+        )
+        result = await asyncio.wait_for(second, 60)
+        assert "discarded" in text_of(result), text_of(result)
+
+    assert upstream_calls(log) == ["close_ticket"], (
+        "the contradicted second write was forwarded because it looked like the first"
+    )
