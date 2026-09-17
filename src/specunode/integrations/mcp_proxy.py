@@ -237,14 +237,6 @@ class ProxyState:
         """``"dispatched"``, ``"discarded"``, or ``None`` while the call is still held."""
         return self._outcome.get(call.effect_id)
 
-    def was_confirmed(self, call: StagedCall) -> bool:
-        """Did *this* call retire? Compared by effect id, never by value.
-
-        A value comparison answers for any structurally identical call from any earlier turn,
-        which is how a discarded write got forwarded.
-        """
-        return any(sent.effect_id == call.effect_id for sent in self.dispatched)
-
     def record_result(self, call: StagedCall, result: JsonValue) -> None:
         """Keep what the upstream returned, so the caller that is waiting can have it."""
         self.results[call.effect_id] = result

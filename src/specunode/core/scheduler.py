@@ -1059,6 +1059,12 @@ class Scheduler:
                 "hits": window.hits,
                 "samples": window.samples,
                 "window": window.size,
+                # Per tier as well, tier 0 included, so the receipt can say which predictor
+                # the misses belong to. The gate never reads this.
+                "by_tier": {
+                    str(tier): {"hits": hits, "samples": samples}
+                    for tier, (hits, samples) in window.graded_by_tier().items()
+                },
                 "wasted_tokens": self.budget.wasted_tokens,
                 "speculative_reads_used": self.budget.speculative_reads_used,
             },

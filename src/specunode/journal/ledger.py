@@ -339,6 +339,9 @@ class Ledger:
     #: nothing about a rate the runtime had been measuring the whole time.
     alpha_hits: int = 0
     alpha_samples: int = 0
+    #: The same counts per tier, tier 0 included, so the receipt can say which predictor the
+    #: misses belong to. ``AlphaWindow`` kept this from the start and nothing ever reported it.
+    alpha_by_tier: dict[int, tuple[int, int]] = field(default_factory=dict)
     #: True when no break-even was measured for this workload, so the alpha gate is inactive.
     alpha_gate_unmeasured: bool = False
     #: Effects whose ``dispatch_index`` disagrees with their ``stage_index``.
@@ -453,6 +456,7 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
     alpha: float | None = None
     alpha_hits = 0
     alpha_samples = 0
+    alpha_by_tier: dict[int, tuple[int, int]] = {}
     alpha_gate_unmeasured = False
 
     for entry in ordered:
@@ -522,6 +526,16 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
                 # event carries its current state.
                 alpha_hits = max(0, _as_int(payload, "hits", 0))
                 alpha_samples = max(0, _as_int(payload, "samples", 0))
+                raw_tiers = payload.get("by_tier")
+                if isinstance(raw_tiers, dict):
+                    alpha_by_tier = {
+                        int(tier): (
+                            max(0, _as_int(counts, "hits", 0)),
+                            max(0, _as_int(counts, "samples", 0)),
+                        )
+                        for tier, counts in raw_tiers.items()
+                        if isinstance(counts, dict) and str(tier).isdigit()
+                    }
             if event == "alpha_floor_unmeasured":
                 alpha_gate_unmeasured = True
 
@@ -563,6 +577,7 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
         alpha_window=_as_int(policy, "alpha_window", -1) if policy else None,
         alpha_hits=alpha_hits,
         alpha_samples=alpha_samples,
+        alpha_by_tier=alpha_by_tier,
         alpha_gate_unmeasured=alpha_gate_unmeasured,
         dispatch_order_anomalies=sum(1 for row in rows if row.dispatch_index != row.stage_index),
         args_hash_mismatches=sum(1 for row in rows if row.args_mismatch),
@@ -852,6 +867,10 @@ def ledger_payload(ledger: Ledger) -> Mapping[str, JsonValue]:
         "alpha_window": ledger.alpha_window,
         "alpha_hits": ledger.alpha_hits,
         "alpha_samples": ledger.alpha_samples,
+        "alpha_by_tier": {
+            str(tier): {"hits": hits, "samples": samples}
+            for tier, (hits, samples) in sorted(ledger.alpha_by_tier.items())
+        },
         "alpha_gate_unmeasured": ledger.alpha_gate_unmeasured,
         "dispatch_order_anomalies": ledger.dispatch_order_anomalies,
         "args_hash_mismatches": ledger.args_hash_mismatches,
@@ -1298,6 +1317,13 @@ def _summary(ledger: Ledger, *, ellipsis: str, equivalence_digest: str | None) -
         alpha = f"unjudged ({ledger.alpha_hits}/{ledger.alpha_samples} graded)"
     else:
         alpha = "n/a"
+    if ledger.alpha_by_tier:
+        # Which predictor the graded guesses belong to. Tier 0 is one by construction and is
+        # excluded from the gate, so it appears here only when it was exercised at all.
+        alpha += "  by tier: " + ", ".join(
+            f"T{tier} {hits}/{samples}"
+            for tier, (hits, samples) in sorted(ledger.alpha_by_tier.items())
+        )
     gate = "  [gate inactive: unmeasured]" if ledger.alpha_gate_unmeasured else ""
     order = (
         "stage-ordered"

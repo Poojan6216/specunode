@@ -223,3 +223,26 @@ async def test_run_started_carries_the_alpha_configuration(tmp_path: Path) -> No
     assert policy["alpha_window"] == 7
     assert policy["max_wasted_tokens"] == 5000
     assert "max_speculative_reads" in policy and "alpha_floor" in policy
+
+
+@pytest.mark.timeout(60)
+async def test_the_receipt_says_which_tier_the_graded_guesses_belong_to(tmp_path: Path) -> None:
+    """``AlphaWindow`` graded per tier from the start and nothing reported it.
+
+    The gate consults one rate. A run with two predictors needs to know which one is missing,
+    so the event, the ledger and the rendered receipt all carry the per-tier counts.
+    """
+    result, _, journal, run_id, scheduler = await run(
+        tmp_path,
+        policy=Policy(speculation=True),
+        predictor=FixedDrafter(ToolCall("fetch_runbook", {"section": "restart"})),
+        db="tiers.db",
+    )
+    assert result.ok
+    window = scheduler.budget.window
+    assert window.samples > 0, "nothing was graded, so this proves nothing"
+    last = events(journal, run_id, "alpha_observed")[-1]
+    assert last["by_tier"] == {"1": {"hits": window.hits, "samples": window.samples}}
+    ledger = build_ledger(journal, run_id)
+    assert ledger.alpha_by_tier == {1: (window.hits, window.samples)}
+    assert f"by tier: T1 {window.hits}/{window.samples}" in render_ledger(ledger)

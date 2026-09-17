@@ -66,11 +66,6 @@ class BranchStatus(Enum):
     def terminal(self) -> bool:
         return self in (BranchStatus.RETIRED, BranchStatus.SQUASHED, BranchStatus.STALLED)
 
-    @property
-    def may_dispatch(self) -> bool:
-        """Only a CONFIRMED branch may drain, and only after its confirming entry is durable."""
-        return self is BranchStatus.CONFIRMED
-
 
 @dataclass(frozen=True, slots=True)
 class StepCursor:
@@ -99,9 +94,6 @@ class StepCursor:
         index = counts.get(structural_id, 0)
         counts[structural_id] = index + 1
         return replace(self, visits=tuple(sorted(counts.items()))), f"{structural_id}#{index}"
-
-    def peek(self, structural_id: str) -> str:
-        return f"{structural_id}#{dict(self.visits).get(structural_id, 0)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,12 +364,6 @@ class Branch:
                 "(Hard Rule 3)"
             )
         self.status = BranchStatus.RETIRED
-
-    def is_ancestor_of(self, other: Branch) -> bool:
-        return self.id in other.lineage[:-1]
-
-    def unwitnessed_reads(self) -> Sequence[ReadRecord]:
-        return [record for record in self.read_set if not record.witnessed]
 
     def reads_to_validate(self) -> Sequence[ReadRecord]:
         """Reads issued while this branch was still a guess -- the only ones E3 re-checks."""

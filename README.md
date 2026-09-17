@@ -168,7 +168,8 @@ Known gaps, stated rather than left to be discovered:
   needs an API key and has not been run.
 - One sample workload, not three. The invariant tests hold on it and on tiers 0 and 1.
 
-`BUILD_SPEC.md`'s Final Report lists every one of these with the reason it is open.
+`BUILD_SPEC.md`'s Final Report lists every one of these with the reason it is open. Every
+subcommand of the CLI is documented in [docs/cli.md](docs/cli.md).
 
 ---
 

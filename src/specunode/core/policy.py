@@ -137,6 +137,17 @@ class AlphaWindow:
             return None
         return sum(1 for s in self._samples if s) / len(self._samples)
 
+    def graded_by_tier(self) -> dict[int, tuple[int, int]]:
+        """Hits and samples per tier, tier 0 included. For the receipt, not the gate.
+
+        The gate consults one rate; a run using two predictors needs to know which one is
+        failing, and tier 0's rate -- one by construction -- is only interesting when it is not.
+        """
+        return {
+            tier: (sum(1 for s in graded if s), len(graded))
+            for tier, graded in sorted(self._by_tier.items())
+        }
+
     def alpha_for(self, tier: int) -> float | None:
         graded = self._by_tier.get(tier, [])
         if not graded:
