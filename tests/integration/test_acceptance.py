@@ -135,6 +135,25 @@ def test_within_a_turn_the_drafter_sees_only_that_turns_calls() -> None:
     assert within[1].offered and not within[1].signature_hit
 
 
+def test_the_signature_measure_is_not_a_restatement_of_the_turn_policy() -> None:
+    """Signature accuracy measures the index; the gate's verdict is ``accepted``.
+
+    ``signature_hit`` used to be gated on the same ``resolvable`` flag as ``accepted``, so on a
+    corpus where every call opens a turn the within-turn column read 0.0000 for every step --
+    which looked like a measured collapse in the predictor and was a second spelling of
+    "squashed at a turn boundary".
+    """
+    index = _trained([[ToolCall("f", {"x": 1}), ToolCall("g", {"x": 1})]] * 3)
+    known = frozenset({"f", "g"})
+    calls = [
+        Call(tool="f", args={"x": 2}, turn=0, ordinal=0, refs_prior_output=False),
+        Call(tool="g", args={"x": 2}, turn=1, ordinal=0, refs_prior_output=False),
+    ]
+    [within] = asyncio.run(grade(calls, index, across_turns=False, known=known))
+    assert within.signature_hit, "the index ranked the right signature and the policy hid it"
+    assert not within.accepted and within.squashed_at_turn_end
+
+
 def test_the_sidecar_join_drops_what_does_not_line_up(tmp_path: Path) -> None:
     """A trajectory whose values do not match its shape is dropped and counted, never guessed."""
 
@@ -163,6 +182,11 @@ def test_the_sidecar_join_drops_what_does_not_line_up(tmp_path: Path) -> None:
             {"trajectory_id": "t1", "steps": [{"x": 1}, {"x": 2}]},
             {"trajectory_id": "t3", "steps": [{"y": 1}]},  # keys disagree with the corpus
             {"trajectory_id": "t3", "steps": [{"x": 1}]},  # a duplicate id is ignored
+            # A duplicate whose id is not a string, after the string it collides with. The
+            # membership test read the raw value while the store used str(), so the int was
+            # never counted as a duplicate and quietly replaced the entry before it.
+            {"trajectory_id": "7", "steps": [{"x": 9}]},
+            {"trajectory_id": 7, "steps": [{"x": 1}]},
         ]
     }
     (tmp_path / "traces.json").write_text(json.dumps(corpus))
@@ -177,7 +201,7 @@ def test_the_sidecar_join_drops_what_does_not_line_up(tmp_path: Path) -> None:
         "joined": 1,
         "dropped_missing_values": 1,
         "dropped_misaligned": 1,
-        "duplicate_ids_in_sidecar": 1,
+        "duplicate_ids_in_sidecar": 2,
     }
 
 

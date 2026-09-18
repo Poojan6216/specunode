@@ -38,7 +38,7 @@ That is the shape spec section 1 predicts gains nothing, and it is 95.5% of this
 
 A different quantity, and the one that is not zero. PASTE excludes a tool with side effects from speculation entirely, so it can speculate on 4.5% of steps. SpecuNode stages a write instead of refusing it, so a *predicted* write can be run ahead like any other call and discarded if the model decides otherwise — which covers the other 95.5%.
 
-That is an upper bound on opportunity, not a speedup. It is realisable only where the predictor is right. The nearest measured proxy is signature top-1 at 53.5%, which is an upper bound on that and not a measurement of it. Neither number means anything alone, which is why they are printed together.
+That is an upper bound on opportunity, not a speedup. It is realisable only where the predictor is right. Signature top-1 of 53.5% is an upper bound on how often that happens; the acceptance rate itself — the gate's own verdict, on the same corpus — is measured in the next section, and it is far lower.
 
 ---
 
@@ -55,13 +55,13 @@ Two policies, because they answer different questions. **within_turn** is what t
 | **Acceptance rate**, pooled | **0.0000** | **0.0002** |
 | Acceptance rate, mean over trajectories | 0.0000 [0.0000, 0.0000] | 0.0002 [0.0000, 0.0004] |
 | Guesses the gate would have confirmed | 0 | 3 |
-| Signature top-1 on the same steps | 0.0000 | 0.5339 |
+| Signature top-1 on the same steps | 0.5219 | 0.5339 |
 | Guesses squashed at a turn boundary | 18288 | 0 |
 | Realisable write speculation | 0.0000 | 0.0002 |
 
-**The tier-1 acceptance rate on this corpus is 0.0002 with guesses carried across turns, and 0.0000 under the policy the runtime runs.** 3 of 19184 guesses would have retired even in the more generous policy. Under the runtime's own, none can: every call in these trajectories opens a new model turn, and a guess the turn ends on is squashed unresolved -- 18288 of them here.
+**The tier-1 acceptance rate on this corpus is 0.0002 with guesses carried across turns, and 0.0000 under the policy the runtime runs.** 3 of 19184 graded steps (18788 of which were offered a guess) would have retired even in the more generous policy. Under the runtime's own, none can: every call in these trajectories opens a new model turn, and a guess the turn ends on is squashed unresolved -- 18288 of them here.
 
-The signature bound of 53.4% on the same steps says the index knows *which tool* comes next about half the time. The gate needs the exact command string, path or thought, and those almost never repeat: every argument value of a call has already appeared in an earlier call at 9.8% of steps, and the whole call has at 8.8%. A predictor that can only copy values out of earlier calls -- which is what tier 1 is, on a corpus whose results are free text -- cannot be exactly right more often than 9.8%, and this one is nowhere near that. Anything above the ceiling has to come from a predictor that generates values (tier 2, a draft model), whose acceptance rate has not been measured because that needs an API key.
+The signature bound of 53.4% on the same steps says the index ranks the right *tool and argument names* about half the time. The gate needs the exact command string, path or thought, and those almost never repeat: every argument value of a call has already appeared in an earlier call at 9.8% of steps, and the whole call has at 8.8%. A predictor that copies values out of earlier calls and has no tool results to draw on — which is exactly tier 1 as graded here — cannot be exactly right more often than 9.8%, and this one is nowhere near that. The corpus keeps no result text, so the bound for a drafter that can also copy from results is unknown and higher; an argument of 20.5% of graded steps did come from one. Anything above the ceiling has to come from a predictor that generates values (tier 2, a draft model), whose acceptance rate has not been measured because that needs an API key.
 
 ---
 
@@ -77,7 +77,7 @@ Every strategy below defeats the runtime. Each reports a measured rate.
 | 7.4 | duplicate delivery of a non-idempotent tool | beats it | delivered=2, duplicates=1, intended=1 |
 | 7.5 | return-value laundering | beats it | cases=9, caught=6, miss_rate=0.333, missed=3, missed_cases=L6 base64-encoded, L7 hex-encoded, L9 split inside the prefix |
 | 7.6 | prompt-injected tool call | beats it | dispatched_when_only_the_drafter_predicted_it=0, dispatched_when_the_model_emitted_it=1 |
-| 7.7 | drafter poisoning | held | alpha_window=4, charges_staged_then_discarded=4, confirmed=0, gate_closures_journaled=1, leaked_effects=0, predictions_made=4, speculation_disabled_by_alpha_gate=1, squashed=4, turns_run=6, wasted_tokens=0 |
+| 7.7 | drafter poisoning | held | alpha_window=4, charges_staged_then_discarded=4, confirmed=0, gate_closures_journaled=1, leaked_effects=0, predictions_made=4, speculation_disabled_by_alpha_gate=1, squashed=4, stalled=0, turns_run=6, wasted_tokens=0 |
 | 7.8 | replay under model drift | held | both_caught_at_step_0=1, first_divergence_step_after_system_prompt_change=0, first_divergence_step_after_tool_list_change=0 |
 | 7.9 | staging an irreversible effect | beats it | barrier_by_default=1, staged_when_enabled=1 |
 | 7.10 | asynchronous side effect behind a READ | beats it | effects_landing_after_the_squash=1, leaked_effects_per_squashed_branch=1, mutations_at_squash_time=0, synchronous_response_looks_like_a_read=1 |

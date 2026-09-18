@@ -15,6 +15,7 @@
           "acceptance_rate": 0.0002,
           "accepted": 3,
           "offered": 15105,
+          "share_of_graded_steps": 0.7946,
           "steps": 15243
         },
         "references_a_prior_result": {
@@ -22,6 +23,7 @@
           "acceptance_rate": 0.0,
           "accepted": 0,
           "offered": 3683,
+          "share_of_graded_steps": 0.2054,
           "steps": 3941
         }
       },
@@ -90,7 +92,7 @@
       "rate": 0.0984,
       "rate_previous_call": 0.0011,
       "rate_whole_call": 0.0879,
-      "relation": "a predictor that can only copy argument values out of earlier calls cannot be exactly right more often than rate",
+      "relation": "a predictor that copies argument values out of earlier CALLS only -- which is tier 1 as graded here, with no tool results -- cannot be exactly right more often than rate; with results in hand the bound is higher and is not measured",
       "steps": 19184,
       "whole_call_is_the_previous_call": 22,
       "whole_call_seen_before": 1687
@@ -117,6 +119,7 @@
           "acceptance_rate": 0.0,
           "accepted": 0,
           "offered": 14642,
+          "share_of_graded_steps": 0.7946,
           "steps": 15243
         },
         "references_a_prior_result": {
@@ -124,6 +127,7 @@
           "acceptance_rate": 0.0,
           "accepted": 0,
           "offered": 3646,
+          "share_of_graded_steps": 0.2054,
           "steps": 3941
         }
       },
@@ -183,7 +187,7 @@
       "offered": 18288,
       "offered_rate": 0.9533,
       "realisable_write_speculation": 0.0,
-      "signature_top1": 0.0,
+      "signature_top1": 0.5219,
       "squashed_at_turn_end": 18288,
       "steps": 19184
     }

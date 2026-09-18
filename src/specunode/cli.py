@@ -20,7 +20,7 @@ from pathlib import Path
 import typer
 
 from specunode import __version__
-from specunode.config import DEFAULT_CONFIG_NAME, load_config
+from specunode.config import DEFAULT_CONFIG_NAME, Config, ConfigError, load_config
 from specunode.journal.journal import Journal
 from specunode.journal.ledger import (
     build_ledger,
@@ -40,6 +40,23 @@ app = typer.Typer(
 )
 
 DEFAULT_JOURNAL = Path("./.specunode/journal.db")
+
+
+def _load_or_exit(config: Path | None) -> Config:
+    """Load a config, reporting a missing or unreadable one rather than raising a traceback.
+
+    An explicit ``--config`` that does not exist is exit 2 with a message. Without the option,
+    the search is ``./specunode.yaml`` then ``$XDG_CONFIG_HOME/specunode/config.yaml``, and
+    finding nothing means built-in defaults, as it always has.
+    """
+    if config is not None and not config.is_file():
+        typer.echo(f"no config at {config}", err=True)
+        raise typer.Exit(2)
+    try:
+        return load_config(config)
+    except ConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from exc
 
 
 def _version_callback(value: bool) -> None:
@@ -152,7 +169,7 @@ def resume(
     from specunode.core.model import JournaledModel
     from specunode.core.scheduler import Scheduler
 
-    loaded = load_config(config)
+    loaded = _load_or_exit(config)
     try:
         adapter, registry = build_graph(loaded)
         target = build_target(loaded)
@@ -208,7 +225,7 @@ def replay(
         typer.echo(f"--speculation takes 'on' or 'off', not {speculation!r}", err=True)
         raise typer.Exit(2)
 
-    loaded = load_config(config)
+    loaded = _load_or_exit(config)
     try:
         adapter, registry = build_graph(loaded)
     except RunnerError as exc:
@@ -364,7 +381,7 @@ def mcp_proxy(
     upstream: str = typer.Option(
         ..., "--upstream", help="Command that starts the upstream server."
     ),
-    config: Path = typer.Option(Path(DEFAULT_CONFIG_NAME), "--config", help="specunode.yaml."),
+    config: Path = typer.Option(None, "--config", help=f"Defaults to ./{DEFAULT_CONFIG_NAME}."),
     deadline: float = typer.Option(
         300.0,
         "--deadline",
@@ -397,7 +414,14 @@ def mcp_proxy(
     from specunode.core.effects import ToolRegistry
     from specunode.integrations.mcp_proxy import ClientMode, ProxyState, serve
 
-    loaded = load_config(config if config.is_file() else None)
+    # An explicit path that does not exist is an error, not a reason to load something else.
+    # This used to fall back to ``find_config()`` -- ./specunode.yaml, then
+    # $XDG_CONFIG_HOME/specunode/config.yaml -- so a typo in the path silently proxied with a
+    # different override table and said nothing about which file it had read.
+    if config is not None and not config.is_file():
+        typer.echo(f"no config at {config}", err=True)
+        raise typer.Exit(2)
+    loaded = load_config(config)
     registry = ToolRegistry()
     for _name, spec in loaded.tool_overrides().items():
         registry.register(spec)

@@ -32,9 +32,12 @@ Declare it `WRITE`. If you do not, a squashed branch's queued job still runs.
 
 A read issued on a branch that is later squashed has still been sent. If your reads are
 metered, rate-limited or audited, speculation costs you those reads whether or not the guess
-was right. Every ledger reports `speculative reads upstream` for exactly this reason, and
-`max_speculative_reads` bounds it. The runtime does not hide this number and does not net it
-off against the latency it saved.
+was right. Every ledger reports `speculative reads upstream` for exactly this reason. That
+number counts every read that reached upstream without a durable decision behind it, including
+a read issued early for a turn that is not yet journaled; `max_speculative_reads` bounds the
+narrower half of it — reads made on a forked guess — and the ledger prints that count beside
+the wider one, because the gate can close on one while the other keeps growing. The runtime
+does not hide either number and does not net them off against the latency it saved.
 
 ## Reads without a witness cannot be checked for staleness
 

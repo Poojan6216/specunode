@@ -101,6 +101,11 @@ default. `--handles` forces the first mode; use it only if you know your client.
 Effect classes come from `specunode.yaml`'s `tools:` table, merged with the upstream server's
 own MCP annotations, with the config winning. See [effect-classes.md](effect-classes.md).
 
+The list is read once, when the proxy starts. An upstream that paginates `tools/list`, or that
+announces new tools later with `notifications/tools/list_changed`, has those tools neither
+classified nor served: a call to one is refused by name rather than forwarded. Restart the
+proxy after the upstream's tool list changes.
+
 A tool with no annotation and no override is a `WRITE`. If the servers you use ship no
 annotations — which Decision Gate D5 anticipated — then everything defaults to `WRITE` and the
 override table is the only route to any speculation at all.

@@ -106,13 +106,16 @@ right, and **how often the predictor is right is now measured, and it is almost 
 accuracy — the right tool with the right argument *names* — is 53.4% top-1 over all 300
 trajectories. The runtime releases a write only on exact canonical equality of argument **values**,
 and graded by that gate on the same steps, the tier-1 acceptance rate is **0.0002** with guesses
-carried across model turns (3 of 19,184) and **0.0000** under the policy the runtime actually runs,
-where every guess is squashed at the turn boundary because every call in this corpus opens a new
-turn. Nor is that a flaw this predictor could fix: every argument value of a call has already
-appeared in an earlier call at only 9.8% of steps, which is the ceiling for any predictor that
-copies values out of history, and half this corpus is `execute_bash` with a free-form command
-string. Anything above that ceiling has to come from a predictor that generates values — a draft
-model — and that has not been measured because it needs an API key.
+carried across model turns (3 of 19,184 graded steps) and **0.0000** under the policy the runtime
+actually runs, where every guess is squashed at the turn boundary because every call in this corpus
+opens a new turn. Nor is that a flaw this predictor could fix: every argument value of a call has
+already appeared in an earlier call at only 9.8% of steps, which is the ceiling for tier 1 *as
+graded here* — a predictor copying values out of earlier calls, with no tool results to draw on,
+because this corpus keeps none — and half this corpus is `execute_bash` with a free-form command
+string. An argument of 20.5% of steps did come from a prior result, so the bound for a drafter that
+can read those is higher and is not measured. Anything above the ceiling has to come from a
+predictor that generates values — a draft model — and that has not been measured because it needs an
+API key.
 
 No wall-clock figure appears anywhere in this repository. The online latency benchmark needs an
 API key and has not been run.
@@ -158,7 +161,9 @@ v0.1.0, and honest about where it is. Working today:
 - the canonical form, the hash-chained journal, replay and crash recovery
 - effect classes, the store buffer, at-least-once dispatch with deterministic idempotency keys
 - the sequential scheduler, the LangGraph integration, the plain-Python API, `resume`
-- tier-0 early issue, the tier-1 pattern index, and a tier-2 draft model behind an extra
+- tier-0 early issue, the tier-1 pattern index, and a tier-2 draft model behind an extra —
+  "working" here means they run and are measured, not that they pay: tier 1's measured
+  acceptance on the corpus above is 0.0000 within a turn and 0.0002 across
 - the MCP proxy's rules, the offline benchmark, the overhead benchmark, the adversarial suite
 - the three invariant tests below
 
@@ -166,6 +171,8 @@ Known gaps, stated rather than left to be discovered:
 
 - **No wall-clock figure exists anywhere in this repository.** The online latency benchmark
   needs an API key and has not been run.
+- **The tier-2 (draft model) acceptance rate has not been measured**, and it is the number the
+  whole case rests on now that tier 1's is known to be ~0. It needs an API key too.
 - One sample workload, not three. The invariant tests hold on it and on tiers 0 and 1.
 
 `BUILD_SPEC.md`'s Final Report lists every one of these with the reason it is open. Every
@@ -220,9 +227,11 @@ report how much of each workload has that shape.
 ## What beats it
 
 Ten strategies are run; eight of them defeat the runtime, and those eight are listed below with
-measured rates. The other two are held — a poisoned pattern index wastes tokens and stalls but
-cannot put an effect in the world, and a replay after a changed prompt or tool list diverges at
-the very first step rather than continuing down a trajectory the recorded run never took.
+measured rates. The other two are held — a poisoned pattern index forks and stages writes that
+are all discarded, costs no model tokens, and closes the alpha gate once its window has filled
+with misses, but cannot put an effect in the world; and a replay after a changed prompt or tool
+list diverges at the very first step rather than continuing down a trajectory the recorded run
+never took.
 
 This section is generated from `bench/adversarial/run_attacks.py` rather than written from
 memory, and a test fails the build if any of the eight stops defeating the runtime — either a

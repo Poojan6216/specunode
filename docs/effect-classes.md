@@ -62,7 +62,7 @@ agent; you carry the consequences of a wrong class, not the server's author.
 | `readOnlyHint: true` | `READ` |
 | `destructiveHint: true` | `IRREVERSIBLE` |
 | `destructiveHint: false, idempotentHint: true` | `WRITE(idempotent=True)` |
-| no annotations | `WRITE(idempotent=False)` |
+| anything else, including partial annotations such as `idempotentHint` alone, and no annotations at all | `WRITE(idempotent=False)` |
 
 If the servers you use ship no annotations, everything defaults to `WRITE` and the per-tool
 override table is the only route to any speculation at all.

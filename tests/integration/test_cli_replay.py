@@ -193,9 +193,7 @@ def test_init_writes_a_config_that_actually_parses(tmp_path: Path) -> None:
     It lives inside the package now. This asserts the result parses and carries the keys that
     make it usable, rather than asserting a byte count.
     """
-    from specunode.cli import app as cli_app
-
-    result = CliRunner().invoke(cli_app, ["init", str(tmp_path)])
+    result = CliRunner().invoke(app, ["init", str(tmp_path)])
     assert result.exit_code == 0, result.output
 
     written = tmp_path / "specunode.yaml"
@@ -211,3 +209,25 @@ def test_init_writes_a_config_that_actually_parses(tmp_path: Path) -> None:
     # `replay` refuse without, so a template that omits it teaches the wrong shape.
     for key in ("graph:", "target:", "journal:", "policy:", "tools:"):
         assert key in text, f"the template no longer documents {key!r}"
+
+
+@pytest.mark.parametrize("command", ["replay", "resume", "mcp-proxy"])
+def test_a_config_path_that_does_not_exist_is_refused_rather_than_replaced(
+    tmp_path: Path, command: str
+) -> None:
+    """A typo in ``--config`` used to load a different file, or raise a traceback.
+
+    ``mcp-proxy`` fell back to the search order -- ``./specunode.yaml``, then
+    ``$XDG_CONFIG_HOME/specunode/config.yaml`` -- so it proxied with whatever override table
+    that found and said nothing about which file it had read. ``resume`` and ``replay`` raised
+    ``FileNotFoundError`` at the user. Both are now exit 2 naming the path.
+    """
+    absent = tmp_path / "nowhere.yaml"
+    args = ["--config", str(absent)]
+    if command == "mcp-proxy":
+        args = ["mcp-proxy", "--upstream", "true", *args]
+    else:
+        args = [command, "01RUNTHATDOESNOTEXISTAAAAA", *args]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 2, result.output
+    assert str(absent) in result.output

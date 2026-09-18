@@ -316,11 +316,17 @@ class Ledger:
     stalls: tuple[Stall, ...] = ()
     reads_validated: ReadTally = ReadTally()
     wasted_tokens: int = 0
-    #: Reads that reached an upstream system from a branch that never retired, plus witness
-    #: re-fetches. Excluded from the equivalence relation and printed in every rendering:
-    #: Hard Rule 9 is about the *effect* ledger, and speculative reads genuinely do reach
-    #: upstream. That exclusion is honest only because the number is never hidden.
+    #: Reads that reached an upstream system without a durable decision behind them -- from a
+    #: branch that was still a guess, or issued early for a turn not yet journaled -- plus
+    #: witness re-fetches. The same definition as the runtime's own tally. Excluded from the
+    #: equivalence relation and printed in every rendering: Hard Rule 9 is about the *effect*
+    #: ledger, and speculative reads genuinely do reach upstream. That exclusion is honest
+    #: only because the number is never hidden.
     speculative_reads_upstream: int = 0
+    #: The share of those the read budget charged: reads made on forked guesses. This is what
+    #: ``max_speculative_reads`` bounds, and the gate can close on it while the wider number
+    #: above keeps growing, so the two are printed together.
+    speculative_reads_charged: int = 0
     context_divergences: int = 0
     #: ``(checked, recorded)`` -- how many of the prompts a branch recorded were rebuilt and
     #: compared at retirement (Hard Rule 13).
@@ -342,6 +348,8 @@ class Ledger:
     #: The same counts per tier, tier 0 included, so the receipt can say which predictor the
     #: misses belong to. ``AlphaWindow`` kept this from the start and nothing ever reported it.
     alpha_by_tier: dict[int, tuple[int, int]] = field(default_factory=dict)
+    #: Why speculation was switched off for the rest of the run, if it was.
+    speculation_disabled_reason: str | None = None
     #: True when no break-even was measured for this workload, so the alpha gate is inactive.
     alpha_gate_unmeasured: bool = False
     #: Effects whose ``dispatch_index`` disagrees with their ``stage_index``.
@@ -458,6 +466,8 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
     alpha_samples = 0
     alpha_by_tier: dict[int, tuple[int, int]] = {}
     alpha_gate_unmeasured = False
+    reads_charged = 0
+    disabled_reason: str | None = None
 
     for entry in ordered:
         payload = entry.payload
@@ -521,21 +531,17 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
             reported = _as_float(payload, "alpha")
             if reported is not None:
                 alpha = reported
-            if "samples" in payload:
+            if event in ("alpha_observed", "speculation_disabled") and "hits" in payload:
                 # The last observation wins: the window is a rolling one and the latest
-                # event carries its current state.
+                # event carries its current state. Only events that carry the whole state
+                # count -- a closure entry without ``hits`` used to zero the hits.
                 alpha_hits = max(0, _as_int(payload, "hits", 0))
                 alpha_samples = max(0, _as_int(payload, "samples", 0))
-                raw_tiers = payload.get("by_tier")
-                if isinstance(raw_tiers, dict):
-                    alpha_by_tier = {
-                        int(tier): (
-                            max(0, _as_int(counts, "hits", 0)),
-                            max(0, _as_int(counts, "samples", 0)),
-                        )
-                        for tier, counts in raw_tiers.items()
-                        if isinstance(counts, dict) and str(tier).isdigit()
-                    }
+                alpha_by_tier = _tiers_from(payload.get("by_tier"))
+            if "speculative_reads_used" in payload:
+                reads_charged = max(0, _as_int(payload, "speculative_reads_used", 0))
+            if event == "speculation_disabled":
+                disabled_reason = _as_str(payload, "reason") or "unknown"
             if event == "alpha_floor_unmeasured":
                 alpha_gate_unmeasured = True
 
@@ -545,9 +551,10 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
         if entry.kind != "tool_result" or not _as_bool(entry.payload, "reached_upstream"):
             continue
         branch_id = _as_str(entry.payload, "branch_id")
-        if _as_bool(entry.payload, "witness_probe") or state.final_status.get(branch_id) not in (
-            "retired",
-            "confirmed",
+        if (
+            _as_bool(entry.payload, "witness_probe")
+            or _as_bool(entry.payload, "speculative")
+            or state.final_status.get(branch_id) not in ("retired", "confirmed")
         ):
             upstream += 1
 
@@ -569,6 +576,8 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
         reads_validated=reads,
         wasted_tokens=_wasted_tokens(state),
         speculative_reads_upstream=upstream,
+        speculative_reads_charged=reads_charged,
+        speculation_disabled_reason=disabled_reason,
         context_divergences=divergences,
         context_checks=(context_checked, context_recorded),
         reads_raced_drain=len(raced_from_results) or raced_from_validation,
@@ -773,6 +782,21 @@ def _stalls(state: _Build) -> tuple[Stall, ...]:
     return tuple(sorted(out, key=lambda stall: (stall.step, stall.slug, stall.node_id)))
 
 
+def _tiers_from(raw: object) -> dict[int, tuple[int, int]]:
+    """Per-tier counts out of a payload, tolerating anything an edited journal might hold."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[int, tuple[int, int]] = {}
+    for tier, counts in raw.items():
+        if not isinstance(counts, dict) or not isinstance(tier, str):
+            continue
+        if not (tier.isascii() and tier.isdigit()):
+            continue
+        samples = max(0, _as_int(counts, "samples", 0))
+        out[int(tier)] = (min(samples, max(0, _as_int(counts, "hits", 0))), samples)
+    return out
+
+
 def _wasted_tokens(state: _Build) -> int:
     """Tokens spent on branches that produced nothing (Hard Rule 10).
 
@@ -858,6 +882,8 @@ def ledger_payload(ledger: Ledger) -> Mapping[str, JsonValue]:
         },
         "wasted_tokens": ledger.wasted_tokens,
         "speculative_reads_upstream": ledger.speculative_reads_upstream,
+        "speculative_reads_charged": ledger.speculative_reads_charged,
+        "speculation_disabled_reason": ledger.speculation_disabled_reason,
         "context_divergences": ledger.context_divergences,
         "context_checks": list(ledger.context_checks),
         "context_identity": ledger.context_identity,
@@ -1336,14 +1362,20 @@ def _summary(ledger: Ledger, *, ellipsis: str, equivalence_digest: str | None) -
         f"stalls: {len(ledger.stalls)}{stall_detail}",
         f"reads validated at retirement: {tally.fresh}/{tally.witnessed} fresh, "
         f"{tally.unwitnessed} unwitnessed, {tally.unreadable} unreadable   "
-        f"speculative reads upstream: {ledger.speculative_reads_upstream}   "
+        f"speculative reads upstream: {ledger.speculative_reads_upstream} "
+        f"({ledger.speculative_reads_charged} charged to the read budget)   "
         f"reads racing a drain: {ledger.reads_raced_drain}",
         f"wasted tokens: {ledger.wasted_tokens:,}   alpha (window {window}): {alpha}{gate}   "
         f"context divergences: {ledger.context_divergences}   "
         f"injected blocks: {ledger.injected_blocks}",
         f"dispatch order: {order}   args-hash mismatches: {ledger.args_hash_mismatches}",
     ]
-    for event in ledger.policy_events[:3]:
+    # Observations already feed the alpha line above; the rest are decisions, and the one
+    # that switched speculation off is never allowed to scroll out of the first three.
+    decisions = [e for e in ledger.policy_events if e.event != "alpha_observed"]
+    closures = [e for e in decisions if e.event == "speculation_disabled"]
+    others = [e for e in decisions if e.event != "speculation_disabled"]
+    for event in closures + others[: max(0, 3 - len(closures))]:
         lines.append(f"policy: {event.event} - {event.reason}")
     lines.append(f"equivalence digest: {equivalence_digest or '(not computed)'}")
     signature = "(unsigned)"

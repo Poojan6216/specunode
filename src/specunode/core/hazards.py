@@ -78,10 +78,9 @@ class Hazard(Enum):
     UNDECLARED_TOOL = "tool has no declared effect class"
     FREE_TEXT_NODE = "node emits free text"
     READ_AFTER_STAGED_WRITE = "read touches a key a staged write touches; no forwarding"
-    BUDGET = "speculation budget exhausted"
+    BUDGET = "speculation depth or in-flight limit reached"
     IRREVERSIBLE_ON_PATH = "irreversible effect would need staging"
     MODEL_TURN_AFTER_STAGED_WRITE = "next model call would contain a placeholder"
-    READ_BUDGET = "speculative read budget exhausted"
     #: Added beyond the spec's eight. A predicted route into a node the adapter cannot run
     #: speculatively must be *named* rather than silently not attempted, or the benchmark's
     #: hazard histogram is incomplete and the honest answer about available speculation is
@@ -232,15 +231,14 @@ def analyse(
     # simply stop speculating.
     if branch.status is not BranchStatus.SPECULATIVE or budget is None:
         return None
-    if (
-        spec.effect is EffectClass.READ
-        and budget.speculative_reads_used >= policy.max_speculative_reads
-    ):
-        return Hazard.READ_BUDGET
+    # Only the per-branch limits live here. The run-level budgets -- reads and wasted tokens
+    # -- close the gate for the rest of the run instead (``Budget.may_speculate``, journaled
+    # as ``speculation_disabled``), and the scheduler consults the gate before it asks the
+    # drafter, so a clause for them here was unreachable and the stall histogram never held
+    # the hazard the docs said it would.
     if (
         branch.depth >= policy.max_speculation_depth
-        or budget.inflight_branches > policy.max_inflight_branches
-        or budget.wasted_tokens >= policy.max_wasted_tokens
+        or budget.inflight_branches >= policy.max_inflight_branches
     ):
         return Hazard.BUDGET
     return None

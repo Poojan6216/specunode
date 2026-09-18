@@ -15,7 +15,9 @@ the shape every audit of this project found: a mechanism that half-works reads a
 
 from __future__ import annotations
 
+import asyncio
 import re
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
@@ -24,7 +26,16 @@ from tests.integration.test_speculation import TURN, FixedDrafter, OneTurnGraph,
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
 from specunode.core.decision import ToolCall
-from specunode.core.model import JournaledModel, ModelResponse, RequestEnvelope
+from specunode.core.effects import EffectClass, ToolSpec
+from specunode.core.model import (
+    JournaledModel,
+    Message,
+    ModelResponse,
+    RequestEnvelope,
+    StreamEvent,
+    TextBlock,
+    ToolUseComplete,
+)
 from specunode.core.policy import Policy
 from specunode.core.scheduler import RunResult, Scheduler
 from specunode.drafters.t2_model import ModelDrafter
@@ -78,11 +89,19 @@ async def test_speculative_reads_are_counted_against_the_budget(tmp_path: Path) 
     )
     assert result.ok
     assert scheduler.budget.speculative_reads_used > 0, (
-        "speculative reads were made and the budget's counter never moved"
+        "a guess made a read and the budget's counter never moved"
     )
+    # Two counters, two questions, and the difference is deliberate. The report answers attack
+    # 7.2's -- "what reached upstream without a durable decision behind it?" -- and includes
+    # reads issued early for a turn that is not yet journaled. The budget answers "what may a
+    # wrong guess cost?" and charges only reads made on a forked guess. Holding them equal is
+    # what made a run with no predictor at all close its own gate.
     assert (
-        scheduler.budget.speculative_reads_used == scheduler.counters.speculative_reads_upstream
-    ), "the budget's counter and the report's counter disagree about the same reads"
+        scheduler.budget.speculative_reads_used <= scheduler.counters.speculative_reads_upstream
+    ), "the budget charged reads the report does not even count"
+    assert (
+        scheduler.counters.speculative_reads_upstream > scheduler.budget.speculative_reads_used
+    ), "this turn issues a read early as well as on the guess; the two counts should differ"
 
 
 @pytest.mark.timeout(60)
@@ -208,6 +227,17 @@ async def test_a_squashed_tier_2_guess_wastes_the_tokens_it_cost(tmp_path: Path)
     )
     closed = events(journal, run_id, "speculation_disabled")
     assert closed and closed[0]["reason"] == "max_wasted_tokens"
+    # The receipt, not only the runtime's own memory. The ledger sums wasted tokens from
+    # ``branch_resolved`` and the squash payload did not carry them, so a run whose gate had
+    # closed for max_wasted_tokens printed "wasted tokens: 0" on the line above the closure.
+    ledger = build_ledger(journal, run_id)
+    assert ledger.wasted_tokens == scheduler.budget.wasted_tokens, (
+        f"budget says {scheduler.budget.wasted_tokens}, the signed ledger says "
+        f"{ledger.wasted_tokens}"
+    )
+    finished = [e.payload for e in journal.read(run_id, kinds=["run_finished"])]
+    assert finished[-1]["counters"]["wasted_tokens"] == scheduler.budget.wasted_tokens
+    assert f"wasted tokens: {scheduler.budget.wasted_tokens:,}" in render_ledger(ledger)
     # And the wrong guess never reached the world.
     assert [m.tool for m in world.mutations] == ["restart_job"]
 
@@ -250,3 +280,360 @@ async def test_the_receipt_says_which_tier_the_graded_guesses_belong_to(tmp_path
     ledger = build_ledger(journal, run_id)
     assert ledger.alpha_by_tier == {1: (window.hits, window.samples)}
     assert f"by tier: T1 {window.hits}/{window.samples}" in render_ledger(ledger)
+
+
+class _BlockingRead:
+    """A read tool that parks until released, so a guess can be observed while it is open."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, section: str) -> dict[str, object]:
+        self.started.set()
+        await self.release.wait()
+        return {"section": section, "text": "restart it"}
+
+
+@pytest.mark.timeout(60)
+async def test_an_open_guess_is_counted_in_flight_until_it_resolves(tmp_path: Path) -> None:
+    """The count has to be 1 *while* the guess is open; the old test only checked it ended at 0.
+
+    ``inflight_branches`` defaults to 0, so a test that runs to completion and asserts zero
+    passes just as well with the increment and both decrements deleted -- which is exactly what
+    it did. This one blocks the predicted read, looks at the count while the branch is alive,
+    then releases it.
+    """
+    world = standard_world()
+    registry = registry_for(world)
+    blocking = _BlockingRead()
+    registry.register(
+        ToolSpec(name="fetch_runbook", effect=EffectClass.READ, fn=blocking, witness=False)
+    )
+    journal = Journal(tmp_path / "open.db")
+    scheduler = Scheduler(
+        graph=OneTurnGraph(),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(
+            ScriptedModel(turns=[tool_turn(*TURN, turn=0)], block_delay_ms=15.0),
+            journal,
+            provider="scripted",
+        ),
+        policy=Policy(speculation=True),
+        predictor=FixedDrafter(ToolCall("fetch_runbook", {"section": "restart"})),
+    )
+    task = asyncio.create_task(scheduler.run(new_ulid(), {}))
+    await asyncio.wait_for(blocking.started.wait(), timeout=10)
+    assert scheduler.budget.inflight_branches == 1, (
+        f"a guess is open and running, and the budget counts {scheduler.budget.inflight_branches}"
+    )
+    blocking.release.set()
+    result = await asyncio.wait_for(task, timeout=30)
+    assert result.ok, result.error
+    assert scheduler.counters.branches_forked > 0
+    assert scheduler.budget.inflight_branches == 0, "the guess resolved and was never counted down"
+
+
+class _FailingStream(ScriptedModel):
+    """Emits one block, then raises -- a turn that dies with a guess still open."""
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        emitted = False
+        async for event in super().stream(envelope):
+            yield event
+            if isinstance(event, ToolUseComplete):
+                emitted = True
+                break
+        assert emitted
+        raise RuntimeError("the target died mid-turn")
+
+
+@pytest.mark.timeout(60)
+async def test_a_turn_that_dies_with_a_guess_open_still_grades_and_discards_it(
+    tmp_path: Path,
+) -> None:
+    """Every branch ends retired, squashed or stalled -- including when the turn raises.
+
+    Without this, a stream that raised left the guess ungraded, its in-flight slot held for the
+    rest of the scheduler's life, its staged effect never discarded, and the journal holding a
+    ``branch_forked`` with no ``branch_resolved``.
+    """
+    world = standard_world()
+    registry = registry_for(world)
+    journal = Journal(tmp_path / "died.db")
+    scheduler = Scheduler(
+        graph=OneTurnGraph(),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(
+            _FailingStream(turns=[tool_turn(*TURN, turn=0)], block_delay_ms=5.0),
+            journal,
+            provider="scripted",
+        ),
+        policy=Policy(speculation=True),
+        predictor=FixedDrafter(ToolCall("restart_job", {"job_id": "etl-1"})),
+    )
+    run_id = new_ulid()
+    result = await scheduler.run(run_id, {})
+    assert not result.ok, "the target raised; the run cannot have succeeded"
+
+    forked = {str(e.payload["branch_id"]) for e in journal.read(run_id, kinds=["branch_forked"])}
+    resolved = {
+        str(e.payload["branch_id"]) for e in journal.read(run_id, kinds=["branch_resolved"])
+    }
+    assert forked, "nothing was forked, so this proves nothing"
+    # Both branches: the guess (squashed on the way out of the turn) and the canonical branch
+    # of the node visit (faulted). The driven loop journaled the fork and then broke straight
+    # out, so the canonical one was left open too.
+    assert forked <= resolved, f"{forked - resolved} forked and never resolved"
+    statuses = {str(e.payload["status"]) for e in journal.read(run_id, kinds=["branch_resolved"])}
+    assert statuses == {"squashed", "faulted"}, statuses
+    assert scheduler.budget.inflight_branches == 0, "the guess is still counted as open"
+    assert scheduler.budget.window.samples > 0, "the guess was never graded"
+    assert [m.tool for m in world.mutations] == [], "a dead turn put something in the world"
+
+
+@pytest.mark.timeout(60)
+async def test_a_run_with_no_predictor_never_charges_the_read_budget(tmp_path: Path) -> None:
+    """Early-issued reads are not guesses, and were closing the gate as though they were.
+
+    A read issued for a turn that is not yet durable counts as speculative in the *report*
+    (attack 7.2 counts it: it reached upstream without a durable decision). It is not a guess,
+    and charging it to ``max_speculative_reads`` disabled speculation on runs that had no
+    predictor at all.
+    """
+    result, _, journal, run_id, scheduler = await run(
+        tmp_path,
+        policy=Policy(speculation=True, max_speculative_reads=1),
+        predictor=None,
+        db="nopredictor.db",
+    )
+    assert result.ok, result.error
+    assert scheduler.counters.speculative_reads_upstream > 0, "no read was issued early"
+    assert scheduler.budget.speculative_reads_used == 0, (
+        "a run with no predictor charged the guess budget"
+    )
+    assert not events(journal, run_id, "speculation_disabled"), (
+        "a run that never guessed journaled the gate closing"
+    )
+
+
+@pytest.mark.timeout(60)
+async def test_the_receipt_keeps_the_closure_and_separates_the_two_read_counts(
+    tmp_path: Path,
+) -> None:
+    """Two defects in one run: the closure scrolled out of the receipt, and the counts disagreed.
+
+    The rendered receipt showed the first three policy events, and alpha observations come
+    first, so the line saying speculation had been switched off was dropped after two
+    resolutions. The ledger also counted a narrower set of reads than the budget charged, so a
+    gate that closed for ``max_speculative_reads`` sat beside "speculative reads upstream: 0".
+    """
+    result, _, journal, run_id, scheduler = await run(
+        tmp_path,
+        policy=Policy(speculation=True, max_speculative_reads=1),
+        predictor=FixedDrafter(ToolCall("fetch_runbook", {"section": "restart"}), limit=3),
+        db="receipt.db",
+    )
+    assert result.ok, result.error
+    ledger = build_ledger(journal, run_id)
+    assert ledger.speculation_disabled_reason == "max_speculative_reads"
+    assert ledger.speculative_reads_charged == scheduler.budget.speculative_reads_used > 0
+    assert ledger.speculative_reads_upstream >= ledger.speculative_reads_charged
+    rendered = render_ledger(ledger)
+    assert "policy: speculation_disabled - max_speculative_reads" in rendered, rendered
+    assert f"{ledger.speculative_reads_charged} charged to the read budget" in rendered
+    # The window's hits survive the closure entry, which used to reset them to zero.
+    assert ledger.alpha_hits == scheduler.budget.window.hits
+    assert ledger.alpha_samples == scheduler.budget.window.samples
+
+
+class ManyTurnsGraph(OneTurnGraph):
+    """Four turns through the same node, so a run produces several resolutions."""
+
+    turns = 4
+
+    async def run_node(self, node: object, session: object) -> ToolCall:  # type: ignore[override]
+        assert session.call_turn is not None  # type: ignore[attr-defined]
+        await session.call_turn(  # type: ignore[attr-defined]
+            RequestEnvelope(
+                model="scripted",
+                messages=(Message(role="user", content=(TextBlock(text="go"),)),),
+                max_tokens=128,
+                stream=True,
+            )
+        )
+        state = session.state  # type: ignore[attr-defined]
+        state["turns"] = int(state.get("turns", 0)) + 1
+        if state["turns"] >= self.turns:
+            state["done"] = True
+        return ToolCall("restart_job", {"job_id": "etl-1"})
+
+
+@pytest.mark.timeout(60)
+async def test_the_closure_survives_a_run_with_more_policy_events_than_the_receipt_shows(
+    tmp_path: Path,
+) -> None:
+    """The receipt showed the first three policy events, and observations come first.
+
+    Every resolution writes an ``alpha_observed``, so on any run with three or more guesses the
+    line saying speculation had been switched off -- the one thing in that list a reader is
+    looking for -- scrolled off the end. The journal always had it; the rendered receipt did
+    not.
+    """
+    world = standard_world()
+    registry = registry_for(world)
+    journal = Journal(tmp_path / "many.db")
+    scheduler = Scheduler(
+        graph=ManyTurnsGraph(),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(
+            ScriptedModel(
+                turns=[tool_turn(*TURN, turn=i) for i in range(ManyTurnsGraph.turns)],
+                block_delay_ms=5.0,
+            ),
+            journal,
+            provider="scripted",
+        ),
+        policy=Policy(speculation=True, max_speculative_reads=3),
+        predictor=FixedDrafter(ToolCall("fetch_runbook", {"section": "restart"}), limit=20),
+    )
+    run_id = new_ulid()
+    result = await scheduler.run(run_id, {})
+    assert result.ok, result.error
+
+    ledger = build_ledger(journal, run_id)
+    observed = [e for e in ledger.policy_events if e.event == "alpha_observed"]
+    closures = [e for e in ledger.policy_events if e.event == "speculation_disabled"]
+    assert len(observed) >= 3, f"only {len(observed)} observations; this proves nothing"
+    assert closures, "the gate never closed, so this proves nothing"
+    assert ledger.policy_events.index(closures[0]) >= 3, "the closure was already in the first 3"
+    rendered = render_ledger(ledger)
+    assert "policy: speculation_disabled - max_speculative_reads" in rendered, rendered
+
+
+@pytest.mark.timeout(60)
+async def test_a_closure_journaled_without_its_counts_does_not_zero_the_window(
+    tmp_path: Path,
+) -> None:
+    """Compatibility, and the shape of the original defect.
+
+    Runs journaled before today wrote ``speculation_disabled`` with ``samples`` and no ``hits``,
+    and the ledger took any event carrying ``samples`` as the latest state of the window -- so
+    the closure, which is usually the last such event, reset the hits to zero and the receipt
+    read ``unjudged (0/n graded)`` beside a per-tier line that still said ``T1 n/n``. The
+    entries below are written by hand on purpose: they are the shape the runtime no longer
+    produces, and the reader still has to be right about them.
+    """
+    journal = Journal(tmp_path / "legacy.db")
+    run_id = new_ulid()
+    await journal.append_async(
+        run_id,
+        "run_started",
+        {
+            "v": 1,
+            "mode": "run",
+            "config_hash": "0" * 64,
+            "registry_hash": "0" * 64,
+            "target": {"provider": "scripted", "model": "scripted"},
+            "policy": {"alpha_window": 20},
+        },
+    )
+    await journal.append_async(
+        run_id,
+        "policy_event",
+        {
+            "v": 1,
+            "event": "alpha_observed",
+            "reason": "a prediction resolved",
+            "step": 1,
+            "alpha": None,
+            "hits": 2,
+            "samples": 3,
+            "window": 20,
+            "by_tier": {"1": {"hits": 2, "samples": 3}},
+        },
+    )
+    await journal.append_async(
+        run_id,
+        "policy_event",
+        {
+            "v": 1,
+            "event": "speculation_disabled",
+            "reason": "max_speculative_reads",
+            "step": 2,
+            "alpha": None,
+            "samples": 3,
+            "window": 20,
+        },
+    )
+    ledger = build_ledger(journal, run_id)
+    assert (ledger.alpha_hits, ledger.alpha_samples) == (2, 3)
+    assert ledger.alpha_by_tier == {1: (2, 3)}
+    assert "unjudged (2/3 graded)" in render_ledger(ledger)
+
+
+@pytest.mark.timeout(60)
+async def test_a_budget_spent_by_the_last_resolution_still_says_so(tmp_path: Path) -> None:
+    """The closure was journaled only when the *next* guess was attempted.
+
+    A budget spent by the final resolution of a run left ``may_speculate()`` False with no
+    ``policy_event`` and no reason in the counters: the run stopped speculating and the durable
+    record did not say why. One guess, whose read spends the budget, and then the turn ends.
+    """
+    # Three guesses at 192 tokens each. The first two are squashed by the block that follows
+    # them, so a later ``_speculate_next`` would have announced any closure they caused; the
+    # third is squashed when the turn ends, after the last block, and crosses the limit. From
+    # there nothing asks the gate again.
+    drafter = ModelDrafter(client=_CostlyDraftClient())  # type: ignore[arg-type]
+    result, _, journal, run_id, scheduler = await run(
+        tmp_path,
+        policy=Policy(speculation=True, max_wasted_tokens=400),
+        predictor=drafter,
+        db="last.db",
+    )
+    assert result.ok, result.error
+    assert not scheduler.budget.may_speculate(), "the budget was not spent; this proves nothing"
+    closed = events(journal, run_id, "speculation_disabled")
+    assert len(closed) == 1, f"{len(closed)} closures journaled"
+    assert scheduler.counters.speculation_disabled_reason == "max_wasted_tokens"
+    assert build_ledger(journal, run_id).speculation_disabled_reason == "max_wasted_tokens"
+
+
+@pytest.mark.timeout(60)
+async def test_a_resolution_and_its_alpha_event_name_the_same_branch_and_step(
+    tmp_path: Path,
+) -> None:
+    """Two entries describe one resolution, and they have to be joinable.
+
+    ``alpha_observed`` carried the *parent's* cursor, which early reads advance concurrently,
+    while the matching ``branch_resolved`` carried the guess's fork step -- so the step numbers
+    disagreed, by an amount that depended on which reads happened to have finished.
+    """
+    result, _, journal, run_id, _ = await run(
+        tmp_path,
+        policy=Policy(speculation=True),
+        predictor=FixedDrafter(ToolCall("fetch_runbook", {"section": "restart"})),
+        db="join.db",
+    )
+    assert result.ok, result.error
+    resolutions = {
+        str(e.payload["branch_id"]): int(e.payload["step"])
+        for e in journal.read(run_id, kinds=["branch_resolved"])
+    }
+    observed = events(journal, run_id, "alpha_observed")
+    assert observed, "nothing was graded, so this proves nothing"
+    for event in observed:
+        branch_id = event["branch_id"]
+        assert branch_id in resolutions, f"{branch_id} has no branch_resolved entry"
+        assert event["step"] == resolutions[str(branch_id)], (
+            "the alpha event and the resolution disagree about the step"
+        )

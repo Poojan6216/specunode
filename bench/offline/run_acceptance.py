@@ -92,7 +92,8 @@ class Grade:
     offered: bool
     #: The gate would have confirmed it: exact canonical equality with the next call.
     accepted: bool
-    #: The index's top-ranked signature was the next call's. The upper bound, on this step.
+    #: The index's top-ranked signature was the next call's, from the history this policy hands
+    #: it. Measures the index alone: a guess the turn boundary squashes can still be a hit here.
     signature_hit: bool
     #: Offered, and the next call opened a new turn, so the runtime squashed it unresolved.
     squashed_at_turn_end: bool
@@ -113,10 +114,14 @@ def load_joined(corpus: Path, values: Path) -> tuple[list[list[Call]], dict[str,
     by_id: dict[str, list[dict[str, JsonValue]]] = {}
     duplicates = 0
     for entry in sidecar:
-        if entry["trajectory_id"] in by_id:
+        # One spelling of the key for both the membership test and the store. Testing the raw
+        # value and storing the string let a non-string duplicate id go uncounted and silently
+        # replace the entry before it, which the docstring above promises never happens.
+        key = str(entry["trajectory_id"])
+        if key in by_id:
             duplicates += 1
             continue
-        by_id[str(entry["trajectory_id"])] = list(entry["steps"])
+        by_id[key] = list(entry["steps"])
 
     joined: list[list[Call]] = []
     missing = misaligned = 0
@@ -223,7 +228,12 @@ async def grade(
         candidates = await drafter.predict(context)
         offered = bool(candidates)
         ranked = index.rank(history)
-        signature_hit = resolvable and bool(ranked) and ranked[0][0] == target.signature
+        # Deliberately not gated on ``resolvable``. This measures the *index* -- did it rank the
+        # right signature from the history the policy gives it -- and the gate's verdict is
+        # ``accepted`` below. Gated, the within-turn column read 0.0000 by construction on a
+        # corpus where every call opens a turn, which looked like a measured collapse in the
+        # predictor and was a restatement of ``squashed_at_turn_end``.
+        signature_hit = bool(ranked) and ranked[0][0] == target.signature
         accepted = (
             offered
             and resolvable
@@ -248,17 +258,22 @@ def _rate(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 4) if denominator else 0.0
 
 
-def _bucket(grades: Sequence[Grade]) -> dict[str, Any]:
+def _bucket(grades: Sequence[Grade], of_total: int = 0) -> dict[str, Any]:
     steps = len(grades)
     offered = sum(1 for g in grades if g.offered)
     accepted = sum(1 for g in grades if g.accepted)
-    return {
+    bucket = {
         "steps": steps,
         "offered": offered,
         "accepted": accepted,
         "acceptance_rate": _rate(accepted, steps),
         "acceptance_given_offered": _rate(accepted, offered),
     }
+    if of_total:
+        # The bucket's share of all graded steps. Carried here rather than divided in prose,
+        # because a number a document computes for itself traces to no measurement (Rule 12).
+        bucket["share_of_graded_steps"] = _rate(steps, of_total)
+    return bucket
 
 
 def tally(per_trajectory: Sequence[Sequence[Grade]]) -> dict[str, Any]:
@@ -291,8 +306,10 @@ def tally(per_trajectory: Sequence[Sequence[Grade]]) -> dict[str, Any]:
             label: _bucket([g for g in flat if g.effect == label]) for label in ("read", "write")
         },
         "by_argument_provenance": {
-            "references_a_prior_result": _bucket([g for g in flat if g.refs_prior_output]),
-            "does_not": _bucket([g for g in flat if not g.refs_prior_output]),
+            "references_a_prior_result": _bucket(
+                [g for g in flat if g.refs_prior_output], of_total=steps
+            ),
+            "does_not": _bucket([g for g in flat if not g.refs_prior_output], of_total=steps),
         },
         "by_tool": {
             tool: _bucket([g for g in flat if g.tool == tool])
@@ -307,15 +324,19 @@ def tally(per_trajectory: Sequence[Sequence[Grade]]) -> dict[str, Any]:
 
 
 def copying_ceiling(trajectories: Sequence[Sequence[ToolCall]]) -> dict[str, Any]:
-    """How often the next call could be assembled from what came before: tier 1's ceiling.
+    """How often the next call could be assembled from earlier *calls*: this grading's ceiling.
 
-    ``PatternDrafter`` fills a guess by copying values out of earlier calls (and out of
-    results, which this corpus does not keep because they are free text). Whatever it ranks,
-    it can be exactly right only where every argument value of the next call has already
-    occurred as an argument value of an earlier one -- so that rate bounds any tier-1
-    acceptance rate from above, however the index is built or the fill is chosen. Whole-call
-    repeats are reported alongside as the stricter, more intuitive figure. The denominator is
-    the graded positions: calls with a predecessor.
+    ``PatternDrafter`` fills a guess by copying values out of earlier calls **and out of tool
+    results**. This corpus keeps no results -- they are free text, and ``fetch.py`` stores only
+    argument keys and a flag for whether a value appeared in a prior result -- so the drafter is
+    graded here with ``results={}``, and under that grading it can be exactly right only where
+    every argument value of the next call has already occurred as an argument value of an
+    earlier one. That is what this rate bounds: tier 1 *as graded here*, not tier 1 with results
+    in hand, and not every conceivable copying predictor. The repository's own provenance
+    measure says an argument of 20.5% of graded steps did appear in a prior result, so the bound
+    with results available is unknown and higher. Whole-call repeats are reported alongside as
+    the stricter, more intuitive figure. The denominator is the graded positions: calls with a
+    predecessor.
     """
     steps = assemblable = whole = previous = 0
     for trace in trajectories:
@@ -342,8 +363,9 @@ def copying_ceiling(trajectories: Sequence[Sequence[ToolCall]]) -> dict[str, Any
         "whole_call_is_the_previous_call": previous,
         "rate_previous_call": _rate(previous, steps),
         "relation": (
-            "a predictor that can only copy argument values out of earlier calls cannot be "
-            "exactly right more often than rate"
+            "a predictor that copies argument values out of earlier CALLS only -- which is "
+            "tier 1 as graded here, with no tool results -- cannot be exactly right more often "
+            "than rate; with results in hand the bound is higher and is not measured"
         ),
     }
 

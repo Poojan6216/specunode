@@ -6,6 +6,12 @@ finish. No subcommand decides anything: the journal decides, and these read it.
 Every command that reads a run takes `--journal PATH`, defaulting to `./.specunode/journal.db`.
 `--version` (or `-V`) prints the version; `specunode` alone prints this list.
 
+Commands that need a config (`resume`, `replay`, `mcp-proxy`) take `--config PATH`. Without the
+option the search is `./specunode.yaml`, then `$XDG_CONFIG_HOME/specunode/config.yaml` (or
+`~/.config/specunode/config.yaml`), and finding neither means built-in defaults. A `--config`
+that names a file which does not exist is an error, exit 2 — never a silent fallback to a
+different file.
+
 ### `specunode init [DIRECTORY]`
 
 Write `specunode.yaml` from the example packaged with the library, and create `.specunode/`,
@@ -46,8 +52,11 @@ is written to a file, by default `<journal dir>/ledgers/<run>.sig`, and echoed. 
 Rebuild the ledger, read its signature file, and check both the signature and the journal
 chain, saying which failed. An edited ledger and a ledger signed by a key the keystore does not
 trust are different problems with different remedies, so they are reported as different
-reasons; the exit code is the category's. Options: `--journal`; `--keystore DIR`;
-`--signature PATH` (default: where `sign-ledger` writes it).
+reasons, each with its own exit code: 0 the ledger verifies; 2 the rows are not the bytes the
+signature covers; 3 the signing key is not one the keystore trusts; 4 the journal chain is
+broken, or the rows do not reproduce from the journal; 5 the signature envelope is malformed;
+6 there is no signature. Options: `--journal`; `--keystore DIR`; `--signature PATH` (default:
+where `sign-ledger` writes it).
 
 ### `specunode resume RUN_ID`
 
@@ -57,18 +66,22 @@ position they consumed, and the graph is driven on from there. An effect that wa
 the crash is claimed and skipped; one whose request demonstrably never left is re-sent; one
 that may or may not have taken effect is dead-lettered unless its tool declared a repeat
 harmless. This needs a live target, because the turns the journal does not already hold have
-to be asked for. Prints the ledger; exits 1 if the run did not complete and 2 if the config
-cannot build the graph or the target. Options: `--journal`; `--config PATH` (default
-`./specunode.yaml`).
+to be asked for. Prints the ledger; exits 1 if the run did not complete and 2 if the config is
+missing, unreadable, or cannot build the graph or the target. Options: `--journal`;
+`--config PATH`.
 
 ### `specunode replay RUN_ID`
 
 Re-run a journaled run against its own recorded model output, from the inputs the journal
-recorded, into a fresh journal (`replay-<run>.db` beside the source, so the record being checked
-is never written to). Refuses at the first turn whose request does not match the journal's,
+recorded, into a separate journal (`replay-<run>.db` beside the source, so the record being
+checked is never written to; a second replay of the same run appends another run to that same
+file rather than starting empty). Refuses at the first turn whose request does not match the journal's,
 naming the step and the fields that differ, rather than continuing down a trajectory the
-recorded run never took (exit 1). Dispatches nothing unless told to. Options: `--journal`;
-`--config PATH`; `--speculation on|off` (default `on`; anything else exits 2); `--dispatch`
+recorded run never took (exit 1). Dispatches nothing unless told to. A replay writes into
+`replay-<run>.db` beside the source journal and appends to it if that file already exists, so
+a second replay of the same run adds a second run to the same file rather than starting empty.
+Options: `--journal`; `--config PATH`; `--speculation on|off` (default `on`; anything else
+exits 2); `--dispatch`
 actually sends effects, which is off by default because a replay that re-sent every effect
 would charge every card again. See [replay.md](replay.md).
 
@@ -76,9 +89,10 @@ would charge every card again. See [replay.md](replay.md).
 
 Proxy an MCP server over stdio: reads are forwarded immediately, everything else is held until
 the model's decision confirms it. Tools are classified from the upstream's own annotations,
-with the config's per-tool overrides winning. Options: `--upstream CMD` (required; the command
-that starts the upstream server); `--config PATH` (default `./specunode.yaml`, used when
-present); `--deadline SECONDS` (default 300), how long a blocking write waits for a decision
+with the config's per-tool overrides winning. The tool list is read once at startup: a server
+that paginates its `tools/list`, or adds tools later, has those tools neither classified nor
+served. Options: `--upstream CMD` (required; the command that starts the upstream server);
+`--config PATH`; `--deadline SECONDS` (default 300), how long a blocking write waits for a decision
 before giving up, after which it is still held and still unsent and the client is told so;
 `--handles`, which returns a staged-write handle instead of blocking, for a client that
 understands one and will not put it in a prompt. See [mcp-proxy.md](mcp-proxy.md).

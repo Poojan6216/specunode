@@ -324,11 +324,16 @@ class Scheduler:
         )
         if speculative:
             self.counters.speculative_reads_upstream += 1
-            # The budget's counter, not only the report's. These were two counters that were
-            # supposed to move together, and only the informational one ever did -- so the
-            # READ_BUDGET hazard could never fire and ``max_speculative_reads`` was dead
-            # config, while attack 7.2's writeup described it as the budget that bounds the
-            # cost of a wrong guess.
+        if branch.predicted is not None:
+            # The budget charges only reads made on a forked guess -- a branch that exists
+            # because something predicted a decision, which is the test ``record_prompt`` uses
+            # too. (Every branch is SPECULATIVE until it is confirmed, the canonical one
+            # included, so status cannot tell a guess from the path the model really took.)
+            # ``max_speculative_reads`` bounds what wrong guesses may cost. The wider tally
+            # above also counts a read
+            # issued early for a turn that is not yet durable (tier 0, on the canonical
+            # branch), which attack 7.2 reports but which is not a guess -- charging those
+            # closed the gate on runs that had no predictor at all.
             self.budget.record_speculative_read()
         await self.journal.append_async(
             self.run_id,
@@ -397,6 +402,12 @@ class Scheduler:
 
                 outcome, decision = await self._run_node(node, branch, node_id, committed)
                 if outcome is BranchOutcome.FAULTED:
+                    # Close the branch's lifecycle first. This loop journaled the fork and then
+                    # broke straight out, so a node that raised here left a ``branch_forked``
+                    # with no ``branch_resolved`` -- a branch that ended in none of the three
+                    # ways branch.py says every branch ends, and invisible to every reader that
+                    # selects on a resolution. The adapter-driven path has always done this.
+                    await self._journal_faulted(branch, node_id)
                     # The reason the node failed is the whole of the diagnostic value here.
                     # A replay that refuses because the prompt changed reports the step index
                     # and a field-level diff, and reducing that to "node act failed" throws
@@ -430,6 +441,7 @@ class Scheduler:
         except Exception as exc:  # a run fault, journaled rather than swallowed
             ok, error = False, f"{type(exc).__name__}: {exc}"
 
+        await self._close_gate_if_spent(steps)
         await self._journal_run_finished(ok, error, steps, committed)
         return RunResult(
             run_id=run_id,
@@ -486,7 +498,7 @@ class Scheduler:
                 "resumed_from_offset": recovery.last_offset,
                 "config_hash": chash({"reducers": dict(self.reducers)}),
                 "registry_hash": chash(sorted(self.registry.names())),
-                "policy": {"speculation": self.policy.speculation},
+                "policy": self._policy_payload(),
                 "graph": {"adapter": self.graph.capabilities().framework},
                 "target": {"provider": "configured", "model": "configured"},
                 "recovered": {
@@ -524,6 +536,7 @@ class Scheduler:
         except Exception as exc:
             ok, error = False, f"{type(exc).__name__}: {exc}"
 
+        await self._close_gate_if_spent(self._steps)
         await self._journal_run_finished(ok, error, self._steps, self._committed)
         state = dict(final) if isinstance(final, Mapping) else self._committed.to_dict()
         return RunResult(
@@ -1033,7 +1046,7 @@ class Scheduler:
 
     # -- journal bookends --------------------------------------------------------------------------
 
-    async def _journal_alpha_observed(self, step: int) -> None:
+    async def _journal_alpha_observed(self, step: int, branch_id: str | None = None) -> None:
         """One ``policy_event`` per resolution, carrying the window's current alpha.
 
         The ledger reads alpha from ``policy_event`` payloads and from nowhere else, and none
@@ -1050,7 +1063,11 @@ class Scheduler:
                 "v": 1,
                 "event": "alpha_observed",
                 "reason": "a prediction resolved",
+                # The guess's own fork step and id, not the parent's cursor -- early reads
+                # advance that concurrently, so the two entries for one resolution carried
+                # different step numbers and could not be joined.
                 "step": step,
+                "branch_id": branch_id,
                 "alpha": window.alpha,
                 # The rate the gate consults is None until the window is full, on purpose --
                 # disabling on three data points is a worse error than guessing three more
@@ -1059,8 +1076,9 @@ class Scheduler:
                 "hits": window.hits,
                 "samples": window.samples,
                 "window": window.size,
-                # Per tier as well, tier 0 included, so the receipt can say which predictor
-                # the misses belong to. The gate never reads this.
+                # Per tier as well -- the tiers the configured predictor actually offered --
+                # so the receipt can say which predictor the misses belong to. The gate never
+                # reads this.
                 "by_tier": {
                     str(tier): {"hits": hits, "samples": samples}
                     for tier, (hits, samples) in window.graded_by_tier().items()
@@ -1086,13 +1104,39 @@ class Scheduler:
                 "reason": reason,
                 "step": step,
                 "alpha": self.budget.window.alpha,
+                "hits": self.budget.window.hits,
                 "samples": self.budget.window.samples,
                 "window": self.budget.window.size,
+                "by_tier": {
+                    str(tier): {"hits": hits, "samples": samples}
+                    for tier, (hits, samples) in self.budget.window.graded_by_tier().items()
+                },
                 "wasted_tokens": self.budget.wasted_tokens,
                 "speculative_reads_used": self.budget.speculative_reads_used,
                 "inflight_branches": self.budget.inflight_branches,
             },
         )
+
+    def _policy_payload(self) -> dict[str, JsonValue]:
+        """The whole policy, for whichever ``run_started`` is being written.
+
+        One helper rather than two literals: ``resume`` journaled ``{"speculation": ...}`` alone,
+        so a resumed run's ledger read its alpha window as absent and rendered "-", and the
+        budgets that governed the run were missing from the only durable record of them.
+        """
+        return {
+            "speculation": self.policy.speculation,
+            "max_inflight_branches": self.policy.max_inflight_branches,
+            "max_speculation_depth": self.policy.max_speculation_depth,
+            "max_wasted_tokens": self.policy.max_wasted_tokens,
+            "max_speculative_reads": self.policy.max_speculative_reads,
+            # The ledger reads its window size from here; it read -1 and rendered "-".
+            "alpha_window": self.policy.alpha_window,
+            "alpha_floor": self.policy.alpha_floor,
+            "stage_irreversible": self.policy.stage_irreversible,
+            "on_stale_read": self.policy.on_stale_read,
+            "on_unverifiable_read": self.policy.on_unverifiable_read,
+        }
 
     async def _journal_run_started(self, inputs: JsonValue) -> None:
         capabilities = self.graph.capabilities()
@@ -1119,19 +1163,7 @@ class Scheduler:
                 "mode": "run",
                 "config_hash": chash({"reducers": dict(self.reducers)}),
                 "registry_hash": chash(sorted(self.registry.names())),
-                "policy": {
-                    "speculation": self.policy.speculation,
-                    "max_inflight_branches": self.policy.max_inflight_branches,
-                    "max_speculation_depth": self.policy.max_speculation_depth,
-                    "max_wasted_tokens": self.policy.max_wasted_tokens,
-                    "max_speculative_reads": self.policy.max_speculative_reads,
-                    # The ledger reads its window size from here; it read -1 and rendered "-".
-                    "alpha_window": self.policy.alpha_window,
-                    "alpha_floor": self.policy.alpha_floor,
-                    "stage_irreversible": self.policy.stage_irreversible,
-                    "on_stale_read": self.policy.on_stale_read,
-                    "on_unverifiable_read": self.policy.on_unverifiable_read,
-                },
+                "policy": self._policy_payload(),
                 "graph": {
                     "adapter": capabilities.framework,
                     "nodes": [n.structural_id for n in self.graph.nodes()],
@@ -1140,6 +1172,18 @@ class Scheduler:
                 "inputs": inputs,
             },
         )
+
+    async def _close_gate_if_spent(self, step: int) -> None:
+        """Journal a closure that nothing will get round to announcing.
+
+        ``_journal_speculation_disabled`` ran only from ``_speculate_next``, so a budget spent
+        by the last resolution of a run -- or by a read issued after the final block -- left
+        ``may_speculate()`` False with no ``policy_event`` and no reason in the counters. The
+        run stopped speculating and the durable record did not say why.
+        """
+        if self.budget.speculation_disabled or self.budget.should_disable() is None:
+            return
+        await self._journal_speculation_disabled(step)
 
     async def _journal_run_finished(
         self, ok: bool, error: str | None, steps: int, committed: CommittedState
@@ -1245,6 +1289,29 @@ class SpeculativeTurn:
         # for its calls is the order it must be shown them in (Hard Rule 13).
         slots: list[asyncio.Task[JsonValue] | None] = []
 
+        try:
+            await self._consume(envelope, tools, slots)
+        except BaseException:
+            # A stream that raised, or a node task cancelled, with a guess still open: grade
+            # it, discard what it staged, cancel its task and journal the resolution before
+            # the exception continues. Without this the in-flight count leaked for the rest
+            # of the scheduler's life, the guess was never graded, and the journal held a
+            # ``branch_forked`` with no ``branch_resolved`` -- a branch that ended in none of
+            # the three ways branch.py says every branch ends.
+            await self._squash_open("turn_failed")
+            raise
+
+        # Any speculation still open when the turn ended predicted a call the model never made.
+        await self._squash_open("turn_ended")
+        return await self._settle_turn(tools, slots)
+
+    async def _consume(
+        self,
+        envelope: RequestEnvelope,
+        tools: BranchTools,
+        slots: list[asyncio.Task[JsonValue] | None],
+    ) -> None:
+        scheduler = self._scheduler
         async for event in scheduler.target.stream(envelope):
             if isinstance(event, ToolUseComplete):
                 actual = ToolCall(name=event.block.name, args=event.block.args)
@@ -1273,9 +1340,11 @@ class SpeculativeTurn:
             elif isinstance(event, TurnComplete):
                 self.stream_ended_at = time.monotonic()
 
-        # Any speculation still open when the turn ended predicted a call the model never made.
-        await self._squash_open("turn_ended")
-
+    async def _settle_turn(
+        self, tools: BranchTools, slots: list[asyncio.Task[JsonValue] | None]
+    ) -> list[JsonValue]:
+        scheduler = self._scheduler
+        branch = self._branch
         # The turn is durable now (JournaledModel writes it before yielding TurnComplete), so
         # the writes it emitted may be staged. They are staged here rather than mid-stream so
         # that a staged effect never exists for a turn the journal does not yet record.
@@ -1310,7 +1379,7 @@ class SpeculativeTurn:
         without ever being dispatched.
         """
         scheduler = self._scheduler
-        if not scheduler.policy.speculation:
+        if not scheduler.policy.speculation or scheduler.predictor is None:
             return
         if not scheduler.budget.may_speculate():
             # The gate has closed for this run. Say so, once, in the durable record. The gate
@@ -1322,8 +1391,6 @@ class SpeculativeTurn:
             await scheduler._journal_speculation_disabled(self._branch.cursor.step_index)
             return
         drafter = scheduler.predictor
-        if drafter is None:
-            return
 
         self._history.append(after)
         context = DraftContext(
@@ -1446,7 +1513,7 @@ class SpeculativeTurn:
                 tier=self._tier, confirmed=True, tokens=self._cost_tokens
             )
             scheduler.budget.inflight_branches -= 1
-            await scheduler._journal_alpha_observed(self._branch.cursor.step_index)
+            await scheduler._journal_alpha_observed(child.fork_step, child.id)
             self.confirmed += 1
             child.confirm()
             # The guess was right, so the work stops being speculative and becomes the
@@ -1503,7 +1570,7 @@ class SpeculativeTurn:
             tier=self._tier, confirmed=False, tokens=self._cost_tokens
         )
         scheduler.budget.inflight_branches -= 1
-        await scheduler._journal_alpha_observed(self._branch.cursor.step_index)
+        await scheduler._journal_alpha_observed(child.fork_step, child.id)
         # Revoke first, cancel second: a tool that cannot be cancelled finishes anyway, and a
         # closed buffer is what stops its write from being staged into something nothing will
         # ever drain.
@@ -1514,6 +1581,10 @@ class SpeculativeTurn:
             self._open.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._open
+        # The cost travels with the resolution. The ledger sums ``wasted_tokens`` from
+        # ``branch_resolved`` and from nowhere else, so a squash that fed the budget but not
+        # the journal left the receipt saying 0 beside a gate that had closed for tokens.
+        scheduler.counters.wasted_tokens += self._cost_tokens
         await scheduler.journal.append_async(
             scheduler.run_id,
             "branch_resolved",
@@ -1523,6 +1594,8 @@ class SpeculativeTurn:
                 "step": child.fork_step,
                 "status": "squashed",
                 "reason": reason,
+                "tier": self._tier,
+                "wasted_tokens": self._cost_tokens,
             },
         )
         self._open = None

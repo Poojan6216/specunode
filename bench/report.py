@@ -110,10 +110,9 @@ def opportunity_section() -> str:
         f"{o['steps_paste_must_skip_that_specunode_can_stage']['mean']:.1%}.",
         "",
         "That is an upper bound on opportunity, not a speedup. It is realisable only where the "
-        f"predictor is right. The nearest measured proxy is signature top-1 at "
-        f"{o['signature_predictability']['top_1']:.1%}, which is an upper bound on that and "
-        "not a measurement of it. "
-        "Neither number means anything alone, which is why they are printed together.",
+        f"predictor is right. Signature top-1 of {o['signature_predictability']['top_1']:.1%} is "
+        "an upper bound on how often that happens; the acceptance rate itself — the gate's own "
+        "verdict, on the same corpus — is measured in the next section, and it is far lower.",
         "",
     ]
     return "\n".join(lines)
@@ -129,6 +128,9 @@ def acceptance_section() -> str:
         )
     a = report["acceptance"]
     within, across, ceiling = a["within_turn"], a["across_turns"], a["copying_ceiling"]
+    from_result_rate = across["by_argument_provenance"]["references_a_prior_result"][
+        "share_of_graded_steps"
+    ]
     values = report.get("values") or {}
     lines = [
         "### The acceptance rate, measured",
@@ -166,21 +168,25 @@ def acceptance_section() -> str:
         "",
         f"**The tier-1 acceptance rate on this corpus is {across['acceptance_rate']:.4f} with "
         f"guesses carried across turns, and {within['acceptance_rate']:.4f} under the policy the "
-        f"runtime runs.** {across['accepted']} of {across['steps']} guesses would have retired "
-        "even in the more generous policy. Under the runtime's own, none can: every call in "
-        "these trajectories opens a new model turn, and a guess the turn ends on is squashed "
+        f"runtime runs.** {across['accepted']} of {across['steps']} graded steps "
+        f"({across['offered']} of which were offered a guess) would have retired even in the "
+        "more generous policy. Under the runtime's own, none can: every call in these "
+        "trajectories opens a new model turn, and a guess the turn ends on is squashed "
         f"unresolved -- {within['squashed_at_turn_end']} of them here.",
         "",
         f"The signature bound of {across['signature_top1']:.1%} on the same steps says the index "
-        "knows *which tool* comes next about half the time. The gate needs the exact command "
-        "string, path or thought, and those almost never repeat: every argument value of a call "
-        f"has already appeared in an earlier call at {ceiling['rate']:.1%} of steps, and the "
-        f"whole call has at {ceiling['rate_whole_call']:.1%}. A predictor that can only copy "
-        "values out of earlier calls -- which is what tier 1 is, on a corpus whose results are "
-        f"free text -- cannot be exactly right more often than {ceiling['rate']:.1%}, and this "
-        "one is nowhere near that. Anything above the ceiling has to come from a predictor "
-        "that generates values (tier 2, a draft model), whose acceptance rate has not been "
-        "measured because that needs an API key.",
+        "ranks the right *tool and argument names* about half the time. The gate needs the exact "
+        "command string, path or thought, and those almost never repeat: every argument value of "
+        f"a call has already appeared in an earlier call at {ceiling['rate']:.1%} of steps, and "
+        f"the whole call has at {ceiling['rate_whole_call']:.1%}. A predictor that copies values "
+        "out of earlier calls and has no tool results to draw on — which is exactly tier 1 as "
+        f"graded here — cannot be exactly right more often than {ceiling['rate']:.1%}, and this "
+        "one is nowhere near that. The corpus keeps no result text, so the bound for a drafter "
+        "that can also copy from results is unknown and higher; an argument of "
+        f"{from_result_rate:.1%} "
+        "of graded steps did come from one. Anything above the ceiling has to come from a "
+        "predictor that generates values (tier 2, a draft model), whose acceptance rate has not "
+        "been measured because that needs an API key.",
         "",
     ]
     return "\n".join(lines)

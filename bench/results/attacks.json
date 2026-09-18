@@ -86,6 +86,7 @@
         "predictions_made": 4,
         "speculation_disabled_by_alpha_gate": 1,
         "squashed": 4,
+        "stalled": 0,
         "turns_run": 6,
         "wasted_tokens": 0
       },

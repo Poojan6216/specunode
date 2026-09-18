@@ -376,6 +376,16 @@ async def attack_77_drafter_poisoning() -> AttackResult:
     and is reported as zero rather than as an invented per-guess charge. What a poisoned
     index costs is the branches, the stagings that are thrown away, and the window's worth of
     misses before the gate closes. What it cannot cost is an effect, and that is the assertion.
+
+    Two properties of the fixture worth stating, because the numbers depend on them. The first
+    guess of each turn is the poisoned chain proper: history ``[quote]`` matches the order-1
+    context and ``charge_card`` is ranked at 1.0. The second is an order-0 back-off, where
+    ``charge_card`` and ``quote`` are tied at 0.5 and the tie is broken by signature string --
+    so it happens to be a charge because ``charge_card`` sorts before ``quote``. Both stage and
+    both are discarded, which is what the row counts. And the model waits for each guess to
+    reach the buffer before moving on; if that wait ever expires while speculation is still
+    enabled the attack raises rather than reporting a smaller number, because a count that
+    quietly shrinks under load is worse than no count.
     """
     import tempfile
     import time
@@ -440,15 +450,20 @@ async def attack_77_drafter_poisoning() -> AttackResult:
 
         buffer: StoreBuffer | None = None
         budget: Budget | None = None
+        timeouts: int = 0
 
         async def _settle(self) -> None:
             if self.buffer is None or self.budget is None:
                 return
             deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and self.budget.may_speculate():
+            while time.monotonic() < deadline:
+                if not self.budget.may_speculate():
+                    # The gate is shut; nothing will stage again, and waiting is not a failure.
+                    return
                 if self.buffer.has_staged():
                     return
                 await asyncio.sleep(0)
+            self.timeouts += 1
 
         async def stream(self, envelope):  # type: ignore[no-untyped-def]
             first = True
@@ -508,6 +523,13 @@ async def attack_77_drafter_poisoning() -> AttackResult:
         outcome = await scheduler.run(run_id, {})
         if not outcome.ok:
             raise RuntimeError(f"the run failed: {outcome.error}")
+        if model.timeouts:
+            # An error row, never a quietly smaller number. The staging count is only
+            # meaningful if every guess reached the buffer before the block that squashes it.
+            raise RuntimeError(
+                f"{model.timeouts} guess(es) did not reach the store buffer within the "
+                "fixture's deadline; the staging count would be an artefact of load"
+            )
         disabled = [
             e
             for e in journal.read(run_id, kinds=["policy_event"])
@@ -518,6 +540,22 @@ async def attack_77_drafter_poisoning() -> AttackResult:
         # ``counters.branches_forked`` counts both kinds of fork, so the guesses are counted
         # from how they were resolved, and a confirmation counts only if it names an adopter.
         resolved = [dict(e.payload) for e in journal.read(run_id, kinds=["branch_resolved"])]
+        # Charges specifically, not effects in general: ``counters.effects_discarded`` counts
+        # any tool, so on a fixture with a second write the row's name would stop matching
+        # what it held.
+        staged = {
+            str(e.payload["effect_id"])
+            for e in journal.read(run_id, kinds=["effect_staged"])
+            if e.payload.get("tool") == "charge_card"
+        }
+        # ``effect_discarded`` carries ``effect_ids``, a list -- one entry per discarding
+        # branch, not per effect.
+        charges_discarded = sum(
+            1
+            for e in journal.read(run_id, kinds=["effect_discarded"])
+            for effect_id in (e.payload.get("effect_ids") or ())
+            if str(effect_id) in staged
+        )
         close_all_writers()
 
     counters = scheduler.counters
@@ -539,10 +577,13 @@ async def attack_77_drafter_poisoning() -> AttackResult:
         measured={
             "turns_run": turns,
             "alpha_window": window,
+            # confirmed + squashed + stalled == predictions_made, so the row reconciles from
+            # its own fields. It used to print two of the three.
             "predictions_made": sum(guesses.values()),
             "confirmed": guesses["confirmed"],
             "squashed": guesses["squashed"],
-            "charges_staged_then_discarded": counters.effects_discarded,
+            "stalled": guesses["stalled"],
+            "charges_staged_then_discarded": charges_discarded,
             "speculation_disabled_by_alpha_gate": (
                 1 if counters.speculation_disabled_reason == "alpha_below_floor" else 0
             ),

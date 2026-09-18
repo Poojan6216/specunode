@@ -13,8 +13,7 @@ disjoint buckets and a run's stalls can be attributed rather than lumped togethe
 | `RETURN_VALUE_DEPENDENCY` | a placeholder appears anywhere in the call's arguments | before a call |
 | `IRREVERSIBLE_ON_PATH` | an `IRREVERSIBLE` effect would have to be staged, and `stage_irreversible` is off | before a call, on a speculative branch only |
 | `READ_AFTER_STAGED_WRITE` | a read touches a resource key a staged write touches | before a call |
-| `READ_BUDGET` | `max_speculative_reads` is spent | before a call |
-| `BUDGET` | depth, in-flight branches or wasted tokens are spent | before a call |
+| `BUDGET` | speculation depth or the in-flight limit is reached | before a call |
 | `FREE_TEXT_NODE` | the predicted decision is prose | when filtering a candidate |
 | `NODE_NOT_SPECULABLE` | a predicted route enters a node that did not opt in | when filtering a candidate |
 | `MODEL_TURN_AFTER_STAGED_WRITE` | a request would carry a placeholder, or include a slot that will never fill | before a model request |
@@ -25,7 +24,7 @@ First match wins, and correctness-bearing predicates come before cost-bearing on
 
 ```
 UNDECLARED_TOOL → RETURN_VALUE_DEPENDENCY → IRREVERSIBLE_ON_PATH
-                → READ_AFTER_STAGED_WRITE → READ_BUDGET → BUDGET
+                → READ_AFTER_STAGED_WRITE → BUDGET
 ```
 
 `UNDECLARED_TOOL` is first because every later predicate reads `ToolSpec` fields the registry
