@@ -32,6 +32,7 @@ shape, present here in a workload that is supposed to succeed.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 
 from specunode.canonical import JsonValue
@@ -58,6 +59,19 @@ TOOL_DEFS = (
 #: Units reserved before a restart. A constant rather than a model-chosen number: the point of
 #: this workload is the effect class, and a varying amount would only add noise to the ledger.
 RESERVE_UNITS = 2
+
+
+def target_model() -> str:
+    """Which model this example asks for.
+
+    ``"scripted"`` by default, so the tests and demos stay hermetic and deterministic. The
+    online latency bench sets ``SPECUNODE_MODEL`` to a real id; nothing else does, and the
+    runtime never rewrites it -- Hard Rule 13 makes the request the unit of identity, so a
+    scheduler that substituted a model would make the journal's record of what was asked
+    untrue. Read at call time rather than at import, because the bench sets it after this
+    module is imported.
+    """
+    return os.environ.get("SPECUNODE_MODEL", "scripted")
 
 
 def build_tools(world: World) -> list[object]:
@@ -121,7 +135,7 @@ async def triage(session: RunSession) -> Decision:
     pipeline_id = str(session.state.get("pipeline_id", "etl-2"))
     results = await session.call_turn(
         RequestEnvelope(
-            model="scripted",
+            model=target_model(),
             system=(TextBlock(text="You are the on-call engineer for a data platform."),),
             messages=(
                 Message(

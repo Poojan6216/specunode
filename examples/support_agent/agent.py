@@ -8,6 +8,7 @@ handed a real result before the branch retires, and it cannot be left waiting fo
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 
 from specunode.canonical import JsonValue
@@ -29,6 +30,19 @@ TOOL_DEFS = (
     ToolDef(name="charge_card", description="Charge a customer's card", input_schema={}),
     ToolDef(name="send_receipt", description="Email a receipt", input_schema={}),
 )
+
+
+def target_model() -> str:
+    """Which model this example asks for.
+
+    ``"scripted"`` by default, so the tests and demos stay hermetic and deterministic. The
+    online latency bench sets ``SPECUNODE_MODEL`` to a real id; nothing else does, and the
+    runtime never rewrites it -- Hard Rule 13 makes the request the unit of identity, so a
+    scheduler that substituted a model would make the journal's record of what was asked
+    untrue. Read at call time rather than at import, because the bench sets it after this
+    module is imported.
+    """
+    return os.environ.get("SPECUNODE_MODEL", "scripted")
 
 
 def build_tools(world: World) -> list[object]:
@@ -66,7 +80,7 @@ async def decide(session: RunSession) -> Decision:
     if session.model is None:  # pragma: no cover - the scheduler always binds one
         raise ModelError("no model was bound for this run")
     envelope = RequestEnvelope(
-        model="scripted",
+        model=target_model(),
         system=(TextBlock(text="You handle refunds and charges for a support desk."),),
         messages=(
             Message(

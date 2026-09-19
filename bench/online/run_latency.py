@@ -63,6 +63,12 @@ ARMS = ("B_seq", "B_readonly_spec", "B_specunode")
 #: Default spend cap in USD. Overridden by SPECUNODE_BENCH_BUDGET_USD.
 DEFAULT_BUDGET_USD = 25.0
 
+#: The target model a real run asks for. The sample apps read it from ``SPECUNODE_MODEL`` at
+#: call time and default to the deterministic stand-in, so a run that forgot to set it would
+#: have sent ``"model": "scripted"`` to the Messages API and failed on the first call -- which
+#: is what this runner did until someone was about to pay for it.
+DEFAULT_TARGET_MODEL = "claude-sonnet-5"
+
 #: Per-million-token prices used to estimate spend. Declared here and printed in the output,
 #: because an estimate whose inputs are hidden is not an estimate anyone can check. They are
 #: *prices*, not measurements, and the output labels them that way.
@@ -286,7 +292,22 @@ async def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=Path("bench/results/latency.json"))
     parser.add_argument("--tasks", type=int, default=30, help="seeded tasks per workload per arm")
     parser.add_argument("--model", default="anthropic", help="anthropic|scripted")
+    parser.add_argument(
+        "--target-model",
+        default=os.environ.get("SPECUNODE_MODEL", DEFAULT_TARGET_MODEL),
+        help=f"model id the workloads ask for (default {DEFAULT_TARGET_MODEL})",
+    )
     args = parser.parse_args(argv)
+
+    if args.model == "anthropic":
+        if args.target_model == "scripted":
+            raise SystemExit(
+                "--model anthropic with --target-model scripted would send "
+                '"model": "scripted" to the Messages API. Pass a real model id.'
+            )
+        # The workloads read this when they build their envelope, so it has to be set before
+        # any of them runs -- and read at call time, not at import, for the same reason.
+        os.environ["SPECUNODE_MODEL"] = args.target_model
 
     cap = float(os.environ.get("SPECUNODE_BENCH_BUDGET_USD", DEFAULT_BUDGET_USD))
     spend = Spend(cap_usd=cap)
@@ -314,6 +335,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         "bench": "latency",
         "model": args.model,
         "is_real_model": args.model != "scripted",
+        "target_model": args.target_model if args.model == "anthropic" else "scripted",
         "tasks_requested": args.tasks,
         "tasks_completed": len(rows),
         "budget_usd_cap": cap,

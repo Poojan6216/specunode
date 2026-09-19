@@ -14,6 +14,7 @@ without a credit card is a benchmark nobody has executed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -118,3 +119,64 @@ def test_the_budget_gate_halts_the_run(tmp_path: Path, monkeypatch: pytest.Monke
     assert report["halted_at"], "the cap was far below one call's cost and nothing halted"
     assert report["tasks_completed"] < 5 * 3 * 3
     assert "Decision Gate D2" in result.stdout
+
+
+def test_every_workload_sends_the_model_the_bench_was_told_to_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real run must not send ``"model": "scripted"`` to the Messages API.
+
+    All four sample apps hard-coded the stand-in's id, and nothing rewrites an envelope -- Hard
+    Rule 13 makes the request the unit of identity, so the runtime must not. The first real call
+    of task 6.4 would therefore have been rejected by the provider, after the credential was
+    obtained and the money spent.
+
+    Asserted on the envelopes each workload actually sends, not on the helper they are supposed
+    to call: a first version of this test imported ``target_model`` and called it, and passed
+    just as happily with every ``model=`` argument back to its hard-coded string.
+    """
+    import asyncio as _asyncio
+
+    from bench.online.run_latency import ARMS, MeteredModel, Spend, run_one
+    from bench.online.scripted_target import ScriptedTarget
+    from bench.workloads import WORKLOADS
+
+    from specunode.core.model import RequestEnvelope
+
+    sentinel = "claude-model-under-test"
+    monkeypatch.setenv("SPECUNODE_MODEL", sentinel)
+    seen: list[str] = []
+
+    class Recording(ScriptedTarget):  # type: ignore[misc]
+        async def complete(self, envelope: RequestEnvelope) -> object:
+            seen.append(envelope.model)
+            return await super().complete(envelope)
+
+        def stream(self, envelope: RequestEnvelope) -> object:
+            seen.append(envelope.model)
+            return super().stream(envelope)
+
+    target = MeteredModel(inner=Recording(), spend=Spend(cap_usd=1.0))
+    for workload in WORKLOADS:
+        _asyncio.run(run_one(workload, ARMS[0], 0, target, tmp_path))
+
+    assert len(seen) >= len(WORKLOADS), f"only {len(seen)} request(s) recorded"
+    assert set(seen) == {sentinel}, (
+        f"a workload asked for {sorted(set(seen) - {sentinel})} instead of the model the bench "
+        "was told to use"
+    )
+
+
+def test_a_real_run_refuses_the_stand_ins_model_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mistake above, made impossible to repeat by accident.
+
+    The key is set so the refusal cannot be the credential check standing in for the one under
+    test -- an earlier version of this assertion was satisfied by the "ANTHROPIC_API_KEY is not
+    set" message, which happens to contain the word "scripted".
+    """
+    from bench.online.run_latency import main as latency_main
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "not-a-real-key")
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(latency_main(["--model", "anthropic", "--target-model", "scripted"]))
+    assert "Messages API" in str(raised.value), str(raised.value)

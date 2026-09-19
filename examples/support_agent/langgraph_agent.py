@@ -13,6 +13,7 @@ change to the graph's shape, and neither has any effect when nothing is wrapping
 from __future__ import annotations
 
 import operator
+import os
 from collections.abc import Mapping
 from typing import Annotated, Any, TypedDict
 
@@ -34,6 +35,19 @@ TOOL_DEFS = (
     ToolDef(name="charge_card", description="Charge a customer's card", input_schema={}),
     ToolDef(name="send_receipt", description="Email a receipt", input_schema={}),
 )
+
+
+def target_model() -> str:
+    """Which model this example asks for.
+
+    ``"scripted"`` by default, so the tests and demos stay hermetic and deterministic. The
+    online latency bench sets ``SPECUNODE_MODEL`` to a real id; nothing else does, and the
+    runtime never rewrites it -- Hard Rule 13 makes the request the unit of identity, so a
+    scheduler that substituted a model would make the journal's record of what was asked
+    untrue. Read at call time rather than at import, because the bench sets it after this
+    module is imported.
+    """
+    return os.environ.get("SPECUNODE_MODEL", "scripted")
 
 
 class SupportState(TypedDict, total=False):
@@ -95,7 +109,7 @@ def build_graph(world: World, model: ModelClient) -> Any:
 
     async def decide(state: SupportState) -> SupportState:
         envelope = RequestEnvelope(
-            model="scripted",
+            model=target_model(),
             system=(TextBlock(text="You handle refunds and charges for a support desk."),),
             messages=(
                 Message(

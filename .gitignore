@@ -16,3 +16,5 @@ bench/corpus/raw/
 *.db-wal
 *.db-shm
 .specunode-chaos/
+.env
+*.env

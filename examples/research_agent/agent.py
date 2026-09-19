@@ -21,6 +21,7 @@ stale, so like ``fetch_runbook`` it is unwitnessed, and for a structurally diffe
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 
 from specunode.canonical import JsonValue
@@ -47,6 +48,19 @@ TOOL_DEFS = (
 #: workload's job is to present a read-only stretch of known length, and a varying one would
 #: make "how much of this workload is speculable" a property of the script instead.
 SECTIONS = ("restart", "escalate")
+
+
+def target_model() -> str:
+    """Which model this example asks for.
+
+    ``"scripted"`` by default, so the tests and demos stay hermetic and deterministic. The
+    online latency bench sets ``SPECUNODE_MODEL`` to a real id; nothing else does, and the
+    runtime never rewrites it -- Hard Rule 13 makes the request the unit of identity, so a
+    scheduler that substituted a model would make the journal's record of what was asked
+    untrue. Read at call time rather than at import, because the bench sets it after this
+    module is imported.
+    """
+    return os.environ.get("SPECUNODE_MODEL", "scripted")
 
 
 def build_tools(world: World) -> list[object]:
@@ -108,7 +122,7 @@ async def decide(session: RunSession) -> Decision:
     if session.model is None:  # pragma: no cover - the scheduler always binds one
         raise ModelError("no model was bound for this run")
     envelope = RequestEnvelope(
-        model="scripted",
+        model=target_model(),
         system=(TextBlock(text="You research operational questions and report findings."),),
         messages=(
             Message(
