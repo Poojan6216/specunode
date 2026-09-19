@@ -56,6 +56,10 @@ class ModelDrafter:
     model: str = DEFAULT_DRAFT_MODEL
     tier: Literal[0, 1, 2] = 2
     max_tokens: int = 512
+    #: Unset by default, and sent only when set. The current models reject sampling parameters
+    #: outright (a 400 on Claude Sonnet 5 and Opus 5), so a drafter that always sent one could
+    #: not be pointed at them at all.
+    temperature: float | None = None
     #: Tool definitions the draft model may choose between. Taken from the registry rather than
     #: written here, so the draft model cannot propose a tool the runtime does not know.
     tools: tuple[ToolDef, ...] = ()
@@ -120,7 +124,7 @@ class ModelDrafter:
             ),
             tools=self.tools,
             max_tokens=self.max_tokens,
-            temperature=0.0,
+            temperature=self.temperature,
         )
 
 

@@ -31,9 +31,34 @@ from specunode.core.model import (
 )
 from specunode.testing.world import World
 
+#: Real JSON Schema, not ``{}``. A tool's schema is what tells the model how to fill the call,
+#: and an empty one is rejected outright by the Messages API
+#: (``tools.0.custom.input_schema.type: Field required``). These examples ran only against a
+#: scripted model, which never looked, so the placeholder survived until the first real call.
+#: Room for the answer. 256 was enough for a scripted model, which emits a tool call and
+#: nothing else; a current model thinks before it answers and spent the whole budget doing so,
+#: returning prose with ``stop_reason: "max_tokens"`` and no tool call at all.
+MAX_TOKENS = 4096
+
 TOOL_DEFS = (
-    ToolDef(name="charge_card", description="Charge a customer's card", input_schema={}),
-    ToolDef(name="send_receipt", description="Email a receipt", input_schema={}),
+    ToolDef(
+        name="charge_card",
+        description="Charge a customer's card",
+        input_schema={
+            "type": "object",
+            "properties": {"customer_id": {"type": "string"}, "amount": {"type": "number"}},
+            "required": ["customer_id", "amount"],
+        },
+    ),
+    ToolDef(
+        name="send_receipt",
+        description="Email a receipt",
+        input_schema={
+            "type": "object",
+            "properties": {"customer_id": {"type": "string"}, "charge_id": {"type": "string"}},
+            "required": ["customer_id", "charge_id"],
+        },
+    ),
 )
 
 
@@ -114,11 +139,20 @@ def build_graph(world: World, model: ModelClient) -> Any:
             messages=(
                 Message(
                     role="user",
-                    content=(TextBlock(text=f"Customer record: {state.get('customer')}"),),
+                    content=(
+                        TextBlock(
+                            text=(
+                                f"Customer record: {state.get('customer')}\n"
+                                "Charge this customer 25.00 for their plan renewal, then "
+                                "send them a receipt. Use the tools; do not ask for "
+                                "confirmation."
+                            )
+                        ),
+                    ),
                 ),
             ),
             tools=TOOL_DEFS,
-            max_tokens=256,
+            max_tokens=MAX_TOKENS,
         )
         decision = decisions_of(await _model().complete(envelope))[0]
         args: Mapping[str, JsonValue] = decision.args if isinstance(decision, ToolCall) else {}

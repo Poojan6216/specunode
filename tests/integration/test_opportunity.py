@@ -152,5 +152,15 @@ def test_a_planted_untraceable_number_fails_the_check(tmp_path: Path) -> None:
     sys.path.insert(0, str(REPO / "tests"))
     from test_numbers_traceable import measured_numbers, untraceable
 
-    planted = "Speculation cut wall clock by 41% on the ops workload."
-    assert untraceable(planted, measured_numbers()), "a planted figure slipped through"
+    measured = measured_numbers()
+    # Chosen at run time rather than written in. "41%" was hard-coded here and passed for a
+    # year, until a real measurement happened to land at 0.41 and the planted figure became
+    # traceable -- the check was still sound, the test's own premise had quietly expired.
+    percent = next(n for n in range(11, 100) if str(n) not in measured)
+    planted = f"Speculation cut wall clock by {percent}% on the ops workload."
+    assert untraceable(planted, measured), (
+        f"{percent}% traces to a results file, so this planted figure proves nothing"
+    )
+    # And the check is not simply refusing everything: a figure that *is* measured passes.
+    real = next(iter(sorted(n for n in measured if n.isdigit() and len(n) > 2)))
+    assert not untraceable(f"The run reported {real} of them.", measured)

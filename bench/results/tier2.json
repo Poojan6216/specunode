@@ -1,0 +1,55 @@
+{
+  "alignment": {
+    "dropped_misaligned": 0,
+    "dropped_missing_values": 0,
+    "duplicate_ids_in_sidecar": 0,
+    "joined": 300,
+    "trajectories_in_corpus": 300
+  },
+  "bench": "tier2_acceptance",
+  "budget_usd_cap": 4.0,
+  "draft_calls": 428,
+  "draft_model": "claude-haiku-4-5",
+  "eligible_positions": 1000,
+  "estimated_spend_usd": 4.0074,
+  "grader": "specunode.verify.gate.resolve_decision",
+  "halted_on_budget": true,
+  "history_window": 12,
+  "is_real_model": true,
+  "policy": "across_turns",
+  "policy_note": "Under the policy the runtime runs -- an open guess is squashed when the turn ends -- acceptance on this corpus is zero for any predictor, because every call in it opens a new model turn. This grades the generous policy instead.",
+  "prices_per_mtok_usd": {
+    "input": 1.0,
+    "output": 5.0
+  },
+  "result": {
+    "acceptance_given_offered": 0.0625,
+    "acceptance_rate": 0.0607,
+    "acceptance_rate_ci95": {
+      "ci95_high": 0.0841,
+      "ci95_low": 0.0397,
+      "mean": 0.0607
+    },
+    "accepted": 26,
+    "by_effect": {
+      "read": {
+        "accepted": 0,
+        "steps": 16
+      },
+      "write": {
+        "accepted": 26,
+        "steps": 412
+      }
+    },
+    "offered": 416,
+    "offered_rate": 0.972,
+    "right_tool": 0.4673,
+    "right_tool_wrong_arguments": 0.4065,
+    "steps_graded": 428,
+    "unparsable": 12
+  },
+  "sample_requested": 1000,
+  "seed": 20260918,
+  "values": "values_full.json",
+  "wall_seconds": 1368.2
+}

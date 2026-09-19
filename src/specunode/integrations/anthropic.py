@@ -91,6 +91,10 @@ def envelope_to_params(envelope: RequestEnvelope) -> dict[str, JsonValue]:
     if envelope.tool_choice is not None:
         params["tool_choice"] = dict(envelope.tool_choice)
     if envelope.temperature is not None:
+        # Sent only when the developer set one. The newest models reject it -- a 400 saying
+        # "`temperature` is deprecated for this model" -- and that refusal belongs to whoever
+        # asked for it. An adapter that silently dropped it would hide a real constraint, and
+        # one that always sent it broke every request on those models.
         params["temperature"] = envelope.temperature
     if envelope.top_p is not None:
         params["top_p"] = envelope.top_p

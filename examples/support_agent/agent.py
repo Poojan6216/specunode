@@ -26,9 +26,34 @@ from specunode.core.model import (
 from specunode.integrations.plain import PlainAdapter, node, registry_of, tool
 from specunode.testing.world import World
 
+#: Real JSON Schema, not ``{}``. A tool's schema is what tells the model how to fill the call,
+#: and an empty one is rejected outright by the Messages API
+#: (``tools.0.custom.input_schema.type: Field required``). These examples ran only against a
+#: scripted model, which never looked, so the placeholder survived until the first real call.
+#: Room for the answer. 256 was enough for a scripted model, which emits a tool call and
+#: nothing else; a current model thinks before it answers and spent the whole budget doing so,
+#: returning prose with ``stop_reason: "max_tokens"`` and no tool call at all.
+MAX_TOKENS = 4096
+
 TOOL_DEFS = (
-    ToolDef(name="charge_card", description="Charge a customer's card", input_schema={}),
-    ToolDef(name="send_receipt", description="Email a receipt", input_schema={}),
+    ToolDef(
+        name="charge_card",
+        description="Charge a customer's card",
+        input_schema={
+            "type": "object",
+            "properties": {"customer_id": {"type": "string"}, "amount": {"type": "number"}},
+            "required": ["customer_id", "amount"],
+        },
+    ),
+    ToolDef(
+        name="send_receipt",
+        description="Email a receipt",
+        input_schema={
+            "type": "object",
+            "properties": {"customer_id": {"type": "string"}, "charge_id": {"type": "string"}},
+            "required": ["customer_id", "charge_id"],
+        },
+    ),
 )
 
 
@@ -85,15 +110,37 @@ async def decide(session: RunSession) -> Decision:
         messages=(
             Message(
                 role="user",
-                content=(TextBlock(text=f"Customer record: {session.state.get('customer')}"),),
+                content=(
+                    # An actual instruction, not a data dump. The first real run of this
+                    # app showed the model a customer record and nothing else; it
+                    # declined, correctly -- a record is not a request to charge anyone --
+                    # and the workload measured a refusal. A scripted model never noticed,
+                    # because it plays its turn whatever the prompt says.
+                    TextBlock(
+                        text=(
+                            f"Customer record: {session.state.get('customer')}\n"
+                            "Charge this customer 25.00 for their plan renewal, then send "
+                            "them a receipt. Use the tools; do not ask for confirmation."
+                        )
+                    ),
+                ),
             ),
         ),
         tools=TOOL_DEFS,
-        max_tokens=256,
+        max_tokens=MAX_TOKENS,
     )
     decision = decisions_of(await session.model.complete(envelope))[0]
     if isinstance(decision, ToolCall):
         session.state["decided"] = dict(decision.args)
+    else:
+        # A turn with no tool call is a FreeText barrier, and this node's router keys on
+        # ``decided``. Without this branch the router sent the run straight back here and the
+        # app re-asked the same question forever -- one model call per lap, which against a
+        # real provider is an unbounded bill rather than a hang. It happens: a model that
+        # thinks by default can spend its whole ``max_tokens`` budget before reaching a call.
+        session.state["decided"] = None
+        # The prose itself lives in the journal; the decision carries only its hash.
+        session.state["declined"] = decision.content_hash
     return decision
 
 
@@ -127,6 +174,12 @@ def route(state: Mapping[str, JsonValue]) -> str | None:
         return "lookup"
     if "decided" not in state:
         return "decide"
+    # A model that answered in prose asked for nothing, so nothing is sent. The fallback
+    # arguments below this line exist for a decision the model *made*; reaching them with no
+    # decision at all would put an effect in the world on arguments this app invented, which
+    # is precisely what the rest of the project exists to prevent.
+    if state.get("decided") is None:
+        return None
     if "receipted" not in state:
         return "charge"
     return None

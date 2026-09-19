@@ -61,6 +61,10 @@ class Workload:
     #: needing a prior journal. Written out rather than mined so that a bug in mining cannot
     #: quietly turn the tier-1 arm into a tier-0 arm that still reports as tier 1.
     trace: Sequence[tuple[str, Mapping[str, JsonValue]]] = field(default_factory=tuple)
+    #: Called on the fresh world before the app is built. The sweep uses it to give the tools
+    #: a realistic latency: every arm pays it, and whether overlapping it saves anything is the
+    #: question this design exists to answer. ``None`` leaves the world as it is.
+    prepare: Callable[[World], None] | None = None
 
     def turns(self) -> list[ModelResponse]:
         """The script. One turn: these workloads have exactly one model decision point."""
@@ -73,6 +77,8 @@ class Workload:
         return [ToolCall(name=name, args=dict(args)) for name, args in self.trace]
 
     def make(self, world: World) -> tuple[GraphAdapter, ToolRegistry]:
+        if self.prepare is not None:
+            self.prepare(world)
         graph, registry = self.build(world)
         if not isinstance(registry, ToolRegistry):  # pragma: no cover - a build() contract bug
             raise TypeError(f"{self.name}.build did not return a ToolRegistry")

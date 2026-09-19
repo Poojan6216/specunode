@@ -18,3 +18,7 @@ bench/corpus/raw/
 .specunode-chaos/
 .env
 *.env
+# Undigested corpus values: too large to commit, rebuilt with
+# `python bench/corpus/fetch.py --values --full`.
+bench/corpus/values_full.json
+bench/corpus/values_full_manifest.json

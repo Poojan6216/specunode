@@ -86,7 +86,9 @@ actually made.
 
 Included: the model id, the system blocks, the **entire** message list, the tool definitions in
 registry order, `tool_choice`, and every sampling parameter — `temperature`, `top_p`, `top_k`,
-`max_tokens`, `stop_sequences`, thinking configuration.
+`max_tokens`, `stop_sequences`, thinking configuration. Each of the three sampling parameters is
+`None` unless the developer set one, and an unset parameter is recorded as unset rather than as
+a value nobody chose; the current models reject all three anyway.
 
 Sampling parameters are in deliberately. A branch that quietly sets a smaller `max_tokens` to
 make its speculative turn cheap is asking a different question, and Rule 13 exists to make that

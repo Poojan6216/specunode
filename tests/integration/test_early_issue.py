@@ -97,7 +97,9 @@ class OneTurnGraph:
         raise NotImplementedError
 
 
-def build(tmp_path: Path) -> tuple[Scheduler, World, Journal, str, OneTurnGraph]:
+def build(
+    tmp_path: Path, *, policy: Policy | None = None
+) -> tuple[Scheduler, World, Journal, str, OneTurnGraph]:
     world = standard_world()
     registry = registry_for(world)
     journal = Journal(tmp_path / "journal.db")
@@ -111,7 +113,7 @@ def build(tmp_path: Path) -> tuple[Scheduler, World, Journal, str, OneTurnGraph]
         buffer=StoreBuffer(journal=journal, run_id=""),
         dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
         target=JournaledModel(model, journal, provider="scripted"),
-        policy=Policy(speculation=True),
+        policy=policy or Policy(speculation=True),
     )
     return scheduler, world, journal, run_id, graph
 
@@ -318,3 +320,64 @@ async def test_a_read_after_a_write_in_the_same_turn_is_seen_as_a_hazard(
         "a read touching the same key as a write emitted earlier in the same turn was not "
         f"reported as a hazard; saw {dict(scheduler.counters.stalls_by_hazard)}"
     )
+
+
+async def test_early_issue_can_be_switched_off_and_then_nothing_is_issued_early(
+    tmp_path: Path,
+) -> None:
+    """Tier 0 needed a switch before any benchmark could say what it was worth.
+
+    It is not gated by ``speculation``, and it never was: it forks no branch and guesses
+    nothing. So every arm of the latency benchmark ran with it on -- including the arm named
+    ``B_seq`` -- the control group contained the treatment, and no measurement could see the
+    mechanism that does most of the work on a workload where nothing is predicted. Off is what
+    "wait for the turn, then call the tools in order" actually means.
+    """
+    scheduler, _, journal, run_id, _ = build(
+        tmp_path, policy=Policy(speculation=False, early_issue=False)
+    )
+    result = await scheduler.run(run_id, {})
+    assert result.ok, result.error
+    assert scheduler._turns, "no turn ran, so this proves nothing"
+    assert all(turn.reads_issued_early == 0 for turn in scheduler._turns)
+    assert scheduler.counters.speculative_reads_upstream == 0, (
+        "a read reached upstream ahead of its turn with early issue switched off"
+    )
+    # The durable record says which it was, so a ledger cannot be read as the other one.
+    started = next(iter(journal.read(run_id, kinds=["run_started"])))
+    assert started.payload["policy"]["early_issue"] is False
+
+    on, _, _, on_run, _ = build(tmp_path, policy=Policy(speculation=False))
+    assert (await on.run(on_run, {})).ok
+    assert sum(turn.reads_issued_early for turn in on._turns) > 0, "the default stopped issuing"
+
+
+async def test_staleness_is_rechecked_for_every_read_not_only_the_unauthorised_ones(
+    tmp_path: Path,
+) -> None:
+    """Two questions that once shared one answer, and narrowing the wrong one loses a guarantee.
+
+    "Did this read reach upstream with no durable decision behind it?" is what attack 7.2
+    counts and the read budget charges. "Could this read have gone stale before the effects it
+    informed reach the world?" is what lattice rule E3 re-checks at retirement -- and staleness
+    is about elapsed time, not about authorisation. A read made on the ordinary path, after its
+    turn was journaled, is authorised and can still be stale.
+
+    Fixing the first question by asking ``predicted is not None`` silently answered the second
+    one too, and E3 stopped re-checking ordinary reads.
+    """
+    scheduler, _, journal, run_id, _ = build(
+        tmp_path, policy=Policy(speculation=False, early_issue=False)
+    )
+    result = await scheduler.run(run_id, {})
+    assert result.ok, result.error
+
+    # Nothing was issued ahead of its turn, so nothing is reported as unauthorised ...
+    assert scheduler.counters.speculative_reads_upstream == 0
+    # ... and the witnessed read was still re-checked before the writes went out.
+    assert scheduler.counters.reads_validated > 0, (
+        "rule E3 skipped a read because it was authorised, which is not what staleness means"
+    )
+    validated = [e.payload for e in journal.read(run_id, kinds=["read_validated"])]
+    assert validated, "no read_validated entry was journaled"
+    assert validated[-1]["total"] > 0

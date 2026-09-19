@@ -49,11 +49,52 @@ from specunode.core.model import (
 from specunode.integrations.plain import PlainAdapter, node, registry_of, tool
 from specunode.testing.world import World
 
+#: Real JSON Schema, not ``{}``. A tool's schema is what tells the model how to fill the call,
+#: and an empty one is rejected outright by the Messages API
+#: (``tools.0.custom.input_schema.type: Field required``). These examples ran only against a
+#: scripted model, which never looked, so the placeholder survived until the first real call.
+#: Room for the answer. 256 was enough for a scripted model, which emits a tool call and
+#: nothing else; a current model thinks before it answers and spent the whole budget doing so,
+#: returning prose with ``stop_reason: "max_tokens"`` and no tool call at all.
+MAX_TOKENS = 4096
+
 TOOL_DEFS = (
-    ToolDef(name="get_pipeline_status", description="Read a pipeline's state", input_schema={}),
-    ToolDef(name="fetch_runbook", description="Read a runbook section", input_schema={}),
-    ToolDef(name="restart_job", description="Restart a failed pipeline job", input_schema={}),
-    ToolDef(name="post_summary", description="Post an incident summary", input_schema={}),
+    ToolDef(
+        name="get_pipeline_status",
+        description="Read a pipeline's state",
+        input_schema={
+            "type": "object",
+            "properties": {"pipeline_id": {"type": "string"}},
+            "required": ["pipeline_id"],
+        },
+    ),
+    ToolDef(
+        name="fetch_runbook",
+        description="Read a runbook section",
+        input_schema={
+            "type": "object",
+            "properties": {"section": {"type": "string"}},
+            "required": ["section"],
+        },
+    ),
+    ToolDef(
+        name="restart_job",
+        description="Restart a failed pipeline job",
+        input_schema={
+            "type": "object",
+            "properties": {"job_id": {"type": "string"}},
+            "required": ["job_id"],
+        },
+    ),
+    ToolDef(
+        name="post_summary",
+        description="Post an incident summary",
+        input_schema={
+            "type": "object",
+            "properties": {"channel": {"type": "string"}, "text": {"type": "string"}},
+            "required": ["channel", "text"],
+        },
+    ),
 )
 
 #: Units reserved before a restart. A constant rather than a model-chosen number: the point of
@@ -140,11 +181,19 @@ async def triage(session: RunSession) -> Decision:
             messages=(
                 Message(
                     role="user",
-                    content=(TextBlock(text=f"Pipeline {pipeline_id} needs attention."),),
+                    content=(
+                        TextBlock(
+                            text=(
+                                f"Pipeline {pipeline_id} needs attention. Check its status "
+                                "and the restart runbook, then restart the job. Use the "
+                                "tools; do not ask for confirmation."
+                            )
+                        ),
+                    ),
                 ),
             ),
             tools=TOOL_DEFS,
-            max_tokens=256,
+            max_tokens=MAX_TOKENS,
             stream=True,
         )
     )

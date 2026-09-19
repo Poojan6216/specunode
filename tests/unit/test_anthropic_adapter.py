@@ -7,7 +7,7 @@ tested is the translation, not the network.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from specunode.core.model import (
@@ -165,3 +165,31 @@ async def test_stream_surfaces_each_tool_use_as_it_completes() -> None:
     ]
     assert isinstance(events[0], ToolUseComplete) and events[0].block.name == "a"
     assert isinstance(events[-1], TurnComplete)
+
+
+def test_an_unset_sampling_parameter_is_not_sent() -> None:
+    """The newest models reject sampling parameters, and we were sending one nobody set.
+
+    ``RequestEnvelope.temperature`` defaulted to 0.0 while ``top_p`` and ``top_k`` beside it
+    defaulted to None, so every request carried a temperature the developer had not asked for.
+    Claude Sonnet 5 and Opus 5 answer that with a 400 ("`temperature` is deprecated for this
+    model"), so the first real call the online benchmark ever made failed on a field nobody
+    had chosen. Sent when it *is* chosen: the provider's refusal then belongs to whoever
+    asked for it, which is more useful than a silent drop.
+    """
+    from specunode.core.model import Message, RequestEnvelope, TextBlock
+    from specunode.integrations.anthropic import envelope_to_params
+
+    bare = RequestEnvelope(
+        model="claude-sonnet-5",
+        messages=(Message(role="user", content=(TextBlock(text="go"),)),),
+        max_tokens=16,
+    )
+    params = envelope_to_params(bare)
+    for name in ("temperature", "top_p", "top_k"):
+        assert name not in params, f"{name} was sent without being set"
+
+    asked = envelope_to_params(replace(bare, temperature=0.0, top_p=0.9, top_k=5))
+    assert asked["temperature"] == 0.0
+    assert asked["top_p"] == 0.9
+    assert asked["top_k"] == 5

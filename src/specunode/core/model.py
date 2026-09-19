@@ -178,7 +178,12 @@ class RequestEnvelope:
     tools: tuple[ToolDef, ...] = ()
     tool_choice: Mapping[str, JsonValue] | None = None
     max_tokens: int = 4096
-    temperature: float = 0.0
+    #: ``None`` means "not specified", like ``top_p`` and ``top_k`` beside it, and nothing is
+    #: sent to the provider. It defaulted to ``0.0``, so every request carried a temperature
+    #: nobody had asked for -- and the current models reject sampling parameters outright
+    #: (``temperature`` is deprecated on Claude Sonnet 5 and Opus 5, a 400), so the first real
+    #: call the online benchmark ever made failed on a field the developer never set.
+    temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
     stop_sequences: tuple[str, ...] = ()

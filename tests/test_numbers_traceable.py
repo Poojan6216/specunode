@@ -33,8 +33,14 @@ CLAIM_FILES = ("README.md", "RESULTS.md")
 # Matches a number a document could be asserting. Comma-grouped forms ("1,842") count as
 # one number. The lookbehind and lookahead keep digits that live inside an identifier
 # ("blake2b", "test_1_2", "Ed25519") from being read as claims.
+#: A leading minus is part of the number, not punctuation around it. Without it a measured
+#: -0.017 rendered as "-1.7%" was read as the number 1.7, matched nothing, and failed the
+#: check -- while the identical positive figure passed. Every saving this project reports can
+#: be negative, and that is the half a reader most needs to be able to trust. Matching the
+#: magnitude instead would have been worse: "41%" would then trace to a measured -0.41, and a
+#: figure nobody measured would pass.
 _NUMBER = re.compile(
-    r"(?<![\w.,$])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:_\d+)*(?:\.\d+)?)(?![\d_,.])"
+    r"(?<![\w.,$])(-?)(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:_\d+)*(?:\.\d+)?)(?![\d_,.])"
 )
 _NUMBERS_OK = re.compile(r"numbers-ok:\s*\S")
 _CITED = re.compile(r"\[cited\]", re.IGNORECASE)
@@ -89,7 +95,7 @@ def _numeric_strings(value: object, out: set[str]) -> None:
         out.add(f"{value:,}")
     elif isinstance(value, str):
         for match in _NUMBER.finditer(value):
-            out.add(match.group(1))
+            out.add(match.group(1) + match.group(2))
     elif isinstance(value, dict):
         for item in value.values():
             _numeric_strings(item, out)
@@ -123,7 +129,7 @@ def claimed_numbers(text: str) -> list[tuple[int, str, str]]:
         if _INTERPRETER_CONTEXT.search(line):
             scrubbed = _INTERPRETER_VERSION.sub(" ", scrubbed)
         for match in _NUMBER.finditer(scrubbed):
-            number = match.group(1)
+            number = match.group(1) + match.group(2)
             if number in {"0", "1"}:
                 continue  # "one code path, not two"; "0 leaks" is an absence, not a measurement
             claims.append((index, number, line.strip()))

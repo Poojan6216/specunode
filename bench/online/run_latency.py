@@ -31,7 +31,7 @@ import os
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -57,8 +57,13 @@ from specunode.ids import new_ulid
 from specunode.journal.journal import Journal, close_all_writers
 from specunode.testing.world import standard_world
 
-#: The three arms section 6.4 names.
-ARMS = ("B_seq", "B_readonly_spec", "B_specunode")
+#: The three arms section 6.4 names, plus the baseline they were all missing.
+#:
+#: ``B_strict_seq`` is what "no speculation" actually means: wait for the turn, then make the
+#: calls in order. Every arm here used to run with tier-0 early issue on, ``B_seq`` included,
+#: so the control group contained the treatment and the benchmark could not see what tier 0
+#: was worth -- which is most of what this runtime does on a workload that never predicts.
+ARMS = ("B_strict_seq", "B_seq", "B_readonly_spec", "B_specunode")
 
 #: Default spend cap in USD. Overridden by SPECUNODE_BENCH_BUDGET_USD.
 DEFAULT_BUDGET_USD = 25.0
@@ -77,18 +82,25 @@ PRICE_PER_MTOK = {"input": 3.0, "output": 15.0}
 
 @dataclass
 class Spend:
-    """What the run has cost so far, and whether it may continue."""
+    """What the run has cost so far, and whether it may continue.
+
+    The price table is a field rather than the module constant it used to read. A second
+    benchmark metered a Haiku-class draft model through this class and was charged at the
+    target model's rates -- three times over -- so it halted on a cap it had not reached and
+    published a spend figure that was wrong by that factor.
+    """
 
     cap_usd: float
     input_tokens: int = 0
     output_tokens: int = 0
     halted: bool = False
+    prices_per_mtok: Mapping[str, float] = field(default_factory=lambda: dict(PRICE_PER_MTOK))
 
     @property
     def usd(self) -> float:
         return (
-            self.input_tokens * PRICE_PER_MTOK["input"]
-            + self.output_tokens * PRICE_PER_MTOK["output"]
+            self.input_tokens * self.prices_per_mtok["input"]
+            + self.output_tokens * self.prices_per_mtok["output"]
         ) / 1_000_000
 
     def record(self, response: ModelResponse) -> None:
@@ -167,6 +179,8 @@ def policy_for(arm: str) -> Policy:
     approximated here by disabling the drafter, which is what "never speculate on a write"
     reduces to on workloads whose only predictable next call is one.
     """
+    if arm == "B_strict_seq":
+        return Policy(speculation=False, early_issue=False)
     if arm == "B_seq":
         return Policy(speculation=False)
     return Policy(speculation=True)
@@ -229,6 +243,39 @@ async def run_one(
     )
 
 
+def difference_ci(
+    treatment: Sequence[float], control: Sequence[float], rounds: int = 2000, seed: int = 20260918
+) -> dict[str, float]:
+    """Bootstrap interval for the *difference* of two arms' means, as a share of the control.
+
+    Two overlapping intervals do not mean two means are indistinguishable, and two separated
+    ones are not a test either -- the comparison has to be made on the difference itself. This
+    resamples both arms independently, because the arms are repeats of the same inputs rather
+    than paired observations, and reports the saving `1 - treatment/control` with an interval.
+    An interval that spans zero is the honest way to say "no difference was resolved here".
+    """
+    import random as _random
+    import statistics as _stats
+
+    if not treatment or not control:
+        return {}
+    rng = _random.Random(seed)
+    savings: list[float] = []
+    for _ in range(rounds):
+        a = _stats.fmean(treatment[rng.randrange(len(treatment))] for _ in treatment)
+        b = _stats.fmean(control[rng.randrange(len(control))] for _ in control)
+        if b > 0:
+            savings.append(1.0 - a / b)
+    if not savings:
+        return {}
+    savings.sort()
+    return {
+        "mean": round(_stats.fmean(savings), 4),
+        "ci95_low": round(savings[int(0.025 * len(savings))], 4),
+        "ci95_high": round(savings[min(int(0.975 * len(savings)), len(savings) - 1)], 4),
+    }
+
+
 def summarise(rows: Sequence[TaskResult]) -> dict[str, object]:
     """Per (workload, arm): mean wall clock with a bootstrap interval over tasks."""
     out: dict[str, object] = {}
@@ -246,7 +293,11 @@ def summarise(rows: Sequence[TaskResult]) -> dict[str, object]:
                 "wall_ms_ci95": [round(low, 3), round(high, 3)],
                 "effects": sorted({r.effects for r in rows if r.workload == name and r.arm == arm}),
                 "leaks": sum(r.leaks for r in rows if r.workload == name and r.arm == arm),
+                # Every run's wall clock, so the numbers can be re-analysed without paying for
+                # the benchmark again. An aggregate nobody can reopen is a dead end.
+                "wall_ms": [round(v, 3) for v in values],
             }
+        base = per_arm.get("B_strict_seq")
         seq = per_arm.get("B_seq")
         spec = per_arm.get("B_specunode")
         reduction = None
@@ -254,12 +305,37 @@ def summarise(rows: Sequence[TaskResult]) -> dict[str, object]:
             base = float(seq["wall_ms_mean"])  # type: ignore[arg-type]
             if base > 0:
                 reduction = round(1.0 - float(spec["wall_ms_mean"]) / base, 4)  # type: ignore[arg-type]
+
+        def arm_values(arm: str, workload: str = name) -> list[float]:
+            return [r.wall_ms for r in rows if r.workload == workload and r.arm == arm]
+
         accepted = [r.accepted for r in rows if r.workload == name and r.arm == "B_specunode"]
         offered = [r.offered for r in rows if r.workload == name and r.arm == "B_specunode"]
         alpha = round(sum(accepted) / sum(offered), 4) if offered and sum(offered) > 0 else None
+        strict_reduction = None
+        if isinstance(base, dict) and isinstance(spec, dict):
+            floor = float(base["wall_ms_mean"])  # type: ignore[arg-type]
+            if floor > 0:
+                strict_reduction = round(1.0 - float(spec["wall_ms_mean"]) / floor, 4)  # type: ignore[arg-type]
         out[name] = {
             "arms": per_arm,
             "wall_clock_reduction_vs_seq": reduction,
+            "wall_clock_reduction_vs_strict_seq": strict_reduction,
+            # The difference with an interval, which is the comparison the point estimate above
+            # only gestures at. Reported for both speculative arms against the sequential one.
+            "saving_vs_seq_ci95": {
+                "B_specunode": difference_ci(arm_values("B_specunode"), arm_values("B_seq")),
+                "B_readonly_spec": difference_ci(
+                    arm_values("B_readonly_spec"), arm_values("B_seq")
+                ),
+            },
+            # Against the arm that does none of it. ``B_seq`` answers "what does *branch*
+            # speculation add on top of early issue?"; this answers "what does the runtime buy
+            # at all?", which is the question a reader thinks the table is answering.
+            "saving_vs_strict_seq_ci95": {
+                arm: difference_ci(arm_values(arm), arm_values("B_strict_seq"))
+                for arm in ("B_seq", "B_readonly_spec", "B_specunode")
+            },
             "alpha_observed": alpha,
             # The break-even alpha needs a sweep, which needs a budget this runner does not
             # assume it has. Reported as null rather than guessed; see the Final Report.

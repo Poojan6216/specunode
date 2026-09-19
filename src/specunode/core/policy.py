@@ -39,6 +39,17 @@ class Policy:
 
     #: Master switch. Off means the scheduler takes the same code path with no candidates.
     speculation: bool = True
+    #: Tier 0: issue a read as its ``tool_use`` block finishes parsing, rather than waiting for
+    #: the turn to end. It is speculative in the sense that matters -- the turn is not journaled
+    #: yet, so the read reaches upstream with no durable decision behind it, and the ledger
+    #: counts it as such -- but it never forks a branch and never guesses, so it is not gated by
+    #: ``speculation``.
+    #:
+    #: It has a switch because a benchmark needs one. Every arm of the latency benchmark ran
+    #: with early issue on, including the arm named ``B_seq``, so the control group contained
+    #: the treatment and no measurement could see what tier 0 was worth. Off is what "wait for
+    #: the turn, then call the tools in order" actually means.
+    early_issue: bool = True
     #: Top-1 by default. Top-k multiplies the upstream reads a wrong guess pays for, so
     #: widening this is a decision about money as much as about latency.
     max_inflight_branches: int = 1

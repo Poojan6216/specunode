@@ -151,3 +151,61 @@ async def test_the_payload_carries_the_breakdown_the_ledger_prints(tmp_path: obj
     assert payload["total"] == 2
     assert payload["fresh"] == 1
     assert payload["unwitnessed"] == 1
+
+
+async def test_the_re_checks_run_concurrently_and_keep_the_read_sets_order() -> None:
+    """Rule E3's probes are real round trips, and they used to be made one at a time.
+
+    A turn that read three witnessed rows paid three upstream round trips in series at
+    retirement -- measured at one tool latency each, which is exactly what tier-0 early issue
+    saves by issuing those reads concurrently in the first place. The runtime handed back at
+    the end what it had won at the start, and the latency benchmark's flat result was the sum.
+
+    Concurrency is asserted by watching how many probes are in flight at once rather than by
+    timing anything, so the test cannot pass by being run on a fast machine. Order is asserted
+    because the ledger renders these verdicts and the equivalence relation compares them.
+    """
+    import asyncio
+
+    in_flight = 0
+    high_water = 0
+    released = asyncio.Event()
+
+    async def probe(row: str) -> dict[str, object]:
+        nonlocal in_flight, high_water
+        in_flight += 1
+        high_water = max(high_water, in_flight)
+        try:
+            if high_water >= 3:
+                released.set()
+            await asyncio.wait_for(released.wait(), timeout=5)
+        finally:
+            in_flight -= 1
+        return {"row": row, "witness": f"w-{row}"}
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec(name="probe", effect=EffectClass.READ, fn=probe, witness=True))
+
+    branch = Branch(id="b", fork_step=0, predicted=None, status=BranchStatus.SPECULATIVE)
+    for row in ("a", "b", "c"):
+        branch.read_set.append(
+            ReadRecord(
+                tool="probe",
+                args={"row": row},
+                args_hash=chash({"row": row}),
+                result_hash=chash({"row": row}),
+                witness=f"w-{row}",
+                at_step=1,
+                issued_while_speculative=True,
+            )
+        )
+
+    validation = await validate_reads(branch, registry)
+
+    assert high_water == 3, f"only {high_water} probe(s) were ever in flight at once"
+    assert validation.probes == 3
+    assert [v.verdict for v in validation.verdicts] == ["fresh", "fresh", "fresh"]
+    # The read set's order, not completion order.
+    assert [v.args_hash for v in validation.verdicts] == [
+        chash({"row": row}) for row in ("a", "b", "c")
+    ]

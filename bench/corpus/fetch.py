@@ -271,7 +271,7 @@ def write_values(
         "corpus_hash": corpus_hash,
         "matches_committed_corpus": committed is not None and committed == corpus_hash,
     }
-    (out.parent / "values_manifest.json").write_text(
+    (out.parent / f"{out.stem}_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
     return manifest
@@ -286,6 +286,15 @@ def main(argv: list[str] | None = None) -> int:
         "--values",
         action="store_true",
         help="fetch the same rows and write values.json beside the corpus, which is not rewritten",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "with --values, keep every value whole instead of digesting the long ones. The "
+            "result is too large to commit and is gitignored; it is what a measurement needs "
+            "when the *content* of a value matters and not only its identity."
+        ),
     )
     parser.add_argument("--verify-manifest", action="store_true")
     parser.add_argument("--out", type=Path, default=HERE / "traces.json")
@@ -325,8 +334,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.fallback:
             print("--values needs the dataset; the fallback corpus has no values", file=sys.stderr)
             return 2
+        global VALUE_INLINE_BYTES
+        if args.full:
+            # Nothing is digested: every value is kept whole. The committed sidecar exists to
+            # answer "is this value the same one?", which a digest answers exactly; a draft
+            # model asked to *predict* a value needs to have seen real ones, and told us so --
+            # it replied "the hashes in the previous calls obscure" what it needed.
+            VALUE_INLINE_BYTES = 1 << 30
         traces, values = fetch_with_values(args.limit, args.offset)
-        manifest = write_values(traces, values, "huggingface", args.out.parent / "values.json")
+        out = args.out.parent / ("values_full.json" if args.full else "values.json")
+        manifest = write_values(traces, values, "huggingface", out)
         print(json.dumps(manifest, indent=2, sort_keys=True))
         if not manifest["matches_committed_corpus"]:
             print("the rows served today are not the committed corpus", file=sys.stderr)

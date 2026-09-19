@@ -65,6 +65,25 @@ The signature bound of 53.4% on the same steps says the index ranks the right *t
 
 ---
 
+### The acceptance rate of a draft model
+
+Tier 1 copies argument values it has already seen, and the section above measures the ceiling that puts on it. A draft model can *invent* a value, so it is the only thing that can clear that ceiling, and whether it does is the question the store buffer's whole case rests on. Same corpus, same grader, same exact-equality verdict.
+
+Draft model: `claude-haiku-4-5`, 428 steps sampled with seed 20260918 from the positions the offline measurement grades, each shown the last 12 calls with their real argument values (`values_full.json`). Spend: $4.0074.
+
+| Measure | Value |
+|---|---|
+| **Acceptance rate** | **0.0607** [0.0397, 0.0841] |
+| Guesses offered | 0.9720 (12 unparsable) |
+| Right tool, any arguments | 0.4673 |
+| Right tool, wrong arguments | 0.4065 |
+| Accepted on a write | 26 of 412 |
+| Accepted on a read | 0 of 16 |
+
+Under the policy the runtime runs -- an open guess is squashed when the turn ends -- acceptance on this corpus is zero for any predictor, because every call in it opens a new model turn. This grades the generous policy instead.
+
+---
+
 ### What beats it
 
 Every strategy below defeats the runtime. Each reports a measured rate.
@@ -124,12 +143,50 @@ That is 87.7% of wall clock here, and the percentage is the misleading half of i
 
 ---
 
-### Wall-clock latency
+### Wall-clock latency, against a real model
 
-Not measured yet. Produce it with:
+Target: `claude-sonnet-5`. 270 of 270 runs -- 30 seeded tasks, 3 sample apps, 3 arms. Means with 95% percentile-bootstrap intervals over tasks. Spend: $1.6411 of a $12.0 cap, at the prices printed in the results file.
 
-```
-ANTHROPIC_API_KEY=... python bench/online/run_latency.py --out bench/results/latency.json
-```
+The three arms: **B_seq** runs sequentially with speculation off. **B_readonly_spec** speculates on reads only and treats every write as a barrier — PASTE's policy, credited. **B_specunode** stages writes in the store buffer, which is what this project adds.
 
-This section is present and empty on purpose: a measurement that has not been taken and a measurement of zero are different things.
+| Workload | B_seq | B_readonly_spec | B_specunode | Wall clock saved vs B_seq | alpha | Leaks |
+|---|---|---|---|---|---|---|
+| `ops_agent` | 1661 [1591, 1743] | 1704 [1610, 1852] | 1687 [1595, 1798] | -1.6% | 0.67 | 0 |
+| `research_agent` | 4961 [4715, 5262] | 4729 [4508, 4977] | 4912 [4685, 5163] | +1.0% | 1.00 | 0 |
+| `support_agent` | 1952 [1859, 2043] | 2070 [1959, 2194] | 2254 [2040, 2583] | -15.5% | 1.00 | 0 |
+
+Milliseconds, lower is better. The saving is `1 - B_specunode / B_seq`, so a **negative** figure means the speculative arm was *slower* than running sequentially -- which is a result, not a bug in the table.
+
+**Effects reaching the world from a branch that never retired: 0.** That is the number this project exists to keep at zero, and it is the only one here that is a claim about correctness rather than about speed.
+
+**The break-even alpha is still not measured.** It is the acceptance rate at which the speculative arm's wall clock equals the sequential arm's, and finding it needs a sweep across drafters of differing accuracy rather than a single run at whatever alpha the tier-1 index happens to deliver. `alpha_floor` stays `None` — the gate is inactive rather than set to a guessed number.
+
+---
+
+### How slow a tool has to be before running ahead pays
+
+Running ahead hides tool latency, and the sample apps' tools are a dictionary in memory. So the flat result above is measured in the one regime where this design cannot win, and the honest question is not whether it helps but how slow a tool has to be before it does.
+
+Every arm pays the same injected latency, on both reads and writes. Target: `claude-sonnet-5`, 8 tasks per arm per rung. The saving is against `B_strict_seq` -- the arm that waits for the turn and then calls the tools in order -- with a bootstrap interval on the difference.
+
+| Tool latency | Workload | B_strict_seq | B_specunode | Saving |
+|---|---|---|---|---|
+| 0 ms | `ops_agent` | 1650 ms | 1755 ms | -6.4% [-22.1%, +6.0%] |
+| 0 ms | `research_agent` | 5030 ms | 5090 ms | -1.5% [-14.6%, +9.4%] |
+| 0 ms | `support_agent` | 2215 ms | 1982 ms | +9.9% [-4.0%, +22.8%] |
+| 200 ms | `ops_agent` | 2725 ms | 2626 ms | +3.0% [-10.5%, +19.3%] |
+| 200 ms | `research_agent` | 5964 ms | 6452 ms | -8.2% [-16.0%, -0.8%] |
+| 200 ms | `support_agent` | 2748 ms | 2900 ms | -5.7% [-20.5%, +7.4%] |
+| 500 ms | `ops_agent` | 3700 ms | 3686 ms | +0.4% [-2.7%, +3.3%] |
+| 500 ms | `research_agent` | 8135 ms | 7942 ms | +2.3% [-6.5%, +10.1%] |
+| 500 ms | `support_agent` | 3548 ms | 3524 ms | +0.6% [-5.5%, +7.1%] |
+| 1000 ms | `ops_agent` | 6353 ms | 5699 ms | +10.1% [+2.1%, +17.6%] |
+| 1000 ms | `research_agent` | 10844 ms | 11219 ms | -3.5% [-8.9%, +1.4%] |
+| 1000 ms | `support_agent` | 4981 ms | 5119 ms | -2.9% [-7.1%, +1.3%] |
+| 2000 ms | `ops_agent` | 9732 ms | 9811 ms | -0.8% [-2.1%, +0.5%] |
+| 2000 ms | `research_agent` | 16662 ms | 16948 ms | -1.7% [-5.4%, +2.1%] |
+| 2000 ms | `support_agent` | 8262 ms | 7980 ms | +3.4% [+0.4%, +6.7%] |
+
+An interval that spans zero resolves no difference at this sample size; the model turn is seconds long and varies by more than the tool latency being hidden, which is what the width of these intervals is made of.
+
+Spend: $2.9393, 2963 s of wall clock.

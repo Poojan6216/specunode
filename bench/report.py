@@ -192,6 +192,53 @@ def acceptance_section() -> str:
     return "\n".join(lines)
 
 
+def tier2_section() -> str:
+    report = load("tier2.json")
+    if report is None:
+        return missing(
+            "The acceptance rate of a draft model",
+            "python bench/corpus/fetch.py --values --full && ANTHROPIC_API_KEY=... python "
+            "bench/online/run_tier2_acceptance.py --out bench/results/tier2.json",
+        )
+    if not report.get("is_real_model"):
+        return (
+            "### The acceptance rate of a draft model\n\n"
+            "The harness has run against its stand-in rather than a model, so there is no "
+            "measurement here yet. Run it with an API key.\n"
+        )
+    r = report["result"]
+    ci = r["acceptance_rate_ci95"]
+    lines = [
+        "### The acceptance rate of a draft model",
+        "",
+        "Tier 1 copies argument values it has already seen, and the section above measures the "
+        "ceiling that puts on it. A draft model can *invent* a value, so it is the only thing "
+        "that can clear that ceiling, and whether it does is the question the store buffer's "
+        "whole case rests on. Same corpus, same grader, same exact-equality verdict.",
+        "",
+        f"Draft model: `{report['draft_model']}`, {r['steps_graded']} steps sampled with seed "
+        f"{report['seed']} from the positions the offline measurement grades, each shown the "
+        f"last {report['history_window']} calls with their real argument values "
+        f"(`{report['values']}`). Spend: ${report['estimated_spend_usd']}.",
+        "",
+        "| Measure | Value |",
+        "|---|---|",
+        f"| **Acceptance rate** | **{r['acceptance_rate']:.4f}** "
+        f"[{ci['ci95_low']:.4f}, {ci['ci95_high']:.4f}] |",
+        f"| Guesses offered | {r['offered_rate']:.4f} ({r['unparsable']} unparsable) |",
+        f"| Right tool, any arguments | {r['right_tool']:.4f} |",
+        f"| Right tool, wrong arguments | {r['right_tool_wrong_arguments']:.4f} |",
+        f"| Accepted on a write | {r['by_effect']['write']['accepted']} of "
+        f"{r['by_effect']['write']['steps']} |",
+        f"| Accepted on a read | {r['by_effect']['read']['accepted']} of "
+        f"{r['by_effect']['read']['steps']} |",
+        "",
+        str(report["policy_note"]),
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def demo_section() -> str:
     report = load("demo_leak.json")
     if report is None:
@@ -304,10 +351,133 @@ def overhead_section() -> str:
 
 
 def latency_section() -> str:
-    return (load("latency.json") and "") or missing(
-        "Wall-clock latency",
-        "ANTHROPIC_API_KEY=... python bench/online/run_latency.py --out bench/results/latency.json",
-    )
+    report = load("latency.json")
+    if report is None:
+        return missing(
+            "Wall-clock latency",
+            "ANTHROPIC_API_KEY=... python bench/online/run_latency.py "
+            "--out bench/results/latency.json",
+        )
+    if not report.get("is_real_model"):
+        return (
+            "### Wall-clock latency\n\n"
+            "The harness has run, against its deterministic stand-in rather than a model, so "
+            "there is still no wall-clock measurement here. The stand-in answers instantly; "
+            "what it times is this repository's own overhead and nothing else. Run it with an "
+            "API key for figures anyone should quote.\n"
+        )
+    lines = [
+        "### Wall-clock latency, against a real model",
+        "",
+        f"Target: `{report['target_model']}`. {report['tasks_completed']} of "
+        f"{report['tasks_requested'] * 9} runs -- {report['tasks_requested']} seeded tasks, "
+        "3 sample apps, 3 arms. Means with 95% percentile-bootstrap intervals over tasks. "
+        f"Spend: ${report['estimated_spend_usd']} of a ${report['budget_usd_cap']} cap, at the "
+        "prices printed in the results file.",
+        "",
+        "The three arms: **B_seq** runs sequentially with speculation off. "
+        "**B_readonly_spec** speculates on reads only and treats every write as a barrier — "
+        "PASTE's policy, credited. **B_specunode** stages writes in the store buffer, which is "
+        "what this project adds.",
+        "",
+        "| Workload | B_seq | B_readonly_spec | B_specunode | Wall clock saved vs B_seq "
+        "| alpha | Leaks |",
+        "|---|---|---|---|---|---|---|",
+    ]
+
+    def cell(arms: dict[str, Any], arm: str) -> str:
+        stats = arms.get(arm)
+        if not stats:
+            return "not run"
+        low, high = stats["wall_ms_ci95"]
+        return f"{stats['wall_ms_mean']:.0f} [{low:.0f}, {high:.0f}]"
+
+    total_leaks = 0
+    for name, entry in sorted(report["workloads"].items()):
+        arms = entry["arms"]
+        reduction = entry.get("wall_clock_reduction_vs_seq")
+        change = "not comparable" if reduction is None else f"{reduction:+.1%}"
+        alpha = entry.get("alpha_observed")
+        leaks = sum(int(s["leaks"]) for s in arms.values())
+        total_leaks += leaks
+        lines += [
+            f"| `{name}` | {cell(arms, 'B_seq')} | {cell(arms, 'B_readonly_spec')} | "
+            f"{cell(arms, 'B_specunode')} | {change} | "
+            f"{'not measured' if alpha is None else f'{alpha:.2f}'} | {leaks} |"
+        ]
+    lines += [
+        "",
+        "Milliseconds, lower is better. The saving is "
+        "`1 - B_specunode / B_seq`, so a **negative** figure means the speculative arm was "
+        "*slower* than running sequentially -- which is a result, not a bug in the table.",
+        "",
+        f"**Effects reaching the world from a branch that never retired: {total_leaks}.** That "
+        "is the number this project exists to keep at zero, and it is the only one here that "
+        "is a claim about correctness rather than about speed.",
+        "",
+        "**The break-even alpha is still not measured.** It is the acceptance rate at which the "
+        "speculative arm's wall clock equals the sequential arm's, and finding it needs a "
+        "sweep across drafters of differing accuracy rather than a single run at whatever alpha "
+        "the tier-1 index happens to deliver. `alpha_floor` stays `None` — the gate is "
+        "inactive rather than set to a guessed number.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def sweep_section() -> str:
+    report = load("sweep.json")
+    if report is None:
+        return missing(
+            "How slow a tool has to be before running ahead pays",
+            "ANTHROPIC_API_KEY=... python bench/online/run_latency_sweep.py "
+            "--out bench/results/sweep.json",
+        )
+    if not report.get("is_real_model"):
+        return (
+            "### How slow a tool has to be before running ahead pays\n\n"
+            "The harness has run against its stand-in rather than a model. Run it with an API "
+            "key for figures anyone should quote.\n"
+        )
+    lines = [
+        "### How slow a tool has to be before running ahead pays",
+        "",
+        "Running ahead hides tool latency, and the sample apps' tools are a dictionary in "
+        "memory. So the flat result above is measured in the one regime where this design "
+        "cannot win, and the honest question is not whether it helps but how slow a tool has "
+        "to be before it does.",
+        "",
+        f"Every arm pays the same injected latency, on both reads and writes. Target: "
+        f"`{report['target_model']}`, {report['tasks_per_arm']} tasks per arm per rung. The "
+        "saving is against `B_strict_seq` -- the arm that waits for the turn and then calls "
+        "the tools in order -- with a bootstrap interval on the difference.",
+        "",
+        "| Tool latency | Workload | B_strict_seq | B_specunode | Saving |",
+        "|---|---|---|---|---|",
+    ]
+    for ms, point in sorted(report["points"].items(), key=lambda kv: int(kv[0])):
+        for name, entry in sorted(point.items()):
+            means = entry["wall_ms_mean"]
+            ci = entry["saving_vs_strict_seq_ci95"].get("B_specunode") or {}
+            band = (
+                f"{ci['mean']:+.1%} [{ci['ci95_low']:+.1%}, {ci['ci95_high']:+.1%}]"
+                if ci
+                else "not measured"
+            )
+            lines.append(
+                f"| {ms} ms | `{name}` | {means.get('B_strict_seq', 0):.0f} ms | "
+                f"{means.get('B_specunode', 0):.0f} ms | {band} |"
+            )
+    lines += [
+        "",
+        "An interval that spans zero resolves no difference at this sample size; the model "
+        "turn is seconds long and varies by more than the tool latency being hidden, which is "
+        "what the width of these intervals is made of.",
+        "",
+        f"Spend: ${report['estimated_spend_usd']}, {report['wall_seconds']:.0f} s of wall clock.",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def build() -> str:
@@ -328,6 +498,9 @@ def build() -> str:
             acceptance_section(),
             "---",
             "",
+            tier2_section(),
+            "---",
+            "",
             attacks_section(),
             "---",
             "",
@@ -341,6 +514,9 @@ def build() -> str:
             "---",
             "",
             latency_section(),
+            "---",
+            "",
+            sweep_section(),
         ]
     )
 

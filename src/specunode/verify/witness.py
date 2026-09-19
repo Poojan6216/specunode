@@ -22,13 +22,14 @@ read total rather than left out because they are the runtime's own.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
 from specunode.canonical import JsonValue, chash
-from specunode.core.branch import Branch
-from specunode.core.effects import ToolRegistry
+from specunode.core.branch import Branch, ReadRecord
+from specunode.core.effects import ToolRegistry, ToolSpec
 from specunode.core.model import CallScope, call_scope
 
 __all__ = ["ReadValidation", "ReadVerdict", "validate_reads"]
@@ -125,70 +126,83 @@ class ReadValidation:
         }
 
 
-async def validate_reads(branch: Branch, registry: ToolRegistry) -> ReadValidation:
-    """Re-check every witnessed read this branch made while it was still a guess."""
-    verdicts: list[ReadVerdict] = []
-    probes = 0
-
-    for record in branch.reads_to_validate():
-        if not record.witnessed:
-            verdicts.append(
-                ReadVerdict(
-                    tool=record.tool,
-                    args_hash=record.args_hash,
-                    verdict="unwitnessed",
-                    raced_drain=record.raced_drain,
-                )
-            )
-            continue
-
-        spec = registry.get(record.tool)
-        args = record.args
-        if spec.synthesised:
-            # Nothing to re-fetch with, or a tool nobody declared. Reported as unreadable
-            # rather than assumed fresh: an unchecked read is not a checked one.
-            verdicts.append(
-                ReadVerdict(
-                    tool=record.tool,
-                    args_hash=record.args_hash,
-                    verdict="unreadable",
-                    witness_before=record.witness,
-                    raced_drain=record.raced_drain,
-                )
-            )
-            continue
-
-        token = call_scope.set(
-            CallScope(branch_id=branch.id, lineage=branch.lineage, speculative=False)
+async def _probe(record: ReadRecord, spec: ToolSpec, branch: Branch) -> ReadVerdict:
+    """Re-fetch one witnessed read and say whether its witness still matches."""
+    token = call_scope.set(
+        CallScope(branch_id=branch.id, lineage=branch.lineage, speculative=False)
+    )
+    try:
+        current = await spec.fn(**record.args)
+    except Exception:
+        # Reported as unreadable rather than assumed fresh: an unchecked read is not a
+        # checked one.
+        return ReadVerdict(
+            tool=record.tool,
+            args_hash=record.args_hash,
+            verdict="unreadable",
+            witness_before=record.witness,
+            raced_drain=record.raced_drain,
         )
-        try:
-            probes += 1
-            current = await spec.fn(**args)
-        except Exception:
-            verdicts.append(
-                ReadVerdict(
-                    tool=record.tool,
-                    args_hash=record.args_hash,
-                    verdict="unreadable",
-                    witness_before=record.witness,
-                    raced_drain=record.raced_drain,
-                )
-            )
-            continue
-        finally:
-            call_scope.reset(token)
+    finally:
+        call_scope.reset(token)
 
-        after = current.get("witness") if isinstance(current, Mapping) else None
-        same = chash(after) == chash(record.witness)
-        verdicts.append(
-            ReadVerdict(
+    after = current.get("witness") if isinstance(current, Mapping) else None
+    return ReadVerdict(
+        tool=record.tool,
+        args_hash=record.args_hash,
+        verdict="fresh" if chash(after) == chash(record.witness) else "stale",
+        witness_before=record.witness,
+        witness_after=after,
+        raced_drain=record.raced_drain,
+    )
+
+
+async def validate_reads(branch: Branch, registry: ToolRegistry) -> ReadValidation:
+    """Re-check every witnessed read this branch made while it was still a guess.
+
+    The probes run **concurrently**. They used to run one after another, and each one is a real
+    round trip to the upstream the read came from, so a turn that made three witnessed reads
+    paid three of them in series at retirement -- measured at one tool latency each. That is
+    the same quantity tier-0 early issue saves by issuing those reads concurrently in the first
+    place, so the runtime handed back at the end exactly what it had won at the start, and the
+    latency benchmark's flat result was the sum of the two.
+
+    Nothing about the guarantee changes: every witnessed read is still re-fetched, compared to
+    the witness it was given, and reported under its own verdict. Only the waiting is shared.
+    The verdicts keep the read set's order -- ``asyncio.gather`` preserves it -- because the
+    ledger renders them and the equivalence relation compares them.
+    """
+    records = list(branch.reads_to_validate())
+    probes: list[tuple[int, ReadRecord, ToolSpec]] = []
+    verdicts: list[ReadVerdict | None] = [None] * len(records)
+
+    for index, record in enumerate(records):
+        if not record.witnessed:
+            verdicts[index] = ReadVerdict(
                 tool=record.tool,
                 args_hash=record.args_hash,
-                verdict="fresh" if same else "stale",
-                witness_before=record.witness,
-                witness_after=after,
+                verdict="unwitnessed",
                 raced_drain=record.raced_drain,
             )
-        )
+            continue
+        spec = registry.get(record.tool)
+        if spec.synthesised:
+            # Nothing to re-fetch with, or a tool nobody declared.
+            verdicts[index] = ReadVerdict(
+                tool=record.tool,
+                args_hash=record.args_hash,
+                verdict="unreadable",
+                witness_before=record.witness,
+                raced_drain=record.raced_drain,
+            )
+            continue
+        probes.append((index, record, spec))
 
-    return ReadValidation(verdicts=tuple(verdicts), probes=probes)
+    if probes:
+        results = await asyncio.gather(
+            *(_probe(record, spec, branch) for _, record, spec in probes)
+        )
+        for (index, _, _), verdict in zip(probes, results, strict=True):
+            verdicts[index] = verdict
+
+    return ReadValidation(verdicts=tuple(v for v in verdicts if v is not None), probes=len(probes))

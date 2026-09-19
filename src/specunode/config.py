@@ -77,7 +77,9 @@ class TargetConfig(_Model):
     #: Passed to the adapter by :func:`specunode.runner.build_target`.
     base_url: str | None = None
     max_tokens: int = 4096
-    temperature: float = 0.0
+    #: ``None`` means "do not send one". The current models reject sampling parameters, so a
+    #: default of 0.0 here would put a 400 in front of anyone who read these defaults.
+    temperature: float | None = None
 
     def envelope_defaults(self) -> dict[str, JsonValue]:
         """Defaults for application code that builds its own ``RequestEnvelope``.

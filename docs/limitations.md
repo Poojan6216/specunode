@@ -64,13 +64,19 @@ way twice.** An idempotency key is derived from the run, the node, the program p
 tool and the *arguments*. A resume re-asks the model for every turn the journal does not
 already hold. If it answers identically — which a recorded or scripted model always does — the
 key matches, the dedupe table sees the earlier attempt, and nothing is sent twice. If it answers
-differently, as a real model at non-zero temperature may, the resumed run produces a different
-call at the same position, derives a different key, and the dedupe table has nothing to match
-it against. The world then receives both, and no bookkeeping in this design connects them.
+differently — and a real model may — the resumed run produces a different call at the same
+position, derives a different key, and the dedupe table has nothing to match it against. The
+world then receives both, and no bookkeeping in this design connects them.
 
 So the honest statement is: **a resumed run never delivers the same call twice, and can deliver
-a second, different call the uninterrupted run would not have made.** Set `temperature: 0.0`
-(the config default) to make that window as small as a provider allows; it does not close it.
+a second, different call the uninterrupted run would not have made.**
+
+There is no setting that closes this window, and on the current models there is not even one
+that narrows it: `temperature`, `top_p` and `top_k` are rejected outright by Claude Sonnet 5 and
+Claude Opus 5 (HTTP 400, "`temperature` is deprecated for this model"), so the advice this page
+used to give — pin the temperature to zero — is no longer available to take. Claude Haiku 4.5
+still accepts them. Either way a model is free to answer differently, and the design does not
+assume otherwise.
 
 Every kill/resume test here uses a deterministic `ScriptedModel`, so none of them can see this.
 That is a property of the fixtures, not evidence about the runtime.

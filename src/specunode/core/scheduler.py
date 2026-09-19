@@ -293,14 +293,35 @@ class Scheduler:
         # Either kind of "not authorised by a durable decision yet": a branch that is still a
         # guess, or a read issued for a turn whose output is not journaled. Attack 7.2 counts
         # both, because both reached upstream without a durable decision behind them.
-        speculative = branch.status is BranchStatus.SPECULATIVE or branch.unjournaled_reads > 0
+        #
+        # "A guess" is ``predicted is not None``, not ``status is SPECULATIVE``. Every branch is
+        # SPECULATIVE until it is confirmed, the canonical one included, so the status test
+        # counted an ordinary read on the ordinary path -- one the model had asked for, in a
+        # turn already journaled -- as a read that reached upstream unauthorised. A plain
+        # sequential run with speculation and early issue both switched off reported one, and
+        # the ledger, the limitations page and attack 7.2's number all repeated it.
+        # Two questions, and they had been sharing one answer.
+        #
+        # ``unretired`` is "could this read still go stale before the effects it informed reach
+        # the world?" -- true for every read a branch makes before it retires, which is what
+        # lattice rule E3 re-checks at retirement. Staleness is about elapsed time, not about
+        # authorisation, so narrowing this would quietly shrink a safety property.
+        #
+        # ``unauthorised`` is "did this reach upstream with no durable decision behind it?" --
+        # a guess, or a read issued for a turn that is not journaled yet. That is what attack
+        # 7.2 counts, what the read budget charges, and what the ledger publishes. Every branch
+        # is SPECULATIVE until it is confirmed, the canonical one included, so asking the
+        # status counted an ordinary read on the ordinary path as unauthorised: a plain
+        # sequential run with speculation and early issue both off reported one.
+        unretired = branch.status is not BranchStatus.RETIRED
+        unauthorised = branch.predicted is not None or branch.unjournaled_reads > 0
         scope = CallScope(
             run_id=self.run_id,
             branch_id=branch.id,
             lineage=branch.lineage,
             step=step,
             node_id=node_id,
-            speculative=speculative,
+            speculative=unauthorised,
         )
         token = call_scope.set(scope)
         try:
@@ -319,10 +340,10 @@ class Scheduler:
                 result_hash=chash(value),
                 witness=witness,
                 at_step=step,
-                issued_while_speculative=speculative,
+                issued_while_speculative=unretired,
             )
         )
-        if speculative:
+        if unauthorised:
             self.counters.speculative_reads_upstream += 1
         if branch.predicted is not None:
             # The budget charges only reads made on a forked guess -- a branch that exists
@@ -350,7 +371,7 @@ class Scheduler:
                 "witness": witness,
                 "source": "upstream",
                 "duration_ms": int((time.monotonic() - started) * 1000),
-                "speculative": speculative,
+                "speculative": unauthorised,
                 "reached_upstream": True,
             },
         )
@@ -1126,6 +1147,7 @@ class Scheduler:
         """
         return {
             "speculation": self.policy.speculation,
+            "early_issue": self.policy.early_issue,
             "max_inflight_branches": self.policy.max_inflight_branches,
             "max_speculation_depth": self.policy.max_speculation_depth,
             "max_wasted_tokens": self.policy.max_wasted_tokens,
@@ -1323,7 +1345,8 @@ class SpeculativeTurn:
                 ordinal = len(slots)
                 if spec.effect is not EffectClass.READ:
                     self._pending_write_keys.append(keys_touched(spec, actual.args))
-                if spec.effect is EffectClass.READ and self._adopted is None:
+                early = scheduler.policy.early_issue
+                if spec.effect is EffectClass.READ and self._adopted is None and early:
                     self.reads_issued_early += 1
                     slots.append(asyncio.create_task(self._timed_read(tools, actual, ordinal)))
                 elif self._adopted is not None:
