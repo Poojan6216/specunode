@@ -540,11 +540,149 @@ def model_bound_section() -> str:
         f"{totals['runs']}. **Effects reaching the world from a branch that never retired: "
         f"{totals['leaks']}.**",
         "",
-        "What this does not show is what a real model does when told it may ask for several "
-        "calls at once, or what prompt caching takes off each reply. Both need a real model, "
-        "and neither is measured yet.",
+        _real_model_pointer(),
         "",
     ]
+    return "\n".join(lines)
+
+
+def _real_model_pointer() -> str:
+    """Where the stand-in's open question is answered -- or that it has not been."""
+    online = load("model_bound_online.json")
+    if online is not None and online.get("is_real_model"):
+        return (
+            "What a real model does with the same two changes, and what prompt caching saves, "
+            "is the next section."
+        )
+    return (
+        "What this does not show is what a real model does when told it may ask for several "
+        "calls at once, or what prompt caching takes off each reply. Both need a real model, "
+        "and neither is measured yet."
+    )
+
+
+#: The incident-agent cells of ``model_bound_online.json``, in the order a reader compares them.
+_ONLINE_REPLY_CELLS = (
+    ("one_call/no_cache", "One call per reply, no cache -- **before**"),
+    ("one_call/cache", "One call per reply, cached"),
+    ("parallel/no_cache", "Several calls per reply, no cache"),
+    ("parallel/cache", "Several calls per reply, cached -- **after**"),
+    ("default/cache", "No guidance either way, cached"),
+)
+_ONLINE_COMPARISONS = (
+    ("caching", "Prompt caching alone (one call per reply)"),
+    ("multi_call_replies", "Several calls per reply (both cached)"),
+    ("before_to_after", "**Before to after: both levers**"),
+    ("parallel_nodes", "Parallel nodes (three checks, then a report)"),
+)
+
+
+def model_bound_online_section() -> str:
+    report = load("model_bound_online.json")
+    title = "Fewer replies, caching and parallel nodes, against a real model"
+    if report is None:
+        return missing(
+            title,
+            "ANTHROPIC_API_KEY=... python bench/online/run_model_bound.py "
+            "--out bench/results/model_bound_online.json",
+        )
+    if not report.get("is_real_model"):
+        return (
+            f"### {title}\n\nThe harness has run against its stand-in rather than a model. Run "
+            "it with an API key for figures anyone should quote.\n"
+        )
+    cells = report["cells"]
+    lines = [
+        f"### {title}",
+        "",
+        f"Target: `{report['target_model']}`. The same seven configurations as above, run "
+        f"round-robin -- one run of each per round, {report['runs_requested']} rounds -- so "
+        "drift in the API's latency lands on all of them alike. Spend: "
+        f"${report['estimated_spend_usd']} of a ${report['budget_usd_cap']} cap.",
+        "",
+        "**One call per reply is enforced, not asked for.** In a first attempt at this run, "
+        "the model told in its system prompt to make one call per reply batched its calls "
+        "anyway, exactly as it did with no guidance, so the attempt was stopped in its second "
+        "round. This arm now also sets the API's `disable_parallel_tool_use`, which is what an "
+        "app that runs one call per reply effectively has. Cached runs of one configuration "
+        "follow each other well inside the cache's five-minute lifetime, so from the second "
+        "round on they start with the system prompt already cached: the steady state of an "
+        "agent that works more than one alert.",
+        "",
+        "| Configuration | Replies | Calls per reply | Wall clock | Cost per run | Correct |",
+        "|---|---|---|---|---|---|",
+    ]
+    for key, label in _ONLINE_REPLY_CELLS:
+        cell = cells.get(key) or {}
+        if not cell.get("n"):
+            lines.append(f"| {label} | not measured | | | | |")
+            continue
+        lines.append(
+            f"| {label} | {cell['replies_mean']:.1f} | {cell['calls_per_reply']:.2f} | "
+            f"{cell['wall_ms_mean']:.0f} ms | ${cell['usd_per_run']:.4f} | "
+            f"{cell['correct']} of {cell['n']} |"
+        )
+    lines += [
+        "",
+        "| Change | Wall clock saved | Cost saved |",
+        "|---|---|---|",
+    ]
+    for key, label in _ONLINE_COMPARISONS:
+        comparison = report["comparisons"].get(key) or {}
+        cost = _band(comparison.get("cost_saving_ci95")) if key != "parallel_nodes" else "--"
+        lines.append(f"| {label} | {_band(comparison.get('wall_saving_ci95'))} | {cost} |")
+    before, after = cells.get("one_call/no_cache") or {}, cells.get("parallel/cache") or {}
+    habit = cells.get("default/cache") or {}
+    comparisons = report["comparisons"]
+    caching = (comparisons.get("caching") or {}).get("cost_saving_ci95") or {}
+    if before.get("n") and after.get("n") and habit.get("n") and caching:
+        lines += [
+            "",
+            "Three things this says, in the order they matter:",
+            "",
+            f"- **The model already asks for independent calls together.** Told nothing either "
+            f"way, it used {habit['replies_mean']:.1f} replies, the same as with guidance. "
+            "What kept a run at one call per reply was the app around the model running only "
+            "one -- which is what this arm's API switch reproduces.",
+            f"- **Fewer replies save each reply's fixed cost, not the writing.** "
+            f"{before['replies_mean']:.1f} replies became {after['replies_mean']:.1f}, and the "
+            "time saved is smaller than that, because a reply that asks for several calls takes "
+            "longer to write than one that asks for one.",
+            f"- **Caching cut the bill by {caching['mean']:.1%} and did not change the wall "
+            "clock** at a prompt this short: reading a prompt of a few thousand tokens is a small "
+            "part of a reply's time, and the interval on the time saved spans zero. On a long "
+            "prompt, where reading it is a larger part of each reply, it should save time too; "
+            "that is not measured here.",
+        ]
+    serial, side = cells.get("nodes/one_at_a_time") or {}, cells.get("nodes/side_by_side") or {}
+    leaks = sum(int(cell.get("leaks", 0)) for cell in cells.values())
+    # Per configuration, because the totals are not in the results file and a sum computed
+    # here would be a number nobody measured (Hard Rule 12).
+    measured = [cell for cell in cells.values() if cell.get("n")]
+    sizes = {int(cell["n"]) for cell in measured}
+    if measured and all(cell["correct"] == cell["n"] for cell in measured) and len(sizes) == 1:
+        (size,) = sizes
+        verdict = (
+            "Every run of every configuration changed the world exactly as a correct run does, "
+            f"{size} of {size} in each."
+        )
+    else:
+        verdict = "Runs that changed the world exactly as a correct run does: " + ", ".join(
+            f"{name} {cell['correct']} of {cell['n']}" for name, cell in cells.items()
+        )
+    lines += [
+        "",
+        "Parallel nodes, with each check one real model reply: "
+        f"{serial.get('wall_ms_mean', 0):.0f} ms one after another, "
+        f"{side.get('wall_ms_mean', 0):.0f} ms side by side.",
+        "",
+        f"{verdict} **Effects reaching the world from a branch that never retired: {leaks}.**",
+        "",
+    ]
+    if report.get("halted_at"):
+        lines += [f"Halted at the spend cap: {report['halted_at']}.", ""]
+    if report.get("failure"):
+        lines += [f"Stopped on a failed run: {report['failure']}.", ""]
     return "\n".join(lines)
 
 
@@ -628,6 +766,9 @@ def build() -> str:
             "---",
             "",
             model_bound_section(),
+            "---",
+            "",
+            model_bound_online_section(),
             "---",
             "",
             attacks_section(),

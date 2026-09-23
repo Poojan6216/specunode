@@ -133,9 +133,15 @@ guessing.** On the one sample app that hands its model turn to the runtime, with
 slowed to 500 ms, issuing each read the moment its block parses saves 11.8% [7.8%, 15.5%]; with
 2000 ms tools, 16.7% [15.1%, 18.2%]. Guessing added nothing any interval resolves, and a guesser
 of controlled accuracy is measured to be worth at most 4.8% even when it is always right, because
-a guess can run at most one block ahead of the model. When the model is the slow part, what
-helps is fewer model replies and replies side by side — measured in [RESULTS.md](RESULTS.md),
-against a stand-in so far.
+a guess can run at most one block ahead of the model.
+
+**When the model is the slow part, what helps is fewer model replies and replies side by side,
+and both are measured against a real model.** On an on-call task against `claude-sonnet-5`,
+running every call a reply asks for and handing the results back together took the job from 11
+replies to 5: 35.4% less time and, with prompt caching, 77.7% less cost, with every run correct.
+Three independent checks run side by side took 60.2% less time than one after another. Caching
+alone cut the bill by 72.7% and did not change the time at this prompt size. Nothing reached the
+world from a branch that never retired. Details in [RESULTS.md](RESULTS.md).
 
 ---
 
@@ -192,11 +198,10 @@ Known gaps, stated rather than left to be discovered:
 
 - **Guessing has not produced a wall-clock saving against a real model.** Issuing reads early
   has; guessing on top of it added nothing any interval resolves.
-- **Fewer replies and parallel nodes are measured only against a stand-in model so far.**
-  There, the same alert takes 4 replies instead of 9 and 48.1% less time, and three independent
-  checks side by side take 66.1% less time than one after another, with every run correct and
-  nothing leaked. Whether a real model asks for several calls at once when invited to, and what
-  prompt caching saves, needs a paid run that has not been made.
+- **The real-model gains for fewer replies and parallel nodes come from one task.** One on-call
+  alert and one three-way check, against one model. How much another task gains depends on how
+  many of its calls are independent of each other; calls that depend on one another still need
+  a reply each.
 - One sample workload, not three. The invariant tests hold on it and on tiers 0 and 1.
 
 `BUILD_SPEC.md`'s Final Report lists every one of these with the reason it is open. Every

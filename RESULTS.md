@@ -129,7 +129,40 @@ A guess buys at most one block of a model's stream (above). When the model is wh
 
 Runs that changed the world exactly as a correct run does: 40 of 40. **Effects reaching the world from a branch that never retired: 0.**
 
-What this does not show is what a real model does when told it may ask for several calls at once, or what prompt caching takes off each reply. Both need a real model, and neither is measured yet.
+What a real model does with the same two changes, and what prompt caching saves, is the next section.
+
+---
+
+### Fewer replies, caching and parallel nodes, against a real model
+
+Target: `claude-sonnet-5`. The same seven configurations as above, run round-robin -- one run of each per round, 15 rounds -- so drift in the API's latency lands on all of them alike. Spend: $2.33 of a $4.8 cap.
+
+**One call per reply is enforced, not asked for.** In a first attempt at this run, the model told in its system prompt to make one call per reply batched its calls anyway, exactly as it did with no guidance, so the attempt was stopped in its second round. This arm now also sets the API's `disable_parallel_tool_use`, which is what an app that runs one call per reply effectively has. Cached runs of one configuration follow each other well inside the cache's five-minute lifetime, so from the second round on they start with the system prompt already cached: the steady state of an agent that works more than one alert.
+
+| Configuration | Replies | Calls per reply | Wall clock | Cost per run | Correct |
+|---|---|---|---|---|---|
+| One call per reply, no cache -- **before** | 11.0 | 1.00 | 16151 ms | $0.0636 | 15 of 15 |
+| One call per reply, cached | 11.0 | 1.00 | 17350 ms | $0.0173 | 15 of 15 |
+| Several calls per reply, no cache | 5.0 | 2.50 | 10804 ms | $0.0361 | 15 of 15 |
+| Several calls per reply, cached -- **after** | 5.0 | 2.50 | 10431 ms | $0.0142 | 15 of 15 |
+| No guidance either way, cached | 5.0 | 2.50 | 10254 ms | $0.0141 | 15 of 15 |
+
+| Change | Wall clock saved | Cost saved |
+|---|---|---|
+| Prompt caching alone (one call per reply) | -7.3% [-17.5%, +1.2%] | +72.7% [+71.9%, +73.6%] |
+| Several calls per reply (both cached) | +39.7% [+34.4%, +45.1%] | +18.3% [+14.9%, +21.6%] |
+| **Before to after: both levers** | +35.4% [+31.9%, +39.0%] | +77.7% [+77.0%, +78.3%] |
+| Parallel nodes (three checks, then a report) | +60.2% [+57.6%, +62.6%] | -- |
+
+Three things this says, in the order they matter:
+
+- **The model already asks for independent calls together.** Told nothing either way, it used 5.0 replies, the same as with guidance. What kept a run at one call per reply was the app around the model running only one -- which is what this arm's API switch reproduces.
+- **Fewer replies save each reply's fixed cost, not the writing.** 11.0 replies became 5.0, and the time saved is smaller than that, because a reply that asks for several calls takes longer to write than one that asks for one.
+- **Caching cut the bill by 72.7% and did not change the wall clock** at a prompt this short: reading a prompt of a few thousand tokens is a small part of a reply's time, and the interval on the time saved spans zero. On a long prompt, where reading it is a larger part of each reply, it should save time too; that is not measured here.
+
+Parallel nodes, with each check one real model reply: 4454 ms one after another, 1773 ms side by side.
+
+Every run of every configuration changed the world exactly as a correct run does, 15 of 15 in each. **Effects reaching the world from a branch that never retired: 0.**
 
 ---
 

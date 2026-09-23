@@ -123,16 +123,26 @@ model's own writes are held until the turn that asked for them is durable — an
 is speed. A drafter that chained several calls ahead, or a scheduler that let a confirmed
 branch's writes dispatch before retirement, would change this; neither is built.
 
-## Fewer model replies need a model that asks for several calls at once
+## Fewer model replies need an app that runs every call a reply asks for
 
 When the model is the slow part of a run, the lever infrastructure has is the number of model
-replies, and the runtime is built for the reply that cuts it: its reads issued as they parse
-and run together, its writes held until the reply is durable, every result handed back in one
-message (`specunode.core.loop.agent_loop`). But the runtime cannot make a model write that
-reply. Every turn in the 300 real trajectories in `bench/corpus` asks for exactly one call, and
-an app whose model works that way gains nothing here. `examples/incident_agent` measures the
-difference a prompt that invites independent calls makes -- nine replies against four, with a
-stand-in model (`RESULTS.md`). Whether a real model takes the invitation is not measured yet.
+replies. Measured against Claude Sonnet 5 (`RESULTS.md`), the model already asks for
+independent calls together when nothing tells it otherwise, and went on doing so when its prompt
+told it not to; only the API's `disable_parallel_tool_use` held it to one. What keeps a run at
+one call per reply is the app around the model running only one — as the 300 trajectories in
+`bench/corpus` do, and as two of this repository's three original sample apps still do: they
+take the first call of each reply and drop the rest. The runtime is built for
+the reply that asks for several: `specunode.core.loop.agent_loop` runs its reads together as
+they parse, holds its writes until the reply is durable, and hands every result back in one
+message.
+
+Two limits remain, and neither is the runtime's to remove:
+
+- **Calls that depend on each other still need a reply each.** The restarts wait for the
+  statuses and the summary waits for the restarts, so the task sets the floor on replies.
+- **Fewer replies save each reply's fixed cost, not the writing.** Eleven replies became five,
+  and the time saved was smaller than that, because a reply that asks for several calls takes
+  longer to write. Prompt caching cut the bill and not the time at that prompt size.
 
 ## Parallel nodes overlap only up to their first write, and must be independent
 

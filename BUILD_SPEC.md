@@ -743,8 +743,8 @@ Goal: numbers, with the negative ones first.
   *Result:* with 500 ms tools a guess of any accuracy costs time (−0.2% to −1.3%, even at α = 1); with 2000 ms tools it pays from α = 0.25 and tops out near +4.8%. Guessing reads and writes is indistinguishable from guessing reads only in every cell: a staged write cannot leave before its branch retires.
 - [x] **6.10 Tier-2 acceptance rate, against a real draft model.** `bench/online/run_tier2_acceptance.py`: `claude-haiku-4-5` shown the last 12 calls with their real argument values (`values_full.json`, gitignored), graded by `resolve_decision` with guesses carried across turns, 1000 sampled steps. Output `bench/results/tier2.json`.
   *Result:* 0.069 [0.054, 0.086], against tier 1's 0.0002 under the same rule. Under the runtime's own within-turn rule it is zero for any predictor on this corpus (6.7).
-- [ ] **6.11 When the model is the slow part.** Three changes for model-bound runs, none of which touches what makes speculation safe: `specunode.core.loop.agent_loop` (every result of a reply back in one message, the reply echoed back unchanged, thinking blocks included); prompt caching on by default (`target.cache`); and parallel nodes (a router may name several nodes; they run side by side and retire in the order named). `bench/offline/run_model_bound.py` measures the runtime's side against a stand-in (`bench/results/model_bound.json`): the same alert in 4 replies instead of 9, three independent model calls in flight instead of one, every run correct, nothing leaked.
-  *Open:* what a real model does when told it may ask for several calls at once, and what caching saves on a real prompt, need a paid run. Its runner is `bench/online/run_model_bound.py` — seven cells round-robin (one call per reply and several, each with the cache off and on; the model's default habit; parallel nodes off and on), stopping at its cap or at the first run that fails rather than completes. Written and dry-run tested; not yet run.
+- [x] **6.11 When the model is the slow part.** Three changes for model-bound runs, none of which touches what makes speculation safe: `specunode.core.loop.agent_loop` (every result of a reply back in one message, the reply echoed back unchanged, thinking blocks included); prompt caching on by default (`target.cache`); and parallel nodes (a router may name several nodes; they run side by side and retire in the order named). `bench/offline/run_model_bound.py` measures the runtime's side against a stand-in (`bench/results/model_bound.json`); `bench/online/run_model_bound.py` measures a real model (`bench/results/model_bound_online.json`): seven configurations round-robin, 15 rounds, stopping at its cap or at the first run that fails.
+  *Result, against `claude-sonnet-5`:* the same on-call task went from 11 replies to 5 — 35.4% less time and, with caching, 77.7% less cost; three independent checks side by side took 60.2% less time than one after another; caching alone cut the bill by 72.7% and did not change the time at this prompt size. Every run correct, 15 of 15 in each configuration; no leaks. Told nothing, the model already asks for independent calls together; the one-call arm is held to one by the API's `disable_parallel_tool_use`.
 
 **Phase Gate 6:** opportunity + latency + overhead results committed with CIs; `RESULTS.md` generated; the anti-results (workloads where speculation buys ≤ 5% or is disabled by policy) are in the README with the same prominence as the wins.
 
@@ -1034,6 +1034,8 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [6.11] DEFECT (fixed): the parallel-group write-conflict check ran only when every body had finished, which is exactly when nothing staged is left to protect. It runs when every body is at rest, again before each node's writes leave, and at commit; the tests pin what each point can and cannot see. — 2026-09-23
 [6.11] DEFECT (fixed): a node refused at retirement for a stale witnessed read was reported as "failed after its effects were dispatched", on the sequential path and the parallel one. Nothing of it had been sent. — 2026-09-23
 [6.11] DEFECT (fixed): the shipped example config set temperature: 0.0 for claude-sonnet-5, which answers any temperature with a 400, so everyone who copied it would have failed on their first request. — 2026-09-23
+[6.11] DEFECT (fixed, before it cost the budget): the first real round of the online run came back with every incident cell identical -- five replies, ten calls, whatever the prompt said. Told to make one call per reply, the model batched anyway, so the "before" arm was running the "after" behaviour. Stopped in round two after nine runs ($0.19); the one-call style now sets the API's disable_parallel_tool_use. A per-run progress line is what made it visible in time. — 2026-09-23
+[6.11] Real-model result, claude-sonnet-5, 15 rounds, $2.33: 11 replies to 5, 35.4% less time, 77.7% less cost with caching; parallel nodes 60.2% less time; caching alone -72.7% cost and no resolved change in time; 105 runs, all correct, no leaks. Told nothing, the model batches independent calls by itself: what held runs at one call per reply was the app. — 2026-09-23
 [6.6] DEFECT (fixed): the traceability check read only a results file's values, so the settings a file is keyed by -- latency rungs, accuracy levels -- could not be traced. Keys that are numbers outright count now; digits inside a key's name do not. — 2026-09-23
 ```
 
@@ -1129,8 +1131,9 @@ runtime, and guessing on top of it adds nothing any interval resolves (6.8). A g
 controlled accuracy is worth at most +4.8% even when always right, because a guess runs at most
 one block ahead of the model (6.9), and a real draft model is right 6.9% of the time (6.10). So
 speculation's measured contribution is safety, not speed. When the model is the slow part, the
-levers are fewer replies and replies side by side (6.11) — built, tested, and measured so far
-only against a stand-in.
+levers are fewer replies and replies side by side (6.11), and those are measured against a
+real model: the same on-call task in 5 replies instead of 11, 35.4% less time and 77.7% less
+cost; three independent checks side by side, 60.2% less time.
 
 ### The anti-results
 
@@ -1394,8 +1397,8 @@ accept that the clause holds only for clients that report node ids.
 ### Manual steps left for you
 
 1. **Done, 2026-09-18:** a key was supplied and the real-model runs in 6.4, 6.8 and 6.10 were
-   made, each under its cap and each recording its spend in its results file. Still to pay for:
-   re-running 6.4 with the corrected arms, and 6.11 against a real model. The original
+   made, each under its cap and each recording its spend in its results file, and 6.11 on
+   2026-09-23. Still to pay for: re-running 6.4 with the corrected arms. The original
    instructions follow.
 
    **An Anthropic API key and a spend cap**, for the online latency benchmark (task 6.4). Set

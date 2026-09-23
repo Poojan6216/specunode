@@ -404,10 +404,68 @@ def build_story(styles: Any) -> list[Any]:
             )
         table(rows)
         totals = bound["totals"]
+        online = load("model_bound_online.json")
+        measured = online is not None and online.get("is_real_model")
         para(
             f"Correct runs: {totals['correct']} of {totals['runs']}. Effects from a branch that "
-            f"never retired: {totals['leaks']}. What a real model does when told it may ask for "
-            "several calls at once, and what prompt caching saves, are not measured yet."
+            f"never retired: {totals['leaks']}. "
+            + (
+                "Section 10 is the same against a real model."
+                if measured
+                else "What a real model does when told it may ask for several calls at once, "
+                "and what prompt caching saves, are not measured yet."
+            )
+        )
+    para("10. The same, against a real model", h2)
+    online = load("model_bound_online.json")
+    if online is None or not online.get("is_real_model"):
+        para("Not measured against a real model.")
+    else:
+        cells = online["cells"]
+        para(
+            f"<font face='Courier'>{online['target_model']}</font>, "
+            f"{online['runs_requested']} rounds, one run of each configuration per round. One "
+            "call per reply is enforced with the API's disable_parallel_tool_use: asked in the "
+            "prompt alone, the model batched its calls anyway."
+        )
+        rows = [["Configuration", "Replies", "Calls/reply", "Wall clock", "Cost/run", "Correct"]]
+        labels = (
+            ("one_call/no_cache", "One call, no cache (before)"),
+            ("one_call/cache", "One call, cached"),
+            ("parallel/no_cache", "Several calls, no cache"),
+            ("parallel/cache", "Several calls, cached (after)"),
+            ("default/cache", "No guidance, cached"),
+        )
+        for key, label in labels:
+            cell = cells.get(key) or {}
+            if not cell.get("n"):
+                continue
+            rows.append(
+                [
+                    label,
+                    f"{cell['replies_mean']:.1f}",
+                    f"{cell['calls_per_reply']:.2f}",
+                    f"{cell['wall_ms_mean']:.0f} ms",
+                    f"${cell['usd_per_run']:.4f}",
+                    f"{cell['correct']} of {cell['n']}",
+                ]
+            )
+        table(rows)
+        rows = [["Change", "Wall clock saved", "Cost saved"]]
+        for key, label in (
+            ("caching", "Caching alone"),
+            ("multi_call_replies", "Several calls per reply"),
+            ("before_to_after", "Before to after"),
+            ("parallel_nodes", "Parallel nodes"),
+        ):
+            comparison = online["comparisons"].get(key) or {}
+            cost = band(comparison.get("cost_saving_ci95")) if key != "parallel_nodes" else "--"
+            rows.append([label, band(comparison.get("wall_saving_ci95")), cost])
+        table(rows)
+        leaks = sum(int(cell.get("leaks", 0)) for cell in cells.values())
+        para(
+            f"Spend ${online['estimated_spend_usd']}. Effects from a branch that never retired: "
+            f"{leaks}."
         )
     return story
 
