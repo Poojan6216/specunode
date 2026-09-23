@@ -4,13 +4,17 @@
 against a stand-in whose timings are settings. This measures what a real model does:
 
 **Does it ask for several calls at once when invited to?** ``examples/incident_agent`` under
-three prompts: ``one_call`` (how every turn in the corpus behaves), ``default`` (says nothing
-either way, so it measures the model's own habit) and ``parallel`` (Anthropic's guidance for
-independent calls). Counted: replies, calls per reply, and whether the run changed the world
-exactly as a correct run does.
+three prompts: ``one_call`` (how every turn in the corpus behaves -- enforced with the API's
+``disable_parallel_tool_use``, because a first attempt at this benchmark found that asking in
+the prompt did not stop the model batching), ``default`` (says nothing either way, so it
+measures the model's own habit) and ``parallel`` (Anthropic's guidance for independent calls).
+Counted: replies, calls per reply, and whether the run changed the world exactly as a correct
+run does.
 
 **What does prompt caching save?** The same agent with ``cache`` off and on -- its wall clock,
-and its bill from the usage the API reports.
+and its bill from the usage the API reports. Runs of one configuration follow each other well
+inside the cache's five-minute lifetime, so from the second round on a run starts with its
+system prompt already cached: the steady state of an agent that works more than one alert.
 
 **What do parallel nodes save?** ``examples/fanout_agent`` with ``parallel_nodes`` off and on.
 
@@ -213,20 +217,31 @@ def summarise(cell: Cell, rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
-async def measure(kind: str, runs: int, spend: Spend) -> dict[str, Any]:
+async def measure(kind: str, runs: int, spend: Spend, *, progress: bool = False) -> dict[str, Any]:
     rows: dict[str, list[dict[str, Any]]] = {cell.name: [] for cell in CELLS}
     halted_at: str | None = None
     failure: str | None = None
     for round_index in range(runs):
         for cell in CELLS:
             try:
-                rows[cell.name].append(await run_cell(cell, kind, spend))
+                row = await run_cell(cell, kind, spend)
             except BudgetExceeded:
                 halted_at = f"round {round_index + 1}, {cell.name}"
                 break
             except RunFailed as exc:
                 failure = f"round {round_index + 1}: {exc}"
+                if progress:
+                    print(f"  FAILED {failure}", flush=True)
                 break
+            rows[cell.name].append(row)
+            if progress:
+                # A paid run takes minutes; the first round is the one worth watching.
+                print(
+                    f"  r{round_index + 1:02d} {cell.name:20s} {row['wall_ms']:8.0f} ms  "
+                    f"replies={row.get('replies', '-')} calls={row.get('calls', '-')} "
+                    f"correct={row['correct']} ${row['usd']:.4f}  total ${spend.usd:.3f}",
+                    flush=True,
+                )
         if halted_at or failure:
             break
     cells = {cell.name: summarise(cell, rows[cell.name]) for cell in CELLS}
@@ -274,7 +289,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     spend = Spend(cap_usd=args.budget, prices_per_mtok=prices_for(args.target_model))
     started = time.monotonic()
-    measured = asyncio.run(measure(args.model, args.runs, spend))
+    measured = asyncio.run(measure(args.model, args.runs, spend, progress=True))
     report = {
         "bench": "model_bound_online",
         "is_real_model": args.model == "anthropic",

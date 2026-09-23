@@ -15,6 +15,12 @@ durable. None of that changes with the prompting style -- only how many turns th
 agent trajectories in ``bench/corpus`` behave: every turn in them makes exactly one call.
 ``default`` says nothing either way, so it measures the model's own habit. ``parallel`` gives
 the guidance Anthropic's tool-use documentation gives for independent calls.
+
+``one_call`` is enforced, not only asked for. Told in its system prompt to make exactly one
+call per reply, Claude Sonnet 5 asked for several at once anyway -- ten calls in five replies,
+the same as with no guidance at all -- so a benchmark that relied on the prompt compared the
+treatment with itself. The style also sets the API's own switch, ``disable_parallel_tool_use``,
+which is what an app that runs one call per reply effectively has.
 """
 
 from __future__ import annotations
@@ -180,12 +186,18 @@ def system_prompt(style: str) -> str:
     return OPERATING_GUIDE if not guidance else f"{OPERATING_GUIDE}\n\n## Tool calls\n\n{guidance}"
 
 
+#: The API's switch for at most one tool call per reply. Part of the request hash, like
+#: everything else the model is asked, so a replay notices if it changes.
+ONE_CALL_PER_REPLY: Mapping[str, JsonValue] = {"type": "auto", "disable_parallel_tool_use": True}
+
+
 def envelope(style: str) -> RequestEnvelope:
     return RequestEnvelope(
         model=target_model(),
         system=(TextBlock(text=system_prompt(style)),),
         messages=(Message(role="user", content=(TextBlock(text=TASK),)),),
         tools=TOOL_DEFS,
+        tool_choice=ONE_CALL_PER_REPLY if style == "one_call" else None,
         max_tokens=MAX_TOKENS,
         stream=True,
     )

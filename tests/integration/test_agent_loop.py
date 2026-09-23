@@ -196,3 +196,22 @@ async def test_a_loop_replays_against_its_own_journal() -> None:
 def test_the_final_reply_is_prose_and_ends_the_loop() -> None:
     last = scripted_replies("parallel")[-1]
     assert not last.tool_uses and isinstance(last.content[0], TextBlock)
+
+
+def test_one_call_per_reply_is_enforced_by_the_api_not_only_asked_for() -> None:
+    """Told in the prompt alone, a real model still asked for several calls per reply, so the
+    benchmark's "before" arm was running the "after" behaviour. The API's switch is what holds."""
+    from examples.incident_agent.agent import ONE_CALL_PER_REPLY, envelope
+
+    from specunode.core.model import request_hash
+    from specunode.integrations.anthropic import envelope_to_params
+
+    one = envelope("one_call")
+    assert one.tool_choice == {"type": "auto", "disable_parallel_tool_use": True}
+    assert envelope_to_params(one)["tool_choice"] == dict(ONE_CALL_PER_REPLY)
+    assert envelope("parallel").tool_choice is None
+    assert envelope("default").tool_choice is None
+    # Part of what the model is asked, so replay refuses a run recorded without it.
+    from dataclasses import replace
+
+    assert request_hash(one) != request_hash(replace(one, tool_choice=None))
