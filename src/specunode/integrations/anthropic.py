@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from specunode.canonical import JsonValue
+from specunode.canonical import JsonValue, canonical
 from specunode.core.model import (
     ContentBlock,
     ModelError,
@@ -60,18 +60,31 @@ def block_to_api(block: ContentBlock) -> JsonValue:
         case ToolUseBlock(id=block_id, name=name, args=args):
             return {"type": "tool_use", "id": block_id, "name": name, "input": dict(args)}
         case ToolResultBlock(tool_use_id=use_id, content=content, is_error=is_error):
+            # JSON, not ``str()``. A structured result used to reach the model as Python's
+            # repr -- single quotes, ``True``, ``None`` -- which is not the format the model
+            # was trained to read tool output in, and nothing else in this project speaks.
+            # Canonical, so the same result is always the same bytes and a cached prefix that
+            # contains it stays cacheable.
             return {
                 "type": "tool_result",
                 "tool_use_id": use_id,
                 "content": content
                 if isinstance(content, str)
-                else [{"type": "text", "text": str(content)}],
+                else [{"type": "text", "text": canonical(content).decode("utf-8")}],
                 "is_error": is_error,
             }
 
 
-def envelope_to_params(envelope: RequestEnvelope) -> dict[str, JsonValue]:
-    """Translate an envelope into Messages API parameters. Adds nothing of its own."""
+def envelope_to_params(envelope: RequestEnvelope, *, cache: bool = False) -> dict[str, JsonValue]:
+    """Translate an envelope into Messages API parameters.
+
+    ``cache`` adds the one thing this function contributes of its own: top-level automatic
+    prompt caching, which caches the request up to its last cacheable block. It is transport,
+    not content -- it changes what the call costs and how fast the model starts answering, not
+    what the model is asked -- so it is excluded from the request hash the journal and replay
+    compare, exactly as ``stream`` is. An agent loop re-sends its whole growing conversation on
+    every turn, and without this every one of those turns was processed from the first token.
+    """
     params: dict[str, JsonValue] = {
         "model": envelope.model,
         "max_tokens": envelope.max_tokens,
@@ -88,6 +101,8 @@ def envelope_to_params(envelope: RequestEnvelope) -> dict[str, JsonValue]:
             {"name": t.name, "description": t.description, "input_schema": dict(t.input_schema)}
             for t in envelope.tools
         ]
+    if cache:
+        params["cache_control"] = {"type": "ephemeral"}
     if envelope.tool_choice is not None:
         params["tool_choice"] = dict(envelope.tool_choice)
     if envelope.temperature is not None:
@@ -163,7 +178,13 @@ class AnthropicModel:
         base_url: str | None = None,
         client: AsyncAnthropic | None = None,
         max_retries: int = 2,
+        cache: bool = True,
     ) -> None:
+        #: Prompt caching, on by default. Every agent loop re-sends a growing prefix, which is
+        #: the case caching exists for; a prompt below the model's minimum (1,024 tokens on
+        #: Claude Sonnet 5) is simply not cached, so the default costs nothing where it cannot
+        #: help. Off is for measuring what it is worth.
+        self.cache = cache
         if client is not None:
             self._client = client
             return
@@ -195,7 +216,7 @@ class AnthropicModel:
     # deliberate; the alternative of leaving the package uninstalled is how a whole file
     # escapes the type checker while appearing to pass it.
     def _params(self, envelope: RequestEnvelope) -> Any:
-        return cast(Any, envelope_to_params(envelope))
+        return cast(Any, envelope_to_params(envelope, cache=self.cache))
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
         raw = await self._client.messages.create(**self._params(envelope))

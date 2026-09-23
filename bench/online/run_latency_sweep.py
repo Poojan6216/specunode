@@ -44,6 +44,7 @@ from bench.online.run_latency import (
     TaskResult,
     build_target,
     difference_ci,
+    prices_for,
     run_one,
 )
 from bench.workloads import WORKLOADS, Workload
@@ -151,7 +152,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
     ladder = [int(value) for value in str(args.ladder).split(",") if value.strip()]
     cap = float(os.environ.get("SPECUNODE_BENCH_BUDGET_USD", DEFAULT_BUDGET_USD))
-    spend = Spend(cap_usd=cap)
+    spend = Spend(cap_usd=cap, prices_per_mtok=prices_for(args.target_model))
     target = MeteredModel(inner=build_target(args.model), spend=spend)
 
     started = time.monotonic()
@@ -168,6 +169,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         "halted_at": halted,
         "budget_usd_cap": cap,
         "estimated_spend_usd": round(spend.usd, 4),
+        "prices_per_mtok_usd": dict(spend.prices_per_mtok),
         "wall_seconds": round(time.monotonic() - started, 1),
         "points": points,
     }

@@ -1,10 +1,11 @@
 name: nightly-online
 
-# The online latency benchmark calls a real target model and therefore costs money.
-# It runs only when ANTHROPIC_API_KEY is configured, and halts at the spend cap
-# (SPECUNODE_BENCH_BUDGET_USD, default 25). Decision Gate D2: if the cap is hit before
-# 30 tasks per app, the report records the reduced n and its wider CI. The cap is never
-# raised silently.
+# The online benchmarks call real models and therefore cost money. They run only when
+# ANTHROPIC_API_KEY is configured. The input budget is the ceiling for the WHOLE job and is
+# split between the three benchmarks below: each script enforces its own cap, so giving every
+# one the full budget would let the job spend three times what was asked. Decision Gate D2:
+# a benchmark that reaches its share records the reduced n and its wider interval. A cap is
+# never raised silently.
 on:
   schedule: [{ cron: "0 5 * * 0" }]
   workflow_dispatch:
@@ -43,9 +44,35 @@ jobs:
       # tier-2 local drafter is exercised by its own job where a wheel exists.
       - run: uv sync --extra anthropic --extra langgraph --extra mcp --extra postgres --extra bench --dev
         if: steps.gate.outputs.run == 'true'
+      - name: split the budget between the three benchmarks
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_ENV"
+          import os
+          total = float(os.environ["SPECUNODE_BENCH_BUDGET_USD"])
+          for name, share in (("LATENCY", 0.2), ("SWEEP", 0.5), ("TIER2", 0.3)):
+              print(f"BUDGET_{name}={total * share:.2f}")
+          EOF
       - name: online latency bench, budget-capped
         if: steps.gate.outputs.run == 'true'
-        run: uv run python bench/online/run_latency.py --out bench/results/latency.json
+        run: >-
+          SPECUNODE_BENCH_BUDGET_USD=$BUDGET_LATENCY
+          uv run python bench/online/run_latency.py --tasks 20 --out bench/results/latency.json
+      - name: tool-latency sweep, budget-capped
+        if: steps.gate.outputs.run == 'true'
+        run: >-
+          SPECUNODE_BENCH_BUDGET_USD=$BUDGET_SWEEP
+          uv run python bench/online/run_latency_sweep.py --tasks 20 --ladder 0,500,2000
+          --out bench/results/sweep.json
+      - name: undigested corpus values for the draft model (network, no model cost)
+        if: steps.gate.outputs.run == 'true'
+        run: uv run python bench/corpus/fetch.py --values --full
+      - name: tier-2 acceptance, budget-capped
+        if: steps.gate.outputs.run == 'true'
+        run: >-
+          SPECUNODE_BENCH_BUDGET_USD=$BUDGET_TIER2
+          uv run python bench/online/run_tier2_acceptance.py --sample 1000
+          --out bench/results/tier2.json
       - name: regenerate RESULTS.md
         if: steps.gate.outputs.run == 'true'
         run: |
@@ -57,4 +84,6 @@ jobs:
           name: online-results
           path: |
             bench/results/latency.json
+            bench/results/sweep.json
+            bench/results/tier2.json
             RESULTS.md

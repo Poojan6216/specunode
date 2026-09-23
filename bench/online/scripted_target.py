@@ -37,6 +37,10 @@ class ScriptedTarget:
 
     calls: int = 0
     _served: dict[str, int] = field(default_factory=dict)
+    #: Milliseconds before each block. The module default keeps the arms distinguishable at
+    #: all; the break-even benchmark sets it to a real model's per-block streaming time, which
+    #: is the window a guess can run ahead in.
+    think_ms: float = THINK_MS
 
     def _turn_for(self, envelope: RequestEnvelope) -> ModelResponse:
         offered = {tool.name for tool in envelope.tools}
@@ -59,7 +63,7 @@ class ScriptedTarget:
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
         self.calls += 1
-        await asyncio.sleep(THINK_MS / 1000.0)
+        await asyncio.sleep(self.think_ms / 1000.0)
         return self._turn_for(envelope)
 
     async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
@@ -67,7 +71,7 @@ class ScriptedTarget:
         response = self._turn_for(envelope)
         index = 0
         for block in response.content:
-            await asyncio.sleep(THINK_MS / 1000.0)
+            await asyncio.sleep(self.think_ms / 1000.0)
             if getattr(block, "name", None) is not None:
                 yield ToolUseComplete(index=index, block=block)  # type: ignore[arg-type]
                 index += 1

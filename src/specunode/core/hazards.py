@@ -80,6 +80,7 @@ class Hazard(Enum):
     READ_AFTER_STAGED_WRITE = "read touches a key a staged write touches; no forwarding"
     BUDGET = "speculation depth or in-flight limit reached"
     IRREVERSIBLE_ON_PATH = "irreversible effect would need staging"
+    WRITE_ON_PATH = "a write would need staging, and this policy speculates on reads only"
     MODEL_TURN_AFTER_STAGED_WRITE = "next model call would contain a placeholder"
     #: Added beyond the spec's eight. A predicted route into a node the adapter cannot run
     #: speculatively must be *named* rather than silently not attempted, or the benchmark's
@@ -221,6 +222,15 @@ def analyse(
         and branch.status is BranchStatus.SPECULATIVE
     ):
         return Hazard.IRREVERSIBLE_ON_PATH
+    if (
+        spec.effect is not EffectClass.READ
+        and not policy.speculate_writes
+        # As above: only a guess is refused. The model's own decision to write is never
+        # stopped by a policy about what may be *predicted*.
+        and branch.status is BranchStatus.SPECULATIVE
+        and branch.predicted is not None
+    ):
+        return Hazard.WRITE_ON_PATH
     if spec.effect is EffectClass.READ and staged_keys:
         touched = keys_touched(spec, next_call.args)
         if any(keys_conflict(touched, staged) for staged in staged_keys):

@@ -8,12 +8,12 @@
   },
   "bench": "tier2_acceptance",
   "budget_usd_cap": 4.0,
-  "draft_calls": 428,
+  "draft_calls": 1000,
   "draft_model": "claude-haiku-4-5",
   "eligible_positions": 1000,
-  "estimated_spend_usd": 4.0074,
+  "estimated_spend_usd": 3.0429,
   "grader": "specunode.verify.gate.resolve_decision",
-  "halted_on_budget": true,
+  "halted_on_budget": false,
   "history_window": 12,
   "is_real_model": true,
   "policy": "across_turns",
@@ -23,33 +23,33 @@
     "output": 5.0
   },
   "result": {
-    "acceptance_given_offered": 0.0625,
-    "acceptance_rate": 0.0607,
+    "acceptance_given_offered": 0.0705,
+    "acceptance_rate": 0.069,
     "acceptance_rate_ci95": {
-      "ci95_high": 0.0841,
-      "ci95_low": 0.0397,
-      "mean": 0.0607
+      "ci95_high": 0.086,
+      "ci95_low": 0.054,
+      "mean": 0.069
     },
-    "accepted": 26,
+    "accepted": 69,
     "by_effect": {
       "read": {
         "accepted": 0,
-        "steps": 16
+        "steps": 32
       },
       "write": {
-        "accepted": 26,
-        "steps": 412
+        "accepted": 69,
+        "steps": 968
       }
     },
-    "offered": 416,
-    "offered_rate": 0.972,
-    "right_tool": 0.4673,
-    "right_tool_wrong_arguments": 0.4065,
-    "steps_graded": 428,
-    "unparsable": 12
+    "offered": 979,
+    "offered_rate": 0.979,
+    "right_tool": 0.473,
+    "right_tool_wrong_arguments": 0.404,
+    "steps_graded": 1000,
+    "unparsable": 21
   },
   "sample_requested": 1000,
   "seed": 20260918,
   "values": "values_full.json",
-  "wall_seconds": 1368.2
+  "wall_seconds": 3384.9
 }

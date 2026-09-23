@@ -171,6 +171,11 @@ async def validate_reads(branch: Branch, registry: ToolRegistry) -> ReadValidati
     the witness it was given, and reported under its own verdict. Only the waiting is shared.
     The verdicts keep the read set's order -- ``asyncio.gather`` preserves it -- because the
     ledger renders them and the equivalence relation compares them.
+
+    The price of the concurrency is that the probes arrive at an upstream as a burst rather
+    than one at a time. An upstream that rate-limits them fails some, and a failed probe is
+    reported ``unreadable`` -- counted, journaled and rendered, never assumed fresh -- and then
+    handled by ``Policy.on_unverifiable_read``. Where that matters, set it to ``"squash"``.
     """
     records = list(branch.reads_to_validate())
     probes: list[tuple[int, ReadRecord, ToolSpec]] = []

@@ -56,7 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from bench.corpus.effect_classes import effect_of
 from bench.offline.run_acceptance import Call, load_joined
 from bench.offline.run_opportunity import bootstrap_ci
-from bench.online.run_latency import Spend
+from bench.online.run_latency import Spend, prices_for
 from specunode.canonical import JsonValue
 from specunode.core.branch import BranchStatus
 from specunode.core.decision import ToolCall
@@ -322,7 +322,9 @@ async def main(argv: Sequence[str] | None = None) -> int:
     cap = float(os.environ.get("SPECUNODE_BENCH_BUDGET_USD", DEFAULT_BUDGET_USD))
     # Haiku-class prices, because that is what this benchmark bills against. The class
     # defaults to the target model's table, which is three times these.
-    spend_prices = dict(PRICE_PER_MTOK)
+    spend_prices = (
+        prices_for(args.draft_model) if args.model == "anthropic" else dict(PRICE_PER_MTOK)
+    )
     spend = Spend(cap_usd=cap, prices_per_mtok=spend_prices)
 
     client = _Metered(inner=build_client(args.model, args.draft_model), spend=spend)

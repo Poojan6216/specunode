@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from specunode.canonical import JsonValue
 from specunode.core.effects import EffectClass, ToolSpec, forward_keys_from_template
-from specunode.core.policy import Policy, StaleReadAction
+from specunode.core.policy import Policy, StaleReadAction, UnverifiableReadAction
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -80,6 +80,9 @@ class TargetConfig(_Model):
     #: ``None`` means "do not send one". The current models reject sampling parameters, so a
     #: default of 0.0 here would put a 400 in front of anyone who read these defaults.
     temperature: float | None = None
+    #: Prompt caching for every request to this target. On by default: an agent loop re-sends
+    #: its whole conversation each turn, and a prefix too short to cache simply is not.
+    cache: bool = True
 
     def envelope_defaults(self) -> dict[str, JsonValue]:
         """Defaults for application code that builds its own ``RequestEnvelope``.
@@ -132,6 +135,13 @@ class PolicyConfig(_Model):
     alpha_floor: float | None = None
     stage_irreversible: bool = False
     on_stale_read: StaleReadAction = "squash"
+    # Three knobs the runtime grew without the config learning them, so a YAML file naming
+    # any of them was rejected by ``extra="forbid"``. A test now holds this model and
+    # ``Policy`` to the same field set, so the next one cannot be missed the same way.
+    on_unverifiable_read: UnverifiableReadAction = "proceed"
+    early_issue: bool = True
+    speculate_writes: bool = True
+    parallel_nodes: bool = True
 
     def to_policy(self) -> Policy:
         return Policy(**self.model_dump())

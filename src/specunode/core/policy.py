@@ -60,6 +60,17 @@ class Policy:
     alpha_window: int = 20
     #: None means "use the break-even measured for this workload" rather than a guess.
     alpha_floor: float | None = None
+    #: False is PASTE's rule: speculate on reads, and treat any predicted write as a barrier
+    #: rather than something to stage. It exists so the benchmark can compare against the
+    #: prior work honestly -- its "read-only speculation" arm used to be ``speculation=True``
+    #: with no predictor at all, which forks nothing and is the sequential arm under another
+    #: name, so the one comparison this project's thesis rests on was made against nothing.
+    speculate_writes: bool = True
+    #: Whether nodes a graph declares independent (``Parallel``) run side by side or one after
+    #: another. Either way they fork from the same state, draw the same program positions and
+    #: idempotency keys, and retire in the order declared -- so the two settings produce the
+    #: same ledger, and only the wall clock differs. Off exists to prove that.
+    parallel_nodes: bool = True
     #: Default off: an irreversible effect is a barrier, not something to stage. Turning it
     #: on is legitimate and is measured in attack 7.9, and the docs say why it is not default.
     stage_irreversible: bool = False

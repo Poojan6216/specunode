@@ -637,3 +637,46 @@ async def test_a_resolution_and_its_alpha_event_name_the_same_branch_and_step(
         assert event["step"] == resolutions[str(branch_id)], (
             "the alpha event and the resolution disagree about the step"
         )
+
+
+@pytest.mark.timeout(60)
+async def test_a_failed_turn_leaves_nothing_running_and_nothing_after_run_finished(
+    tmp_path: Path,
+) -> None:
+    """A run that has reported failure must not still be touching the world, or the journal.
+
+    A turn whose stream raised left its early-issued reads running. They reached upstream after
+    the run had returned, and each appended a ``tool_result`` after ``run_finished`` -- the
+    entry every reader of a run, recovery included, takes to be the last one.
+    """
+    world = standard_world()
+    world.faults.slow("read", 200)
+    registry = registry_for(world)
+    journal = Journal(tmp_path / "abandoned.db")
+    scheduler = Scheduler(
+        graph=OneTurnGraph(),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+        target=JournaledModel(
+            _FailingStream(turns=[tool_turn(*TURN, turn=0)], block_delay_ms=5.0),
+            journal,
+            provider="scripted",
+        ),
+        policy=Policy(speculation=False),
+    )
+    run_id = new_ulid()
+    result = await scheduler.run(run_id, {})
+    assert not result.ok
+    reads_when_returned = len(world.reads)
+
+    others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    assert not [t for t in others if not t.done()], "a failed run left a task running"
+
+    await asyncio.sleep(0.4)  # long enough for an orphaned 200 ms read to have landed
+    assert len(world.reads) == reads_when_returned, "a read reached upstream after the run ended"
+    kinds = [entry.kind for entry in journal.read(run_id)]
+    assert kinds[-1] == "run_finished", (
+        f"entries after run_finished: {kinds[kinds.index('run_finished') :]}"
+    )

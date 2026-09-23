@@ -30,7 +30,16 @@ target:
   model: claude-sonnet-5
   # base_url: https://api.anthropic.com
   max_tokens: 4096
-  temperature: 0.0
+  # Sampling parameters are sent only when set, and Claude Sonnet 5 and Opus 5 reject
+  # temperature, top_p and top_k outright (HTTP 400). Leave this unset for them.
+  # temperature: 0.0
+  # Prompt caching. The stable front of every request -- tool definitions, system prompt,
+  # the conversation so far -- is marked for the provider's cache, so each later turn of an
+  # agent loop re-reads it at a tenth of the input price and starts sooner. A prefix shorter
+  # than the model's minimum (1024 tokens on Sonnet 5, 4096 on Haiku 4.5) is simply not
+  # cached. Keep the system prompt identical across requests: a timestamp at its top makes
+  # every request a miss.
+  cache: true
 
 drafters:
   # Tier 0: early-issue. Each tool_use block is dispatched as soon as it finishes parsing
@@ -71,6 +80,16 @@ policy:
   stage_irreversible: false
   # What to do when a witnessed read went stale between speculation and confirmation.
   on_stale_read: squash # squash | stall
+  # What to do when a witnessed read cannot be re-checked at all -- the probe raised.
+  on_unverifiable_read: proceed # proceed | squash
+  # Issue a read the moment its tool_use block finishes parsing, instead of waiting for the
+  # turn to end. This is where the measured speedup comes from; off means strictly sequential.
+  early_issue: true
+  # false is PASTE's rule: speculate on reads, and treat a predicted write as a barrier.
+  speculate_writes: true
+  # Nodes a graph declares independent run side by side; they still retire in the order
+  # declared, so turning this off changes the wall clock and nothing else.
+  parallel_nodes: true
 
 tools:
   # Declarations for tools whose own annotations are absent or wrong. This table wins over

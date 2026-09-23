@@ -277,7 +277,7 @@ async def test_replay_reproduces_every_response(tmp_path: Path) -> None:
     assert replay.steps == (0, 1, 2)
     replayed = []
     for step, env in enumerate(envelopes):
-        with scoped(CallScope(run_id=RUN, step=step)):
+        with scoped(CallScope(run_id=RUN, node_id="agent", step=step)):
             replayed.append(await replay.complete(env))
     assert [response_to_json(r) for r in replayed] == [response_to_json(r) for r in original]
 
@@ -289,7 +289,7 @@ async def test_replay_never_calls_a_model(tmp_path: Path) -> None:
     calls_before = model.calls
 
     replay = ReplayModel(journal=journal, run_id=RUN)
-    with scoped(CallScope(run_id=RUN, step=0)):
+    with scoped(CallScope(run_id=RUN, node_id="agent", step=0)):
         await replay.complete(envelope())
     assert model.calls == calls_before
 
@@ -307,11 +307,14 @@ async def test_a_changed_request_diverges_at_that_step_and_writes_nothing_furthe
 
     replay = ReplayModel(journal=journal, run_id=RUN)
     for step in (0, 1):
-        with scoped(CallScope(run_id=RUN, step=step)):
+        with scoped(CallScope(run_id=RUN, node_id="agent", step=step)):
             await replay.complete(envelopes[step])
 
     tampered = replace(envelopes[2], system=(TextBlock(text="You help with support tickets!"),))
-    with scoped(CallScope(run_id=RUN, step=2)), pytest.raises(ReplayDivergence) as caught:
+    with (
+        scoped(CallScope(run_id=RUN, node_id="agent", step=2)),
+        pytest.raises(ReplayDivergence) as caught,
+    ):
         await replay.complete(tampered)
 
     assert caught.value.step == 2
@@ -325,7 +328,10 @@ async def test_a_changed_tool_list_diverges_at_the_first_step(tmp_path: Path) ->
 
     extra = ToolDef(name="send_email", description="email", input_schema={"type": "object"})
     replay = ReplayModel(journal=journal, run_id=RUN)
-    with scoped(CallScope(run_id=RUN, step=0)), pytest.raises(ReplayDivergence) as caught:
+    with (
+        scoped(CallScope(run_id=RUN, node_id="agent", step=0)),
+        pytest.raises(ReplayDivergence) as caught,
+    ):
         await replay.complete(envelope(tools=(*envelope().tools, extra)))
     assert caught.value.step == 0
     assert any("send_email" in note for note in caught.value.diff)
@@ -335,8 +341,46 @@ async def test_replay_refuses_a_step_the_journal_does_not_have(tmp_path: Path) -
     journal = Journal(tmp_path / "j.db")
     await _drive(journal, ScriptedModel(turns=[tool_turn(("a", {}))]), [envelope()])
     replay = ReplayModel(journal=journal, run_id=RUN)
-    with scoped(CallScope(run_id=RUN, step=9)), pytest.raises(ReplayExhausted):
+    with scoped(CallScope(run_id=RUN, node_id="agent", step=9)), pytest.raises(ReplayExhausted):
         await replay.complete(envelope())
+
+
+async def test_replay_serves_a_node_only_the_turns_that_node_made(tmp_path: Path) -> None:
+    """Keyed by node as well as position, because two nodes can make a call from one position.
+
+    Running side by side, two nodes each make their first call from the same program position.
+    An index keyed by position alone would hand one node's recorded reply to the other -- a
+    replay that "succeeds" by answering the wrong question.
+    """
+    journal = Journal(tmp_path / "j.db")
+    await _drive(journal, ScriptedModel(turns=[tool_turn(("a", {}))]), [envelope()])
+    replay = ReplayModel(journal=journal, run_id=RUN)
+    with scoped(CallScope(run_id=RUN, node_id="another", step=0)), pytest.raises(ReplayExhausted):
+        await replay.complete(envelope())
+
+
+async def test_replay_serves_several_turns_from_one_position_in_the_order_they_were_made(
+    tmp_path: Path,
+) -> None:
+    """A node running a conversation makes several calls from one position; replay kept one.
+
+    The index held a single turn per step, so every turn but the last was overwritten, and a
+    replay of a multi-turn node diverged on its very first request.
+    """
+    journal = Journal(tmp_path / "j.db")
+    first, second = envelope(), replace(envelope(), max_tokens=17)
+    model = JournaledModel(
+        ScriptedModel(turns=[tool_turn(("a", {})), tool_turn(("b", {}))]), journal
+    )
+    with scoped(CallScope(run_id=RUN, branch_id="br-canon", step=0, node_id="agent")):
+        await model.complete(first)
+        await model.complete(second)
+    replay = ReplayModel(journal=journal, run_id=RUN)
+    with scoped(CallScope(run_id=RUN, node_id="agent", step=0)):
+        assert (await replay.complete(first)).tool_uses[0].name == "a"
+        assert (await replay.complete(second)).tool_uses[0].name == "b"
+        with pytest.raises(ReplayExhausted):
+            await replay.complete(second)
 
 
 async def test_replay_streams_the_journaled_blocks(tmp_path: Path) -> None:
@@ -344,7 +388,7 @@ async def test_replay_streams_the_journaled_blocks(tmp_path: Path) -> None:
     await _drive(journal, ScriptedModel(turns=[tool_turn(("a", {}), ("b", {}))]), [envelope()])
     replay = ReplayModel(journal=journal, run_id=RUN)
     events = []
-    with scoped(CallScope(run_id=RUN, step=0)):
+    with scoped(CallScope(run_id=RUN, node_id="agent", step=0)):
         async for event in replay.stream(envelope()):
             events.append(event)
     assert sum(isinstance(e, ToolUseComplete) for e in events) == 2

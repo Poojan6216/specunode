@@ -1,0 +1,169 @@
+{
+  "bench": "model_bound",
+  "branches": {
+    "0": {
+      "one_at_a_time": {
+        "correct": 5,
+        "in_flight_max": 1,
+        "leaks": 0,
+        "n": 5,
+        "wall_ms": [
+          6344.5,
+          6345.9,
+          6352.6,
+          6350.8,
+          6356.0
+        ],
+        "wall_ms_mean": 6350.0
+      },
+      "saving_ci95": {
+        "ci95_high": 0.6631,
+        "ci95_low": 0.6572,
+        "mean": 0.661
+      },
+      "side_by_side": {
+        "correct": 5,
+        "in_flight_max": 3,
+        "leaks": 0,
+        "n": 5,
+        "wall_ms": [
+          2140.0,
+          2138.2,
+          2141.9,
+          2142.8,
+          2200.3
+        ],
+        "wall_ms_mean": 2152.6
+      },
+      "summaries_identical": true
+    },
+    "300": {
+      "one_at_a_time": {
+        "correct": 5,
+        "in_flight_max": 1,
+        "leaks": 0,
+        "n": 5,
+        "wall_ms": [
+          8449.8,
+          8465.7,
+          8477.9,
+          8460.9,
+          8479.1
+        ],
+        "wall_ms_mean": 8466.7
+      },
+      "saving_ci95": {
+        "ci95_high": 0.5691,
+        "ci95_low": 0.5674,
+        "mean": 0.5683
+      },
+      "side_by_side": {
+        "correct": 5,
+        "in_flight_max": 3,
+        "leaks": 0,
+        "n": 5,
+        "wall_ms": [
+          3646.2,
+          3663.5,
+          3652.7,
+          3650.8,
+          3664.4
+        ],
+        "wall_ms_mean": 3655.6
+      },
+      "summaries_identical": true
+    }
+  },
+  "is_real_model": false,
+  "policy": {
+    "early_issue": true,
+    "speculation": false
+  },
+  "replies": {
+    "0": {
+      "one_call": {
+        "correct": 5,
+        "leaks": 0,
+        "n": 5,
+        "replies": 9,
+        "wall_ms": [
+          19026.8,
+          19037.7,
+          19009.6,
+          19012.3,
+          19915.3
+        ],
+        "wall_ms_mean": 19200.3
+      },
+      "parallel": {
+        "correct": 5,
+        "leaks": 0,
+        "n": 5,
+        "replies": 4,
+        "wall_ms": [
+          9971.9,
+          9969.5,
+          9966.2,
+          9970.1,
+          9963.3
+        ],
+        "wall_ms_mean": 9968.2
+      },
+      "saving_ci95": {
+        "ci95_high": 0.4904,
+        "ci95_low": 0.4757,
+        "mean": 0.4809
+      }
+    },
+    "300": {
+      "one_call": {
+        "correct": 5,
+        "leaks": 0,
+        "n": 5,
+        "replies": 9,
+        "wall_ms": [
+          20255.3,
+          20271.0,
+          20227.7,
+          20235.6,
+          20242.3
+        ],
+        "wall_ms_mean": 20246.4
+      },
+      "parallel": {
+        "correct": 5,
+        "leaks": 0,
+        "n": 5,
+        "replies": 4,
+        "wall_ms": [
+          11226.6,
+          11169.6,
+          11212.3,
+          11182.1,
+          11200.4
+        ],
+        "wall_ms_mean": 11198.2
+      },
+      "saving_ci95": {
+        "ci95_high": 0.4478,
+        "ci95_low": 0.446,
+        "mean": 0.4469
+      }
+    }
+  },
+  "runs_per_cell": 5,
+  "stand_in": {
+    "block_ms": 300.0,
+    "reply_ms": 1500.0
+  },
+  "tool_latencies_ms": [
+    0,
+    300
+  ],
+  "totals": {
+    "correct": 40,
+    "leaks": 0,
+    "runs": 40
+  },
+  "wall_seconds": 407.0
+}

@@ -79,6 +79,10 @@ class ScriptedModel:
     #: enough that an early-issued read can demonstrably finish before the turn ends.
     block_delay_ms: float = 0.0
     complete_delay_ms: float = 0.0
+    #: Latency before :meth:`stream` emits anything: reading the prompt and thinking, the part
+    #: of a reply that does not grow with what it says. It is what a run pays once per reply,
+    #: and so what asking for several calls in one reply saves.
+    reply_delay_ms: float = 0.0
     #: Turns already played, so the next call serves ``turns[consumed]``.
     #:
     #: A resumed run is a *new process*: its script starts over while the run does not, so a
@@ -114,6 +118,8 @@ class ScriptedModel:
 
     async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
         response = self._next(envelope)
+        if self.reply_delay_ms:
+            await asyncio.sleep(self.reply_delay_ms / 1000.0)
         for index, block in enumerate(response.content):
             if self.block_delay_ms:
                 await asyncio.sleep(self.block_delay_ms / 1000.0)

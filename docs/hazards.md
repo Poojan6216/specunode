@@ -12,6 +12,7 @@ disjoint buckets and a run's stalls can be attributed rather than lumped togethe
 | `UNDECLARED_TOOL` | the tool has no declared effect class | before a call |
 | `RETURN_VALUE_DEPENDENCY` | a placeholder appears anywhere in the call's arguments | before a call |
 | `IRREVERSIBLE_ON_PATH` | an `IRREVERSIBLE` effect would have to be staged, and `stage_irreversible` is off | before a call, on a speculative branch only |
+| `WRITE_ON_PATH` | a predicted call is not a `READ`, and `speculate_writes` is off — PASTE's rule | before a call, on a guess only |
 | `READ_AFTER_STAGED_WRITE` | a read touches a resource key a staged write touches | before a call |
 | `BUDGET` | speculation depth or the in-flight limit is reached | before a call |
 | `FREE_TEXT_NODE` | the predicted decision is prose | when filtering a candidate |
@@ -23,7 +24,7 @@ disjoint buckets and a run's stalls can be attributed rather than lumped togethe
 First match wins, and correctness-bearing predicates come before cost-bearing ones:
 
 ```
-UNDECLARED_TOOL → RETURN_VALUE_DEPENDENCY → IRREVERSIBLE_ON_PATH
+UNDECLARED_TOOL → RETURN_VALUE_DEPENDENCY → IRREVERSIBLE_ON_PATH → WRITE_ON_PATH
                 → READ_AFTER_STAGED_WRITE → BUDGET
 ```
 

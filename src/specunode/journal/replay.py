@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from specunode.canonical import JsonValue
 from specunode.core.branch import StepCursor
 from specunode.core.model import (
+    CallScope,
     Message,
     ModelResponse,
     RequestEnvelope,
@@ -149,7 +150,13 @@ class ReplayModel:
     #: which is the right answer for a journal written by a sequential run.
     retired_branches: frozenset[str] = frozenset()
     role: str = "target"
-    _turns: dict[int, JournaledTurn] = field(default_factory=dict, init=False)
+    #: Recorded turns by (node, program position), in the order they were made. A list, not
+    #: one turn: a node that runs a conversation -- ``agent_loop`` -- makes several model calls
+    #: from one position, and an index that held one turn per step kept only the last, so a
+    #: replay of any multi-turn node diverged on its first request. Keyed by node as well,
+    #: because two nodes running side by side can each make a call from the same position.
+    _turns: dict[tuple[str, int], list[JournaledTurn]] = field(default_factory=dict, init=False)
+    _next: dict[tuple[str, int], int] = field(default_factory=dict, init=False)
     _served: list[int] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
@@ -184,24 +191,32 @@ class ReplayModel:
             if not isinstance(response_payload, Mapping):
                 continue
             projected = request.get("request")
-            self._turns[step] = JournaledTurn(
-                step=step,
-                branch_id=branch_id,
-                request_hash=str(request.get("request_hash", "")),
-                request=projected if isinstance(projected, Mapping) else {},
-                response=response_from_json(response_payload),
-                speculative=speculative,
+            key = (str(request.get("node_id") or ""), step)
+            self._turns.setdefault(key, []).append(
+                JournaledTurn(
+                    step=step,
+                    branch_id=branch_id,
+                    request_hash=str(request.get("request_hash", "")),
+                    request=projected if isinstance(projected, Mapping) else {},
+                    response=response_from_json(response_payload),
+                    speculative=speculative,
+                )
             )
 
     # -- the ModelClient surface ---------------------------------------------------------------
 
-    def _turn_for(self, envelope: RequestEnvelope, step: int) -> JournaledTurn:
-        turn = self._turns.get(step)
-        if turn is None:
+    def _turn_for(self, envelope: RequestEnvelope, scope: CallScope) -> JournaledTurn:
+        key = (scope.node_id, scope.step)
+        recorded = self._turns.get(key, [])
+        index = self._next.get(key, 0)
+        if index >= len(recorded):
             raise ReplayExhausted(
-                f"the journal for run {self.run_id} has no {self.role} turn at step {step}; "
-                f"it records steps {sorted(self._turns)}"
+                f"the journal for run {self.run_id} has no {self.role} turn number "
+                f"{index + 1} for node {scope.node_id!r} at step {scope.step}; it records "
+                f"{sorted((node, step, len(turns)) for (node, step), turns in self._turns.items())}"
             )
+        turn = recorded[index]
+        step = scope.step
         actual = request_hash(envelope)
         if actual != turn.request_hash:
             raise ReplayDivergence(
@@ -210,11 +225,12 @@ class ReplayModel:
                 expected=turn.request_hash,
                 actual=actual,
             )
+        self._next[key] = index + 1
         self._served.append(step)
         return turn
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
-        return self._turn_for(envelope, current_scope().step).response
+        return self._turn_for(envelope, current_scope()).response
 
     async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
         """Re-emit the journaled turn's blocks, with no delay.
@@ -223,7 +239,7 @@ class ReplayModel:
         replay take as long as the original run and would make its result depend on a number
         that has nothing to do with correctness.
         """
-        response = self._turn_for(envelope, current_scope().step).response
+        response = self._turn_for(envelope, current_scope()).response
         for index, block in enumerate(response.content):
             if isinstance(block, ToolUseBlock):
                 yield ToolUseComplete(index=index, block=block)
@@ -233,7 +249,7 @@ class ReplayModel:
 
     @property
     def steps(self) -> tuple[int, ...]:
-        return tuple(sorted(self._turns))
+        return tuple(sorted({step for _node, step in self._turns}))
 
     @property
     def served(self) -> tuple[int, ...]:

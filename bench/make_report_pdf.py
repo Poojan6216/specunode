@@ -266,13 +266,148 @@ def build_story(styles: Any) -> list[Any]:
     else:
         para("Overhead not measured.")
 
-    para("5. Wall-clock latency", h2)
+    def band(ci: dict[str, float] | None) -> str:
+        if not ci:
+            return "not measured"
+        return f"{ci['mean']:+.1%} [{ci['ci95_low']:+.1%}, {ci['ci95_high']:+.1%}]"
+
+    # A present results file used to render nothing here: the section handled only a missing
+    # file, so the first real measurement this project made was silently left out of the one
+    # document that promises never to omit a section.
+    para("5. Wall-clock latency, against a real model", h2)
     latency = load("latency.json")
-    if latency is None:
+    if latency is None or not latency.get("is_real_model"):
         para(
-            "<b>Not measured.</b> The online latency benchmark calls a real target model and "
-            "needs an API key and a spend cap. No wall-clock figure appears anywhere in this "
-            "report or in the repository, because none has been produced."
+            "<b>Not measured against a real model.</b> The online latency benchmark needs an "
+            "API key; a run against the scripted stand-in is not a latency measurement."
+        )
+    elif not any("B_strict_seq" in e["arms"] for e in latency["workloads"].values()):
+        para(
+            f"The {latency['tasks_completed']} runs on file were taken before two faults in "
+            "their arms were found -- the baseline already issued reads early, and the "
+            "reads-only arm was given no predictor -- so their savings are not quoted. Section "
+            "6's 0 ms rung is the corrected measurement; re-running this table is pending."
+        )
+    else:
+        para(
+            f"Target <font face='Courier'>{latency['target_model']}</font>, "
+            f"{latency['tasks_completed']} runs, tools as fast as the in-memory sample world "
+            "makes them. Saving is against the arm that waits for each turn and then calls "
+            "the tools in order."
+        )
+        rows = [["Workload", "Early issue only", "Early issue + guessing", "Leaks"]]
+        for name, entry in sorted(latency["workloads"].items()):
+            strict = entry.get("saving_vs_strict_seq_ci95") or {}
+            leaks = sum(int(s["leaks"]) for s in entry["arms"].values())
+            rows.append(
+                [name, band(strict.get("B_seq")), band(strict.get("B_specunode")), str(leaks)]
+            )
+        table(rows)
+
+    para("6. How slow a tool has to be", h2)
+    sweep = load("sweep.json")
+    if sweep is None or not sweep.get("is_real_model"):
+        para("Not measured against a real model.")
+    else:
+        rows = [["Tool latency", "Workload", "Early issue only", "Early issue + guessing"]]
+        for ms, point in sorted(sweep["points"].items(), key=lambda kv: int(kv[0])):
+            for name, entry in sorted(point.items()):
+                strict = entry["saving_vs_strict_seq_ci95"]
+                rows.append(
+                    [
+                        f"{ms} ms",
+                        name,
+                        band(strict.get("B_seq")),
+                        band(strict.get("B_specunode")),
+                    ]
+                )
+        table(rows)
+        para(
+            "Only the workload that hands its model turn to the runtime can gain anything; the "
+            "other two call the model themselves. Where it gains, the whole of the saving is "
+            "tier-0 early issue, and guessing adds nothing the interval can resolve."
+        )
+
+    para("7. What a guess is worth", h2)
+    breakeven = load("break_even.json")
+    if breakeven is None:
+        para("Not measured. Run <font face='Courier'>bench/offline/run_break_even.py</font>.")
+    else:
+        rows = [["Tool latency", "Accuracy", "Guess reads and writes", "Guess reads only"]]
+        for ms, point in sorted(breakeven["points"].items(), key=lambda kv: int(kv[0])):
+            for alpha, arms in point["by_alpha"].items():
+                rows.append(
+                    [
+                        f"{ms} ms",
+                        alpha,
+                        band(arms["reads_and_writes"]["saving_vs_early_issue_ci95"]),
+                        band(arms["reads_only"]["saving_vs_early_issue_ci95"]),
+                    ]
+                )
+        table(rows)
+        para(
+            "A guesser of controlled accuracy, against early issue alone, on a stand-in that "
+            f"streams {breakeven['think_ms_per_block']:.0f} ms per block. A correct guess can "
+            "run at most one block ahead; a wrong one is squashed and costs no wall clock; and "
+            "guessing writes as well as reads adds nothing, because a staged write cannot be "
+            "sent before its branch retires."
+        )
+
+    para("8. The acceptance rate of a draft model", h2)
+    tier2 = load("tier2.json")
+    if tier2 is None or not tier2.get("is_real_model"):
+        para("Not measured against a real draft model.")
+    else:
+        r = tier2["result"]
+        para(
+            f"<font face='Courier'>{tier2['draft_model']}</font>, graded by the runtime's own "
+            f"gate on {r['steps_graded']} sampled steps: acceptance "
+            f"{band(r['acceptance_rate_ci95']).replace('+', '')}, right tool "
+            f"{r['right_tool']:.1%}. Against a tier-1 acceptance rate that is effectively zero, "
+            "a draft model is the only predictor here that gets anything right -- and section 7 "
+            "is what a hit is worth when it does."
+        )
+    para("9. When the model is the slow part", h2)
+    bound = load("model_bound.json")
+    if bound is None:
+        para("Not measured. Run <font face='Courier'>bench/offline/run_model_bound.py</font>.")
+    else:
+        stand_in = bound["stand_in"]
+        para(
+            "Fewer replies, and replies side by side, against a stand-in model whose reply "
+            f"takes {stand_in['reply_ms']:.0f} ms before its first block and "
+            f"{stand_in['block_ms']:.0f} ms per block -- settings, not measurements. The reply "
+            "and in-flight counts do not depend on them."
+        )
+        rows = [["Tool latency", "One call per reply", "Every independent call at once", "Saving"]]
+        for ms, point in sorted(bound["replies"].items(), key=lambda kv: int(kv[0])):
+            one, many = point["one_call"], point["parallel"]
+            rows.append(
+                [
+                    f"{ms} ms",
+                    f"{one['replies']} replies, {one['wall_ms_mean']:.0f} ms",
+                    f"{many['replies']} replies, {many['wall_ms_mean']:.0f} ms",
+                    band(point["saving_ci95"]),
+                ]
+            )
+        table(rows)
+        rows = [["Tool latency", "Nodes one after another", "Side by side", "Saving"]]
+        for ms, point in sorted(bound["branches"].items(), key=lambda kv: int(kv[0])):
+            serial, side = point["one_at_a_time"], point["side_by_side"]
+            rows.append(
+                [
+                    f"{ms} ms",
+                    f"{serial['in_flight_max']} in flight, {serial['wall_ms_mean']:.0f} ms",
+                    f"{side['in_flight_max']} in flight, {side['wall_ms_mean']:.0f} ms",
+                    band(point["saving_ci95"]),
+                ]
+            )
+        table(rows)
+        totals = bound["totals"]
+        para(
+            f"Correct runs: {totals['correct']} of {totals['runs']}. Effects from a branch that "
+            f"never retired: {totals['leaks']}. What a real model does when told it may ask for "
+            "several calls at once, and what prompt caching saves, are not measured yet."
         )
     return story
 

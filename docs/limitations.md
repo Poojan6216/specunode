@@ -95,6 +95,60 @@ A workload shaped `model → write → model(reads the write's result)` therefor
 all from speculating past the write. That is by design, not a gap, and the benchmark reports
 what fraction of each workload has that shape instead of quietly excluding it.
 
+## Guessing buys at most one block, and guessing a write buys nothing
+
+This is the finding that decides what the project should claim, so it is stated plainly.
+Every wall-clock saving measured against a real model in this repository comes from **tier-0
+early issue** — a read
+starts the moment its block finishes parsing instead of after the turn — and none of it,
+within any interval the benchmarks resolve, from guessing. Three properties of the scheduler
+explain why, and `bench/offline/run_break_even.py` measures each with a guesser of controlled
+accuracy (`RESULTS.md`, "What a guess is worth"):
+
+- **A guess runs at most one block ahead of the model.** The drafter is asked after each block
+  the model emits, and the next block resolves the guess. So a correct guess starts its call
+  one block's streaming time early, and that is worth something only when the call is slower
+  than early issue could already hide.
+- **A staged write cannot leave before its branch retires, and the drafter does not chain past
+  one.** So guessing a write correctly moves nothing forward in time. Speculating on writes as
+  well as reads — the setting the store buffer makes *safe* — is measured to be no *faster*
+  than PASTE's reads-only rule, even with a guesser that is always right.
+- **A miss costs no wall clock.** It is squashed when the real block arrives and the real call
+  is issued as it would have been. What a miss costs is money: the upstream read its branch
+  made, and for a draft model the tokens. That is why the gate that matters for a real
+  deployment is `max_speculative_reads` and `max_wasted_tokens`, not the alpha floor.
+
+So the store buffer's contribution is safety — no guessed effect can reach the world, and the
+model's own writes are held until the turn that asked for them is durable — and early issue's
+is speed. A drafter that chained several calls ahead, or a scheduler that let a confirmed
+branch's writes dispatch before retirement, would change this; neither is built.
+
+## Fewer model replies need a model that asks for several calls at once
+
+When the model is the slow part of a run, the lever infrastructure has is the number of model
+replies, and the runtime is built for the reply that cuts it: its reads issued as they parse
+and run together, its writes held until the reply is durable, every result handed back in one
+message (`specunode.core.loop.agent_loop`). But the runtime cannot make a model write that
+reply. Every turn in the 300 real trajectories in `bench/corpus` asks for exactly one call, and
+an app whose model works that way gains nothing here. `examples/incident_agent` measures the
+difference a prompt that invites independent calls makes -- nine replies against four, with a
+stand-in model (`RESULTS.md`). Whether a real model takes the invitation is not measured yet.
+
+## Parallel nodes overlap only up to their first write, and must be independent
+
+A router that names several nodes at once gets their bodies run side by side and retired in the
+order named (`docs/adapters.md`). Two consequences follow, and neither is hidden:
+
+- **Overlap stops at each body's first write.** A write is sent only when its node retires, and
+  nodes retire in order, so a body waiting on its own write's result waits for every node named
+  before it. Nodes that investigate and hand their findings to one node that acts overlap
+  completely; nodes that each act early barely overlap.
+- **Independence is declared, and only partly checked.** Two nodes writing one state key are
+  refused, at the earliest point the clash is visible. A node that read what an earlier node
+  then changed is refused at its retirement -- but only if the read was witnessed; an
+  unwitnessed read cannot be checked (above) and retires on the value it saw. Refused means the
+  run fails, loudly, with nothing of the refused node sent. It is not re-run on the fresh value.
+
 ## A drafter cannot use the result of the call it was just asked about
 
 The drafter is consulted immediately after a `tool_use` block finishes parsing. At that instant

@@ -351,3 +351,93 @@ def test_the_sweep_runs_every_rung_and_reports_a_difference(tmp_path: Path) -> N
     fast = report["points"]["0"]["support_agent"]["wall_ms_mean"]["B_seq"]
     slow = report["points"]["25"]["support_agent"]["wall_ms_mean"]["B_seq"]
     assert slow > fast, f"latency had no effect: {fast}ms then {slow}ms"
+
+
+def test_a_workload_that_never_guesses_reports_no_acceptance_rate(tmp_path: Path) -> None:
+    """Ordinary steps are not guesses, and counting them as correct ones invented a result.
+
+    The harness used ``branches_forked - branches_squashed`` as the number of accepted guesses,
+    but every node visit forks a canonical branch too. ``support_agent`` hands no turn to the
+    runtime, so its drafter is never consulted -- and it reported an acceptance rate of 1.0,
+    which was then quoted as "a perfect predictor, and still slower".
+    """
+    from bench.online.run_latency import MeteredModel, Spend, run_one
+    from bench.online.scripted_target import ScriptedTarget
+    from bench.workloads import WORKLOADS
+
+    support = next(w for w in WORKLOADS if w.name == "support_agent")
+    assert not support.drives_turn, "the premise of this test changed"
+    target = MeteredModel(inner=ScriptedTarget(), spend=Spend(cap_usd=1.0))
+    row = asyncio.run(run_one(support, "B_specunode", 0, target, tmp_path))
+    assert row.offered == 0, f"{row.offered} guesses reported on a run that made none"
+    assert row.accepted == 0
+
+    ops = next(w for w in WORKLOADS if w.name == "ops_agent")
+    target = MeteredModel(inner=ScriptedTarget(), spend=Spend(cap_usd=1.0))
+    row = asyncio.run(run_one(ops, "B_specunode", 0, target, tmp_path))
+    assert row.offered > 0, "ops_agent drives its turn and was predicted; nothing was counted"
+    assert 0 <= row.accepted <= row.offered
+
+
+def test_the_oracle_is_right_exactly_as_often_as_it_is_told_to_be() -> None:
+    """A break-even curve is only as good as the accuracy it was measured at."""
+    from bench.offline.run_break_even import SEED, OracleDrafter
+    from bench.workloads import WORKLOADS
+
+    from specunode.drafters.base import DraftContext
+
+    truth = next(w for w in WORKLOADS if w.name == "ops_agent").decisions()
+
+    async def guesses(alpha: float, task: int) -> list[bool]:
+        oracle = OracleDrafter(truth, alpha, SEED, task)
+        out = []
+        for position in range(len(truth)):
+            ctx = DraftContext(
+                run_id="r",
+                branch_id="b",
+                step_index=position,
+                node_id="n",
+                history=tuple(truth[:position]),
+            )
+            [prediction] = await oracle.predict(ctx)
+            out.append(prediction.decision == truth[position])
+        return out
+
+    assert all(asyncio.run(guesses(1.0, 0))), "alpha=1 must always name the real call"
+    assert not any(asyncio.run(guesses(0.0, 0))), "alpha=0 must never name the real call"
+    # Reproducible: the same seed and task make the same guesses.
+    assert asyncio.run(guesses(0.5, 3)) == asyncio.run(guesses(0.5, 3))
+    # And over many tasks the hit rate is the one asked for.
+    hits = [h for task in range(400) for h in asyncio.run(guesses(0.5, task))]
+    assert 0.45 < sum(hits) / len(hits) < 0.55
+
+
+def test_a_miss_names_a_real_row_so_it_is_squashed_rather_than_failing() -> None:
+    """A wrong guess that pointed at a missing row would fault, which is not what a miss does."""
+    from bench.offline.run_break_even import NEAR_MISS
+    from bench.workloads import WORKLOADS
+
+    from specunode.testing.world import standard_world
+
+    world = standard_world()
+    for call in next(w for w in WORKLOADS if w.name == "ops_agent").decisions():
+        assert call.name in NEAR_MISS, f"no near miss declared for {call.name}"
+        key, alternative = NEAR_MISS[call.name]
+        assert alternative != call.args[key], f"the miss for {call.name} is the right answer"
+    assert "etl-4" in world.tables["jobs"]
+    assert "escalate" in world.tables["docs"]
+
+
+def test_the_model_bound_bench_counts_replies_and_calls_in_flight() -> None:
+    """The two counts its section leads with, which do not depend on the stand-in's timings."""
+    from bench.offline.run_model_bound import measure
+
+    report = asyncio.run(measure([0], runs=1, reply_ms=30.0, block_ms=5.0))
+    replies = report["replies"]["0"]
+    assert (replies["one_call"]["replies"], replies["parallel"]["replies"]) == (9, 4)
+    branches = report["branches"]["0"]
+    assert branches["one_at_a_time"]["in_flight_max"] == 1
+    assert branches["side_by_side"]["in_flight_max"] == 3
+    assert branches["summaries_identical"], "side by side posted a different report"
+    totals = report["totals"]
+    assert totals == {"runs": 4, "correct": 4, "leaks": 0}

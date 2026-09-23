@@ -350,6 +350,12 @@ def overhead_section() -> str:
     )
 
 
+def _band(ci: dict[str, float] | None) -> str:
+    if not ci:
+        return "not measured"
+    return f"{ci['mean']:+.1%} [{ci['ci95_low']:+.1%}, {ci['ci95_high']:+.1%}]"
+
+
 def latency_section() -> str:
     report = load("latency.json")
     if report is None:
@@ -362,64 +368,181 @@ def latency_section() -> str:
         return (
             "### Wall-clock latency\n\n"
             "The harness has run, against its deterministic stand-in rather than a model, so "
-            "there is still no wall-clock measurement here. The stand-in answers instantly; "
-            "what it times is this repository's own overhead and nothing else. Run it with an "
-            "API key for figures anyone should quote.\n"
+            "there is still no wall-clock measurement here. Run it with an API key for figures "
+            "anyone should quote.\n"
+        )
+    arms = {arm for entry in report["workloads"].values() for arm in entry["arms"]}
+    if "B_strict_seq" not in arms:
+        leaks = sum(
+            int(s["leaks"]) for e in report["workloads"].values() for s in e["arms"].values()
+        )
+        return (
+            "### Wall-clock latency, against a real model\n\n"
+            f"The {report['tasks_completed']} runs in `bench/results/latency.json` were taken "
+            "before two faults in their arms were found: their `B_seq` already issued reads "
+            "early, so it was not the sequential baseline it was labelled as, and their "
+            "`B_readonly_spec` was given no predictor, so it never guessed. Their savings are "
+            "measured against the wrong baseline and are not quoted here. The 0 ms rung of the "
+            "sweep below measures the same thing with the corrected arms; re-running this table "
+            "is pending.\n\n"
+            f"**Effects reaching the world from a branch that never retired: {leaks}.** That "
+            "count does not depend on which arm was the baseline.\n"
         )
     lines = [
         "### Wall-clock latency, against a real model",
         "",
-        f"Target: `{report['target_model']}`. {report['tasks_completed']} of "
-        f"{report['tasks_requested'] * 9} runs -- {report['tasks_requested']} seeded tasks, "
-        "3 sample apps, 3 arms. Means with 95% percentile-bootstrap intervals over tasks. "
-        f"Spend: ${report['estimated_spend_usd']} of a ${report['budget_usd_cap']} cap, at the "
-        "prices printed in the results file.",
+        f"Target: `{report['target_model']}`. {report['tasks_completed']} runs, "
+        f"{report['tasks_requested']} per arm per sample app, with tools exactly as fast as the "
+        "in-memory sample world makes them. Means with 95% bootstrap intervals on the "
+        f"*difference*. Spend: ${report['estimated_spend_usd']}, at the per-model prices "
+        "printed in the results file.",
         "",
-        "The three arms: **B_seq** runs sequentially with speculation off. "
-        "**B_readonly_spec** speculates on reads only and treats every write as a barrier — "
-        "PASTE's policy, credited. **B_specunode** stages writes in the store buffer, which is "
-        "what this project adds.",
+        "Four arms, and the first is the one every earlier version of this table was missing. "
+        "**B_strict_seq** waits for each model turn to end and then calls its tools in order. "
+        "**B_seq** adds tier-0 early issue -- a read starts the moment its block parses -- and "
+        "nothing else. **B_readonly_spec** adds guessing, but a guessed write is a barrier: "
+        "PASTE's rule, credited. **B_specunode** guesses writes too and stages them in the "
+        "store buffer, which is what this project adds.",
         "",
-        "| Workload | B_seq | B_readonly_spec | B_specunode | Wall clock saved vs B_seq "
-        "| alpha | Leaks |",
-        "|---|---|---|---|---|---|---|",
+        "| Workload | Early issue only | + guessing reads | + guessing writes too | Leaks |",
+        "|---|---|---|---|---|",
     ]
-
-    def cell(arms: dict[str, Any], arm: str) -> str:
-        stats = arms.get(arm)
-        if not stats:
-            return "not run"
-        low, high = stats["wall_ms_ci95"]
-        return f"{stats['wall_ms_mean']:.0f} [{low:.0f}, {high:.0f}]"
-
     total_leaks = 0
     for name, entry in sorted(report["workloads"].items()):
-        arms = entry["arms"]
-        reduction = entry.get("wall_clock_reduction_vs_seq")
-        change = "not comparable" if reduction is None else f"{reduction:+.1%}"
-        alpha = entry.get("alpha_observed")
-        leaks = sum(int(s["leaks"]) for s in arms.values())
+        strict = entry.get("saving_vs_strict_seq_ci95") or {}
+        leaks = sum(int(s["leaks"]) for s in entry["arms"].values())
         total_leaks += leaks
-        lines += [
-            f"| `{name}` | {cell(arms, 'B_seq')} | {cell(arms, 'B_readonly_spec')} | "
-            f"{cell(arms, 'B_specunode')} | {change} | "
-            f"{'not measured' if alpha is None else f'{alpha:.2f}'} | {leaks} |"
-        ]
+        lines.append(
+            f"| `{name}` | {_band(strict.get('B_seq'))} | "
+            f"{_band(strict.get('B_readonly_spec'))} | {_band(strict.get('B_specunode'))} | "
+            f"{leaks} |"
+        )
     lines += [
         "",
-        "Milliseconds, lower is better. The saving is "
-        "`1 - B_specunode / B_seq`, so a **negative** figure means the speculative arm was "
-        "*slower* than running sequentially -- which is a result, not a bug in the table.",
+        "Each cell is the wall clock saved against `B_strict_seq`; a **negative** saving means "
+        "that arm was slower. An interval that spans zero resolves no difference.",
         "",
         f"**Effects reaching the world from a branch that never retired: {total_leaks}.** That "
         "is the number this project exists to keep at zero, and it is the only one here that "
         "is a claim about correctness rather than about speed.",
         "",
-        "**The break-even alpha is still not measured.** It is the acceptance rate at which the "
-        "speculative arm's wall clock equals the sequential arm's, and finding it needs a "
-        "sweep across drafters of differing accuracy rather than a single run at whatever alpha "
-        "the tier-1 index happens to deliver. `alpha_floor` stays `None` — the gate is "
-        "inactive rather than set to a guessed number.",
+    ]
+    return "\n".join(lines)
+
+
+def break_even_section() -> str:
+    report = load("break_even.json")
+    if report is None:
+        return missing(
+            "What a guess is worth",
+            "python bench/offline/run_break_even.py --out bench/results/break_even.json",
+        )
+    lines = [
+        "### What a guess is worth",
+        "",
+        "The acceptance rates above say how often a predictor is right. This says what being "
+        "right is *worth*, which no real predictor can answer on its own: a guesser that knows "
+        "the model's turn in advance and names the right next call with a chosen probability, "
+        "otherwise a valid wrong one, measured against tier-0 early issue alone -- so each cell "
+        "is what guessing adds *on top of* what the runtime already does. No model and no "
+        f"network: the stand-in streams {report['think_ms_per_block']:.0f} ms per block, "
+        f"calibrated from the real sweep, {report['tasks_per_point']} runs per cell, on "
+        f"`{report['workload']}`, the one sample app that hands its turn to the runtime.",
+        "",
+        "| Tool latency | Accuracy | Guess reads and writes | Guess reads only |",
+        "|---|---|---|---|",
+    ]
+    for ms, point in sorted(report["points"].items(), key=lambda kv: int(kv[0])):
+        for alpha, arms in point["by_alpha"].items():
+            lines.append(
+                f"| {ms} ms | {alpha} | "
+                f"{_band(arms['reads_and_writes']['saving_vs_early_issue_ci95'])} | "
+                f"{_band(arms['reads_only']['saving_vs_early_issue_ci95'])} |"
+            )
+    lines += [
+        "",
+        "Three things this settles, each of which the scheduler's structure predicts and none of "
+        "which was a result until it was measured:",
+        "",
+        "- **A hit is worth at most one block of streaming.** The drafter is asked after each "
+        "block and the next block resolves the guess, so a correct guess starts its call one "
+        "block early -- which is worth something only when the call is slower than early issue "
+        "could already hide.",
+        "- **A miss costs no wall clock.** It is squashed when the real block arrives and the "
+        "real call is issued as it always was. What a miss costs is money: the upstream read it "
+        "made, and for a draft model the tokens.",
+        "- **Guessing a write adds nothing over guessing reads only.** A staged write cannot be "
+        "dispatched before its branch retires, and the drafter does not chain past one. The "
+        "store buffer is what makes guessing a write *safe*; it does not make it *faster*.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def model_bound_section() -> str:
+    report = load("model_bound.json")
+    title = "When the model is the slow part: fewer replies, and replies side by side"
+    if report is None:
+        return missing(
+            title, "python bench/offline/run_model_bound.py --out bench/results/model_bound.json"
+        )
+    stand_in = report["stand_in"]
+    totals = report["totals"]
+    lines = [
+        f"### {title}",
+        "",
+        "A guess buys at most one block of a model's stream (above). When the model is what a "
+        "run waits on, the time is in the replies themselves, and infrastructure has two levers "
+        "left: how many replies a run needs, and how many of them it waits on at once. Both "
+        "are measured here against a stand-in model whose reply takes "
+        f"{stand_in['reply_ms']:.0f} ms before its first block -- reading the prompt and "
+        f"thinking -- and {stand_in['block_ms']:.0f} ms per block. Those are settings, not "
+        "measurements: the wall clock below is what the runtime makes of them. The reply "
+        f"counts and in-flight counts do not depend on them. {report['runs_per_cell']} runs "
+        "per cell, with a bootstrap interval on the difference.",
+        "",
+        "**Multi-call replies** (`examples/incident_agent`). One alert -- four pipelines to "
+        "check, a runbook to read, two restarts, one summary -- worked one call per reply, "
+        "which is how every turn in the corpus above behaves, and with every independent call "
+        "in one reply. The runtime runs a reply's reads together as they parse, holds its "
+        "writes until the reply is durable, and hands every result back in one message.",
+        "",
+        "| Tool latency | One call per reply | Every independent call at once | Saving |",
+        "|---|---|---|---|",
+    ]
+    for ms, point in sorted(report["replies"].items(), key=lambda kv: int(kv[0])):
+        one, many = point["one_call"], point["parallel"]
+        lines.append(
+            f"| {ms} ms | {one['replies']} replies, {one['wall_ms_mean']:.0f} ms | "
+            f"{many['replies']} replies, {many['wall_ms_mean']:.0f} ms | "
+            f"{_band(point['saving_ci95'])} |"
+        )
+    lines += [
+        "",
+        "**Parallel nodes** (`examples/fanout_agent`). Three independent checks, each one model "
+        "reply, then a report. The router names the three at once; the runtime runs their "
+        "bodies side by side and retires them in the order it named them, so their effects "
+        "reach the world in that order however the bodies interleaved.",
+        "",
+        "| Tool latency | One after another | Side by side | Saving |",
+        "|---|---|---|---|",
+    ]
+    for ms, point in sorted(report["branches"].items(), key=lambda kv: int(kv[0])):
+        serial, side = point["one_at_a_time"], point["side_by_side"]
+        lines.append(
+            f"| {ms} ms | {serial['in_flight_max']} model call in flight, "
+            f"{serial['wall_ms_mean']:.0f} ms | {side['in_flight_max']} in flight, "
+            f"{side['wall_ms_mean']:.0f} ms | {_band(point['saving_ci95'])} |"
+        )
+    lines += [
+        "",
+        f"Runs that changed the world exactly as a correct run does: {totals['correct']} of "
+        f"{totals['runs']}. **Effects reaching the world from a branch that never retired: "
+        f"{totals['leaks']}.**",
+        "",
+        "What this does not show is what a real model does when told it may ask for several "
+        "calls at once, or what prompt caching takes off each reply. Both need a real model, "
+        "and neither is measured yet.",
         "",
     ]
     return "\n".join(lines)
@@ -499,6 +622,12 @@ def build() -> str:
             "---",
             "",
             tier2_section(),
+            "---",
+            "",
+            break_even_section(),
+            "---",
+            "",
+            model_bound_section(),
             "---",
             "",
             attacks_section(),

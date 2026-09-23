@@ -25,7 +25,7 @@ import os
 from collections.abc import Mapping
 
 from specunode.canonical import JsonValue
-from specunode.core.decision import Decision, ToolCall
+from specunode.core.decision import Decision, FreeText, ToolCall
 from specunode.core.effects import EffectClass
 from specunode.core.graph import RunSession
 from specunode.core.model import (
@@ -183,8 +183,9 @@ async def decide(session: RunSession) -> Decision:
         # real provider is an unbounded bill rather than a hang. It happens: a model that
         # thinks by default can spend its whole ``max_tokens`` budget before reaching a call.
         session.state["decided"] = None
-        # The prose itself lives in the journal; the decision carries only its hash.
-        session.state["declined"] = decision.content_hash
+        if isinstance(decision, FreeText):
+            # The prose itself lives in the journal; the decision carries only its hash.
+            session.state["declined"] = decision.content_hash
     return decision
 
 

@@ -74,10 +74,25 @@ DEFAULT_BUDGET_USD = 25.0
 #: is what this runner did until someone was about to pay for it.
 DEFAULT_TARGET_MODEL = "claude-sonnet-5"
 
-#: Per-million-token prices used to estimate spend. Declared here and printed in the output,
-#: because an estimate whose inputs are hidden is not an estimate anyone can check. They are
-#: *prices*, not measurements, and the output labels them that way.
-PRICE_PER_MTOK = {"input": 3.0, "output": 15.0}
+#: Per-million-token list prices, per model, used to estimate spend. Declared here and printed
+#: in the output, because an estimate whose inputs are hidden is not an estimate anyone can
+#: check. They are *prices*, not measurements, and the output labels them that way.
+#:
+#: Keyed by model because one flat table was wrong twice: $3/$15 is the previous Sonnet's
+#: price, so every run against Claude Sonnet 5 ($2/$10) overstated its bill by half again,
+#: and the tier-2 benchmark was billed at those rates for a Haiku model at a third of them.
+PRICES_PER_MTOK: dict[str, dict[str, float]] = {
+    "claude-opus-5": {"input": 5.0, "output": 25.0},
+    "claude-sonnet-5": {"input": 2.0, "output": 10.0},
+    "claude-haiku-4-5": {"input": 1.0, "output": 5.0},
+}
+#: For a model not in the table: the highest price listed, so an estimate errs towards the
+#: cap tripping early rather than late.
+PRICE_PER_MTOK = {"input": 5.0, "output": 25.0}
+
+
+def prices_for(model: str) -> dict[str, float]:
+    return dict(PRICES_PER_MTOK.get(model, PRICE_PER_MTOK))
 
 
 @dataclass
@@ -98,14 +113,26 @@ class Spend:
 
     @property
     def usd(self) -> float:
+        # A cache write costs 1.25x the input price and a cache read 0.1x (the published
+        # multipliers for the default five-minute entry).
         return (
             self.input_tokens * self.prices_per_mtok["input"]
+            + self.cache_write_tokens * self.prices_per_mtok["input"] * 1.25
+            + self.cache_read_tokens * self.prices_per_mtok["input"] * 0.1
             + self.output_tokens * self.prices_per_mtok["output"]
         ) / 1_000_000
+
+    #: Cache writes and reads, which the API reports *outside* ``input_tokens``. With caching
+    #: on, ``input_tokens`` is only the uncached remainder, so an estimate that read nothing
+    #: else would under-count every request that wrote a cache entry and over-count none.
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
 
     def record(self, response: ModelResponse) -> None:
         self.input_tokens += response.usage.input_tokens
         self.output_tokens += response.usage.output_tokens
+        self.cache_write_tokens += response.usage.cache_creation_tokens
+        self.cache_read_tokens += response.usage.cache_read_tokens
 
     def may_continue(self) -> bool:
         if self.usd >= self.cap_usd:
@@ -172,22 +199,26 @@ class TaskResult:
 
 
 def policy_for(arm: str) -> Policy:
-    """The three arms differ only in policy, so any difference is the runtime's.
+    """The arms differ only in policy and predictor, so any difference is the runtime's.
 
-    ``B_readonly_spec`` is PASTE's rule expressed as policy: speculation is on, but an
-    irreversible or staged write is a barrier rather than something to run ahead of. It is
-    approximated here by disabling the drafter, which is what "never speculate on a write"
-    reduces to on workloads whose only predictable next call is one.
+    ``B_readonly_spec`` is PASTE's rule: the same predictor as ``B_specunode``, but a predicted
+    write is a barrier rather than something to stage (``speculate_writes=False``). It used to
+    be ``speculation=True`` with no predictor at all, justified as what "never speculate on a
+    write" reduces to -- which forks nothing, is ``B_seq`` under another name, and made the
+    comparison this project's thesis rests on a comparison against nothing.
     """
     if arm == "B_strict_seq":
         return Policy(speculation=False, early_issue=False)
     if arm == "B_seq":
         return Policy(speculation=False)
+    if arm == "B_readonly_spec":
+        return Policy(speculation=True, speculate_writes=False)
     return Policy(speculation=True)
 
 
 def drafter_for(arm: str, workload: Workload) -> PatternDrafter | None:
-    if arm != "B_specunode":
+    # Both speculative arms get the same predictor; only what they may do with a guess differs.
+    if arm not in ("B_specunode", "B_readonly_spec"):
         return None
     index = PatternIndex(order=2)
     index.train([workload.decisions()])
@@ -195,8 +226,16 @@ def drafter_for(arm: str, workload: Workload) -> PatternDrafter | None:
 
 
 async def run_one(
-    workload: Workload, arm: str, task: int, target: MeteredModel, root: Path
+    workload: Workload,
+    arm: str,
+    task: int,
+    target: MeteredModel,
+    root: Path,
+    *,
+    policy: Policy | None = None,
+    predictor: object | None = None,
 ) -> TaskResult:
+    """One run of one workload under one arm. ``policy``/``predictor`` override the arm's."""
     world = standard_world()
     adapter, registry = workload.make(world)
     journal = Journal(root / f"{workload.name}-{arm}-{task}.db")
@@ -207,8 +246,8 @@ async def run_one(
         buffer=StoreBuffer(journal=journal, run_id=""),
         dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
         target=JournaledModel(target, journal, provider="metered"),
-        policy=policy_for(arm),
-        predictor=drafter_for(arm, workload),
+        policy=policy if policy is not None else policy_for(arm),
+        predictor=predictor if predictor is not None else drafter_for(arm, workload),  # type: ignore[arg-type]
     )
     run_id = new_ulid()
     started = time.monotonic()
@@ -238,8 +277,13 @@ async def run_one(
         leaks=leaks,
         stalls=dict(scheduler.counters.stalls_by_hazard),
         wasted_tokens=scheduler.counters.wasted_tokens,
-        accepted=scheduler.counters.branches_forked - scheduler.counters.branches_squashed,
-        offered=scheduler.counters.branches_forked,
+        # Guesses, counted where guesses are made. This used to be ``branches_forked -
+        # branches_squashed``, but every node visit forks a canonical branch as well, so
+        # ordinary steps were counted as correct guesses: a workload whose drafter never
+        # offered anything reported an acceptance rate of 1.0, and that figure was quoted as
+        # "a perfect predictor, and still slower". There had been no predictions at all.
+        accepted=sum(turn.confirmed for turn in scheduler._turns),
+        offered=sum(turn.confirmed + turn.squashed + turn.stalled for turn in scheduler._turns),
     )
 
 
@@ -386,7 +430,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         os.environ["SPECUNODE_MODEL"] = args.target_model
 
     cap = float(os.environ.get("SPECUNODE_BENCH_BUDGET_USD", DEFAULT_BUDGET_USD))
-    spend = Spend(cap_usd=cap)
+    spend = Spend(cap_usd=cap, prices_per_mtok=prices_for(args.target_model))
     target = MeteredModel(inner=build_target(args.model), spend=spend)
 
     rows: list[TaskResult] = []
@@ -416,7 +460,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         "tasks_completed": len(rows),
         "budget_usd_cap": cap,
         "estimated_spend_usd": round(spend.usd, 4),
-        "prices_per_mtok_usd": PRICE_PER_MTOK,
+        "prices_per_mtok_usd": dict(spend.prices_per_mtok),
         "halted_at": halted_at,
         "total_leaks": sum(row.leaks for row in rows),
         "workloads": summarise(rows),

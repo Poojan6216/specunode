@@ -316,6 +316,20 @@ def decisions_of(response: ModelResponse) -> tuple[Decision, ...]:
 # -- streaming -------------------------------------------------------------------------------
 
 
+class TurnResults(list):  # type: ignore[type-arg]
+    """What one model turn's tool calls returned, in the order the model asked for them.
+
+    A list, so every caller that indexed or iterated ``call_turn``'s result still works, with
+    the reply that produced it attached. A multi-turn loop needs that reply: the next request
+    has to carry the assistant's content back *unchanged* -- thinking blocks and their
+    signatures included -- and pair each result with the ``tool_use`` id that asked for it.
+    """
+
+    def __init__(self, results: Sequence[JsonValue], response: ModelResponse | None) -> None:
+        super().__init__(results)
+        self.response = response
+
+
 @dataclass(frozen=True, slots=True)
 class TextDelta:
     index: int

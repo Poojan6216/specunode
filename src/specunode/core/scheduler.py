@@ -33,7 +33,7 @@ import asyncio
 import contextlib
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from specunode.buffer.dispatcher import Dispatcher
@@ -42,18 +42,26 @@ from specunode.canonical import JsonValue, chash
 from specunode.core.branch import Branch, BranchStatus, ReadRecord, StepCursor
 from specunode.core.decision import Decision, ToolCall, decision_key, decision_payload, is_barrier
 from specunode.core.effects import EffectClass, ToolRegistry
-from specunode.core.graph import END, GraphAdapter, NodeRef, RunSession, session_scope
+from specunode.core.graph import END, GraphAdapter, NodeRef, Parallel, RunSession, session_scope
 from specunode.core.hazards import Hazard, analyse, keys_touched
 from specunode.core.model import (
     CallScope,
     ModelClient,
+    ModelResponse,
     RequestEnvelope,
     ToolUseComplete,
     TurnComplete,
+    TurnResults,
     call_scope,
 )
 from specunode.core.policy import Budget, Policy
-from specunode.core.state import CommittedState, Reducer, patch_payload, resolve_reducers
+from specunode.core.state import (
+    CommittedState,
+    Reducer,
+    _touched_keys,
+    patch_payload,
+    resolve_reducers,
+)
 from specunode.drafters.base import DraftContext, Drafter
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
@@ -88,6 +96,69 @@ class RunResult:
     ledger: Ledger
     steps: int = 0
     error: str | None = None
+
+
+class ParallelWriteConflict(SchedulerError):
+    """Two nodes declared independent both wrote one state key, and no reducer says how."""
+
+    def __init__(self, key: str, first: str, second: str) -> None:
+        super().__init__(
+            f"parallel nodes {first} and {second} both write state key {key!r}; declare a "
+            "reducer for it, or run them one after another"
+        )
+        self.key = key
+
+
+def _not_retired(node_name: str, branch: Branch) -> str:
+    """Why a node that reached retirement did not retire, in words that send the operator to
+    the right place.
+
+    Three failures arrive here and they are different facts. A node refused at retirement --
+    a witnessed read gone stale -- sent nothing; its writes were discarded unsent. A node that
+    raised after its writes went out has effects in the world. And a write that would not
+    dispatch is a fault in the tool, not in the node. Reporting the first as the second sends
+    the operator looking for an effect that never happened.
+    """
+    if branch.status is BranchStatus.SQUASHED:
+        return (
+            f"node {node_name} was refused at retirement and nothing it staged was sent: "
+            f"{branch.reason or 'no reason recorded'}"
+        )
+    if branch.reason:
+        return f"node {node_name} failed after its effects were dispatched: {branch.reason}"
+    return f"effects from node {node_name} did not all dispatch"
+
+
+@dataclass(frozen=True)
+class _GroupOutcome:
+    ok: bool
+    error: str | None
+    committed: CommittedState
+    cursor: StepCursor
+    retired: int
+
+
+def _first_conflict(
+    lanes: Sequence[tuple[NodeRef, str]],
+    branches: Sequence[Branch],
+    reducers: Mapping[str, Reducer],
+    claimed: Mapping[str, str] | None = None,
+) -> ParallelWriteConflict | None:
+    """The first state key two lanes both wrote without a reducer, in declared order.
+
+    ``claimed`` is the keys lanes already retired have committed. A key in a parked lane's
+    delta is one its body has already written, so a clash found mid-body is a real one, even
+    if the body later puts the old value back. What a mid-body check cannot see is what the
+    body writes after it resumes.
+    """
+    claimed = dict(claimed or {})
+    for (_node, node_id), branch in zip(lanes, branches, strict=True):
+        for key in sorted(_touched_keys(branch.state.delta())):
+            owner = claimed.get(key)
+            if owner is not None and key not in reducers:
+                return ParallelWriteConflict(key, owner, node_id)
+            claimed.setdefault(key, node_id)
+    return None
 
 
 @dataclass
@@ -415,6 +486,15 @@ class Scheduler:
                 node = self.graph.next(committed.to_dict())
                 if node is END or isinstance(node, type(END)):
                     break
+                if isinstance(node, Parallel):
+                    group = await self._run_group(node, cursor, committed, reducers)
+                    committed, cursor = group.committed, group.cursor
+                    self._committed, self._cursor = committed, cursor
+                    steps += group.retired
+                    if not group.ok:
+                        ok, error = False, group.error
+                        break
+                    continue
                 assert isinstance(node, NodeRef)
                 cursor, node_id = cursor.visit(node.structural_id)
 
@@ -439,17 +519,8 @@ class Scheduler:
 
                 drained, updated = await self._retire(branch, node_id, committed, reducers)
                 if not drained:
-                    # Two different failures reach here and they need different words. A node
-                    # that *raised* after its writes went out is not a dispatch failure, and
-                    # reporting it as one sends the operator to look at the wrong subsystem
-                    # while an effect is already in the world.
                     ok = False
-                    error = (
-                        f"node {node.name} failed after its effects were dispatched: "
-                        f"{branch.reason}"
-                        if branch.reason
-                        else f"effects from node {node.name} did not all dispatch"
-                    )
+                    error = _not_retired(node.name, branch)
                 if updated is not None:
                     committed = updated
                 cursor = branch.cursor
@@ -658,6 +729,126 @@ class Scheduler:
 
     # -- the pieces -----------------------------------------------------------------------------
 
+    async def _run_group(
+        self,
+        group: Parallel,
+        cursor: StepCursor,
+        committed: CommittedState,
+        reducers: Mapping[str, Reducer],
+    ) -> _GroupOutcome:
+        """Run independent nodes side by side, and retire them one at a time in declared order.
+
+        Every lane forks from the same committed state and the same program position, and its
+        node id -- ``name#visit``, minted here in declared order -- is what keeps two lanes'
+        idempotency keys apart. So the keys, the positions and the journal order are the same
+        whether the bodies overlap or not (``Policy.parallel_nodes``), and a crash in the middle
+        resumes onto the same keys. Retiring in declared order is what makes their effects
+        reach the world in a reproducible order, however the scheduler interleaved them.
+
+        A lane parked on a staged write stays parked until its turn to retire, so bodies
+        overlap up to each one's first write and no further. And nodes named together must be
+        independent: a lane that read what an earlier lane then changed is caught by the
+        retirement re-check if the read was witnessed, and refused -- not re-run.
+        """
+        lanes: list[tuple[NodeRef, str]] = []
+        visited = cursor
+        for node in group.nodes:
+            visited, node_id = visited.visit(node.structural_id)
+            lanes.append((node, node_id))
+        branches = [self._fork_canonical(visited, node_id) for _node, node_id in lanes]
+        for (_node, node_id), branch in zip(lanes, branches, strict=True):
+            await self._journal_fork(branch, node_id)
+
+        async def start(index: int) -> tuple[BranchOutcome, Decision]:
+            node, node_id = lanes[index]
+            return await self._run_node(node, branches[index], node_id, committed)
+
+        if self.policy.parallel_nodes:
+            outcomes = list(await asyncio.gather(*(start(i) for i in range(len(lanes)))))
+        else:
+            outcomes = [await start(i) for i in range(len(lanes))]
+
+        def cursor_after() -> StepCursor:
+            # Past every position any lane consumed, with every lane's visit counted.
+            return replace(visited, step_index=max(b.cursor.step_index for b in branches))
+
+        faulted = next(
+            (i for i, (outcome, _) in enumerate(outcomes) if outcome is BranchOutcome.FAULTED),
+            None,
+        )
+        if faulted is not None:
+            name = lanes[faulted][0].name
+            error = f"node {name} failed: {branches[faulted].reason or 'no reason recorded'}"
+            await self._abandon_lanes(lanes, branches, error)
+            return _GroupOutcome(False, error, committed, cursor_after(), 0)
+
+        # Every lane is at rest -- finished, or parked on a staged write only its retirement
+        # releases -- and nothing any of them staged has left. A clash in what they have written
+        # so far is refused now, with nothing sent. A lane parked on its own write can still
+        # write state after that write returns, which no check can see before it goes out; that
+        # is caught at the lane's commit, and the lanes after it are abandoned unsent.
+        conflict = _first_conflict(lanes, branches, reducers)
+        if conflict is not None:
+            await self._abandon_lanes(lanes, branches, str(conflict))
+            return _GroupOutcome(False, str(conflict), committed, cursor_after(), 0)
+
+        claimed: dict[str, str] = {}
+        for index, ((node, node_id), branch) in enumerate(zip(lanes, branches, strict=True)):
+            rest = (lanes[index + 1 :], branches[index + 1 :])
+            # Again before this lane's writes leave: a lane retired above may have committed,
+            # after its own write returned, a key this one had already written.
+            conflict = _first_conflict([lanes[index]], [branch], reducers, claimed)
+            if conflict is not None:
+                await self._abandon_lanes(lanes[index:], branches[index:], str(conflict))
+                return _GroupOutcome(False, str(conflict), committed, cursor_after(), index)
+            try:
+                drained, updated = await self._retire(
+                    branch, node_id, committed, reducers, claimed=claimed
+                )
+            except ParallelWriteConflict as conflict:
+                await self._abandon_lanes(*rest, str(conflict))
+                return _GroupOutcome(False, str(conflict), committed, cursor_after(), index)
+            if updated is not None:
+                committed = updated
+            if not drained:
+                error = _not_retired(node.name, branch)
+                await self._abandon_lanes(*rest, error)
+                return _GroupOutcome(False, error, committed, cursor_after(), index + 1)
+        return _GroupOutcome(True, None, committed, cursor_after(), len(lanes))
+
+    async def _abandon_lanes(
+        self, lanes: Sequence[tuple[NodeRef, str]], branches: Sequence[Branch], reason: str
+    ) -> None:
+        """Close lanes that will not retire: stop them, discard what they staged, journal it.
+
+        None of them has retired, so none of their writes has left -- which is the whole of
+        what makes abandoning them safe. Each still ends in exactly one of the ways a branch
+        ends, in the durable record, so no reader finds a fork without a resolution.
+        """
+        for (_node, node_id), branch in zip(lanes, branches, strict=True):
+            task = branch.task
+            if isinstance(task, asyncio.Task) and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            own = branch.reason
+            if branch.status is not BranchStatus.SQUASHED:
+                branch.squash(f"abandoned: {reason}")
+            discarded = await self.buffer.discard_and_journal(branch, f"abandoned: {reason}")
+            self.counters.effects_discarded += discarded
+            await self.journal.append_async(
+                self.run_id,
+                "branch_resolved",
+                {
+                    "v": 1,
+                    "branch_id": branch.id,
+                    "step": branch.fork_step,
+                    "status": "faulted" if own else "squashed",
+                    "reason": own or f"abandoned: {reason}",
+                    "node_id": node_id,
+                },
+            )
+
     def _fork_canonical(self, cursor: StepCursor, node_id: str) -> Branch:
         branch = Branch(
             id=new_ulid(),
@@ -842,6 +1033,7 @@ class Scheduler:
         node_id: str,
         committed: CommittedState | None = None,
         reducers: Mapping[str, Reducer] | None = None,
+        claimed: dict[str, str] | None = None,
     ) -> tuple[bool, CommittedState | None]:
         """R5 through R9: validate reads, confirm, make it durable, drain, then retire."""
         # E3, before anything is confirmed. ``validate_reads`` is the retirement-time witness
@@ -992,7 +1184,7 @@ class Scheduler:
         # ordering bug.
         new_committed = committed
         if committed is not None:
-            new_committed = await self._commit(branch, committed, reducers or {})
+            new_committed = await self._commit(branch, committed, reducers or {}, claimed)
 
         branch.retire()
         self._retire_seq += 1
@@ -1023,11 +1215,24 @@ class Scheduler:
         branch: Branch,
         committed: CommittedState,
         reducers: Mapping[str, Reducer],
+        claimed: dict[str, str] | None = None,
     ) -> CommittedState:
         """Apply the retiring branch's delta, and journal what it did to committed state."""
         patch = branch.state.delta()
         if not patch:
             return committed
+        if claimed is not None:
+            # A node in a Parallel group. Its delta was taken against the state the whole group
+            # forked from, so applying it on top of a sibling's would silently overwrite any key
+            # they both wrote -- the later one in declared order winning, with no one told. A
+            # declared reducer is the developer saying how to combine them; without one, refuse.
+            touched = _touched_keys(patch)
+            for key in sorted(touched):
+                owner = claimed.get(key)
+                if owner is not None and owner != branch.node_id and key not in reducers:
+                    raise ParallelWriteConflict(key, owner, branch.node_id)
+            for key in touched:
+                claimed.setdefault(key, branch.node_id)
         result = committed.commit(patch, reducers=reducers)
         await self.journal.append_async(
             self.run_id,
@@ -1155,6 +1360,7 @@ class Scheduler:
             # The ledger reads its window size from here; it read -1 and rendered "-".
             "alpha_window": self.policy.alpha_window,
             "alpha_floor": self.policy.alpha_floor,
+            "speculate_writes": self.policy.speculate_writes,
             "stage_irreversible": self.policy.stage_irreversible,
             "on_stale_read": self.policy.on_stale_read,
             "on_unverifiable_read": self.policy.on_unverifiable_read,
@@ -1296,6 +1502,9 @@ class SpeculativeTurn:
         self._tier: int = 1
         #: What the open prediction cost to produce; charged to ``wasted_tokens`` on a squash.
         self._cost_tokens: int = 0
+        #: The model's whole reply, from ``TurnComplete``, for a caller that continues the
+        #: conversation.
+        self.response: ModelResponse | None = None
 
     async def run(self, envelope: RequestEnvelope) -> list[JsonValue]:
         scheduler = self._scheduler
@@ -1321,11 +1530,30 @@ class SpeculativeTurn:
             # ``branch_forked`` with no ``branch_resolved`` -- a branch that ended in none of
             # the three ways branch.py says every branch ends.
             await self._squash_open("turn_failed")
+            await self._abandon(slots)
             raise
 
         # Any speculation still open when the turn ended predicted a call the model never made.
         await self._squash_open("turn_ended")
-        return await self._settle_turn(tools, slots)
+        return TurnResults(await self._settle_turn(tools, slots), self.response)
+
+    async def _abandon(self, slots: list[asyncio.Task[JsonValue] | None]) -> None:
+        """Cancel and await every call this turn started, so none outlives the turn.
+
+        A turn whose stream raised left its early-issued reads running. They reached upstream
+        *after* the run had returned a failure to its caller, and each one appended a
+        ``tool_result`` to the journal after ``run_finished`` -- which every reader of a run,
+        recovery included, takes to be the run's last entry. A turn that failed is over, and
+        so is everything it started.
+        """
+        pending = [task for task in slots if task is not None and not task.done()]
+        if self._adopted is not None and not self._adopted.done():
+            pending.append(self._adopted)
+        self._adopted = None
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def _consume(
         self,
@@ -1362,6 +1590,7 @@ class SpeculativeTurn:
                 await self._speculate_next(actual)
             elif isinstance(event, TurnComplete):
                 self.stream_ended_at = time.monotonic()
+                self.response = event.response
 
     async def _settle_turn(
         self, tools: BranchTools, slots: list[asyncio.Task[JsonValue] | None]

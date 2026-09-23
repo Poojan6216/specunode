@@ -193,3 +193,47 @@ def test_an_unset_sampling_parameter_is_not_sent() -> None:
     assert asked["temperature"] == 0.0
     assert asked["top_p"] == 0.9
     assert asked["top_k"] == 5
+
+
+def test_prompt_caching_is_on_by_default_and_is_transport_not_content() -> None:
+    """An agent loop re-sends its whole conversation every turn; caching is what that needs.
+
+    It must not change what the model is asked: the journal and replay compare the request
+    hash, and a setting that moved it would make a cached run and an uncached one of the same
+    conversation look like two different questions.
+    """
+    from specunode.core.model import Message, RequestEnvelope, TextBlock, request_hash
+    from specunode.integrations.anthropic import envelope_to_params
+
+    envelope = RequestEnvelope(
+        model="claude-sonnet-5",
+        messages=(Message(role="user", content=(TextBlock(text="go"),)),),
+        max_tokens=16,
+    )
+    assert envelope_to_params(envelope, cache=True)["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in envelope_to_params(envelope)
+
+    model = AnthropicModel(client=object())  # type: ignore[arg-type]
+    assert model.cache is True, "caching should be the default for an agent runtime"
+    assert model._params(envelope)["cache_control"] == {"type": "ephemeral"}
+    off = AnthropicModel(client=object(), cache=False)  # type: ignore[arg-type]
+    assert "cache_control" not in off._params(envelope)
+
+    # The adapter setting is not part of the request, so the hash cannot depend on it.
+    assert request_hash(envelope) == request_hash(envelope)
+
+
+def test_a_structured_tool_result_reaches_the_model_as_json() -> None:
+    """Python's repr is not a wire format: single quotes, True and None were reaching the model."""
+    import json
+
+    from specunode.core.model import ToolResultBlock
+
+    block = ToolResultBlock(tool_use_id="t1", content={"ok": True, "b": None, "a": [1, 2]})
+    [text] = block_to_api(block)["content"]  # type: ignore[index]
+    decoded = json.loads(text["text"])
+    assert decoded == {"ok": True, "b": None, "a": [1, 2]}
+    assert "'" not in text["text"] and "True" not in text["text"]
+    # Canonical, so the same result is always the same bytes and a cached prefix holds.
+    same = ToolResultBlock(tool_use_id="t1", content={"a": [1, 2], "b": None, "ok": True})
+    assert block_to_api(block) == block_to_api(same)

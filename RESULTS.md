@@ -69,18 +69,67 @@ The signature bound of 53.4% on the same steps says the index ranks the right *t
 
 Tier 1 copies argument values it has already seen, and the section above measures the ceiling that puts on it. A draft model can *invent* a value, so it is the only thing that can clear that ceiling, and whether it does is the question the store buffer's whole case rests on. Same corpus, same grader, same exact-equality verdict.
 
-Draft model: `claude-haiku-4-5`, 428 steps sampled with seed 20260918 from the positions the offline measurement grades, each shown the last 12 calls with their real argument values (`values_full.json`). Spend: $4.0074.
+Draft model: `claude-haiku-4-5`, 1000 steps sampled with seed 20260918 from the positions the offline measurement grades, each shown the last 12 calls with their real argument values (`values_full.json`). Spend: $3.0429.
 
 | Measure | Value |
 |---|---|
-| **Acceptance rate** | **0.0607** [0.0397, 0.0841] |
-| Guesses offered | 0.9720 (12 unparsable) |
-| Right tool, any arguments | 0.4673 |
-| Right tool, wrong arguments | 0.4065 |
-| Accepted on a write | 26 of 412 |
-| Accepted on a read | 0 of 16 |
+| **Acceptance rate** | **0.0690** [0.0540, 0.0860] |
+| Guesses offered | 0.9790 (21 unparsable) |
+| Right tool, any arguments | 0.4730 |
+| Right tool, wrong arguments | 0.4040 |
+| Accepted on a write | 69 of 968 |
+| Accepted on a read | 0 of 32 |
 
 Under the policy the runtime runs -- an open guess is squashed when the turn ends -- acceptance on this corpus is zero for any predictor, because every call in it opens a new model turn. This grades the generous policy instead.
+
+---
+
+### What a guess is worth
+
+The acceptance rates above say how often a predictor is right. This says what being right is *worth*, which no real predictor can answer on its own: a guesser that knows the model's turn in advance and names the right next call with a chosen probability, otherwise a valid wrong one, measured against tier-0 early issue alone -- so each cell is what guessing adds *on top of* what the runtime already does. No model and no network: the stand-in streams 500 ms per block, calibrated from the real sweep, 8 runs per cell, on `ops_agent`, the one sample app that hands its turn to the runtime.
+
+| Tool latency | Accuracy | Guess reads and writes | Guess reads only |
+|---|---|---|---|
+| 500 ms | 0.00 | -0.2% [-0.3%, -0.0%] | -0.4% [-0.9%, +0.0%] |
+| 500 ms | 0.25 | -0.3% [-0.9%, +0.1%] | -0.1% [-0.4%, +0.1%] |
+| 500 ms | 0.50 | -0.2% [-0.4%, +0.1%] | -0.1% [-0.5%, +0.1%] |
+| 500 ms | 0.75 | -0.9% [-1.1%, -0.7%] | -0.8% [-1.1%, -0.5%] |
+| 500 ms | 1.00 | -1.3% [-2.1%, -0.7%] | -1.3% [-2.0%, -0.8%] |
+| 2000 ms | 0.00 | +0.1% [-0.1%, +0.4%] | +0.1% [-0.2%, +0.3%] |
+| 2000 ms | 0.25 | +2.4% [+0.8%, +3.9%] | +2.5% [+0.9%, +4.2%] |
+| 2000 ms | 0.50 | +4.2% [+2.9%, +5.0%] | +4.2% [+3.0%, +5.0%] |
+| 2000 ms | 0.75 | +4.8% [+4.5%, +5.1%] | +4.7% [+4.4%, +5.0%] |
+| 2000 ms | 1.00 | +4.7% [+4.4%, +5.0%] | +4.8% [+4.5%, +5.1%] |
+
+Three things this settles, each of which the scheduler's structure predicts and none of which was a result until it was measured:
+
+- **A hit is worth at most one block of streaming.** The drafter is asked after each block and the next block resolves the guess, so a correct guess starts its call one block early -- which is worth something only when the call is slower than early issue could already hide.
+- **A miss costs no wall clock.** It is squashed when the real block arrives and the real call is issued as it always was. What a miss costs is money: the upstream read it made, and for a draft model the tokens.
+- **Guessing a write adds nothing over guessing reads only.** A staged write cannot be dispatched before its branch retires, and the drafter does not chain past one. The store buffer is what makes guessing a write *safe*; it does not make it *faster*.
+
+---
+
+### When the model is the slow part: fewer replies, and replies side by side
+
+A guess buys at most one block of a model's stream (above). When the model is what a run waits on, the time is in the replies themselves, and infrastructure has two levers left: how many replies a run needs, and how many of them it waits on at once. Both are measured here against a stand-in model whose reply takes 1500 ms before its first block -- reading the prompt and thinking -- and 300 ms per block. Those are settings, not measurements: the wall clock below is what the runtime makes of them. The reply counts and in-flight counts do not depend on them. 5 runs per cell, with a bootstrap interval on the difference.
+
+**Multi-call replies** (`examples/incident_agent`). One alert -- four pipelines to check, a runbook to read, two restarts, one summary -- worked one call per reply, which is how every turn in the corpus above behaves, and with every independent call in one reply. The runtime runs a reply's reads together as they parse, holds its writes until the reply is durable, and hands every result back in one message.
+
+| Tool latency | One call per reply | Every independent call at once | Saving |
+|---|---|---|---|
+| 0 ms | 9 replies, 19200 ms | 4 replies, 9968 ms | +48.1% [+47.6%, +49.0%] |
+| 300 ms | 9 replies, 20246 ms | 4 replies, 11198 ms | +44.7% [+44.6%, +44.8%] |
+
+**Parallel nodes** (`examples/fanout_agent`). Three independent checks, each one model reply, then a report. The router names the three at once; the runtime runs their bodies side by side and retires them in the order it named them, so their effects reach the world in that order however the bodies interleaved.
+
+| Tool latency | One after another | Side by side | Saving |
+|---|---|---|---|
+| 0 ms | 1 model call in flight, 6350 ms | 3 in flight, 2153 ms | +66.1% [+65.7%, +66.3%] |
+| 300 ms | 1 model call in flight, 8467 ms | 3 in flight, 3656 ms | +56.8% [+56.7%, +56.9%] |
+
+Runs that changed the world exactly as a correct run does: 40 of 40. **Effects reaching the world from a branch that never retired: 0.**
+
+What this does not show is what a real model does when told it may ask for several calls at once, or what prompt caching takes off each reply. Both need a real model, and neither is measured yet.
 
 ---
 
@@ -145,21 +194,9 @@ That is 87.7% of wall clock here, and the percentage is the misleading half of i
 
 ### Wall-clock latency, against a real model
 
-Target: `claude-sonnet-5`. 270 of 270 runs -- 30 seeded tasks, 3 sample apps, 3 arms. Means with 95% percentile-bootstrap intervals over tasks. Spend: $1.6411 of a $12.0 cap, at the prices printed in the results file.
+The 270 runs in `bench/results/latency.json` were taken before two faults in their arms were found: their `B_seq` already issued reads early, so it was not the sequential baseline it was labelled as, and their `B_readonly_spec` was given no predictor, so it never guessed. Their savings are measured against the wrong baseline and are not quoted here. The 0 ms rung of the sweep below measures the same thing with the corrected arms; re-running this table is pending.
 
-The three arms: **B_seq** runs sequentially with speculation off. **B_readonly_spec** speculates on reads only and treats every write as a barrier — PASTE's policy, credited. **B_specunode** stages writes in the store buffer, which is what this project adds.
-
-| Workload | B_seq | B_readonly_spec | B_specunode | Wall clock saved vs B_seq | alpha | Leaks |
-|---|---|---|---|---|---|---|
-| `ops_agent` | 1661 [1591, 1743] | 1704 [1610, 1852] | 1687 [1595, 1798] | -1.6% | 0.67 | 0 |
-| `research_agent` | 4961 [4715, 5262] | 4729 [4508, 4977] | 4912 [4685, 5163] | +1.0% | 1.00 | 0 |
-| `support_agent` | 1952 [1859, 2043] | 2070 [1959, 2194] | 2254 [2040, 2583] | -15.5% | 1.00 | 0 |
-
-Milliseconds, lower is better. The saving is `1 - B_specunode / B_seq`, so a **negative** figure means the speculative arm was *slower* than running sequentially -- which is a result, not a bug in the table.
-
-**Effects reaching the world from a branch that never retired: 0.** That is the number this project exists to keep at zero, and it is the only one here that is a claim about correctness rather than about speed.
-
-**The break-even alpha is still not measured.** It is the acceptance rate at which the speculative arm's wall clock equals the sequential arm's, and finding it needs a sweep across drafters of differing accuracy rather than a single run at whatever alpha the tier-1 index happens to deliver. `alpha_floor` stays `None` — the gate is inactive rather than set to a guessed number.
+**Effects reaching the world from a branch that never retired: 0.** That count does not depend on which arm was the baseline.
 
 ---
 
@@ -167,26 +204,20 @@ Milliseconds, lower is better. The saving is `1 - B_specunode / B_seq`, so a **n
 
 Running ahead hides tool latency, and the sample apps' tools are a dictionary in memory. So the flat result above is measured in the one regime where this design cannot win, and the honest question is not whether it helps but how slow a tool has to be before it does.
 
-Every arm pays the same injected latency, on both reads and writes. Target: `claude-sonnet-5`, 8 tasks per arm per rung. The saving is against `B_strict_seq` -- the arm that waits for the turn and then calls the tools in order -- with a bootstrap interval on the difference.
+Every arm pays the same injected latency, on both reads and writes. Target: `claude-sonnet-5`, 20 tasks per arm per rung. The saving is against `B_strict_seq` -- the arm that waits for the turn and then calls the tools in order -- with a bootstrap interval on the difference.
 
 | Tool latency | Workload | B_strict_seq | B_specunode | Saving |
 |---|---|---|---|---|
-| 0 ms | `ops_agent` | 1650 ms | 1755 ms | -6.4% [-22.1%, +6.0%] |
-| 0 ms | `research_agent` | 5030 ms | 5090 ms | -1.5% [-14.6%, +9.4%] |
-| 0 ms | `support_agent` | 2215 ms | 1982 ms | +9.9% [-4.0%, +22.8%] |
-| 200 ms | `ops_agent` | 2725 ms | 2626 ms | +3.0% [-10.5%, +19.3%] |
-| 200 ms | `research_agent` | 5964 ms | 6452 ms | -8.2% [-16.0%, -0.8%] |
-| 200 ms | `support_agent` | 2748 ms | 2900 ms | -5.7% [-20.5%, +7.4%] |
-| 500 ms | `ops_agent` | 3700 ms | 3686 ms | +0.4% [-2.7%, +3.3%] |
-| 500 ms | `research_agent` | 8135 ms | 7942 ms | +2.3% [-6.5%, +10.1%] |
-| 500 ms | `support_agent` | 3548 ms | 3524 ms | +0.6% [-5.5%, +7.1%] |
-| 1000 ms | `ops_agent` | 6353 ms | 5699 ms | +10.1% [+2.1%, +17.6%] |
-| 1000 ms | `research_agent` | 10844 ms | 11219 ms | -3.5% [-8.9%, +1.4%] |
-| 1000 ms | `support_agent` | 4981 ms | 5119 ms | -2.9% [-7.1%, +1.3%] |
-| 2000 ms | `ops_agent` | 9732 ms | 9811 ms | -0.8% [-2.1%, +0.5%] |
-| 2000 ms | `research_agent` | 16662 ms | 16948 ms | -1.7% [-5.4%, +2.1%] |
-| 2000 ms | `support_agent` | 8262 ms | 7980 ms | +3.4% [+0.4%, +6.7%] |
+| 0 ms | `ops_agent` | 1745 ms | 1775 ms | -1.8% [-17.2%, +12.9%] |
+| 0 ms | `research_agent` | 4834 ms | 4797 ms | +0.7% [-6.9%, +7.8%] |
+| 0 ms | `support_agent` | 2054 ms | 1997 ms | +2.6% [-5.9%, +10.7%] |
+| 500 ms | `ops_agent` | 4292 ms | 3673 ms | +14.4% [+12.1%, +16.7%] |
+| 500 ms | `research_agent` | 8495 ms | 8565 ms | -0.8% [-4.9%, +3.2%] |
+| 500 ms | `support_agent` | 4039 ms | 4067 ms | -0.7% [-5.1%, +3.5%] |
+| 2000 ms | `ops_agent` | 11764 ms | 9923 ms | +15.6% [+13.8%, +17.4%] |
+| 2000 ms | `research_agent` | 18991 ms | 19226 ms | -1.2% [-4.2%, +1.4%] |
+| 2000 ms | `support_agent` | 10067 ms | 10100 ms | -0.3% [-1.9%, +1.3%] |
 
 An interval that spans zero resolves no difference at this sample size; the model turn is seconds long and varies by more than the tool latency being hidden, which is what the width of these intervals is made of.
 
-Spend: $2.9393, 2963 s of wall clock.
+Spend: $4.4267, 5169 s of wall clock.

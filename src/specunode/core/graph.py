@@ -96,7 +96,32 @@ class _End:
 
 END = _End()
 
-NextNode: TypeAlias = NodeRef | _End
+
+@dataclass(frozen=True)
+class Parallel:
+    """Nodes that do not depend on one another, to run side by side.
+
+    Returned by ``next()`` in place of a single node. Each runs on a branch of its own, forked
+    from the same committed state, so none of them sees another's writes -- which is the
+    developer's declaration that none of them needs to. Their bodies overlap in time; they
+    **retire one at a time, in the order listed**, so their effects reach the world in that
+    order whatever order they finished in, and a run is reproducible however the scheduler
+    interleaved them. It is the reorder buffer of the processor analogy, applied to nodes.
+
+    Declaring nodes independent is a claim the runtime can partly check: two of them writing
+    the same state key is refused unless a reducer is declared for that key. It cannot check
+    that one does not *read* what another writes; like an effect class, that is the
+    developer's word.
+    """
+
+    nodes: tuple[NodeRef, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.nodes) < 2:
+            raise ValueError("a Parallel group needs at least two nodes; one is just a node")
+
+
+NextNode: TypeAlias = NodeRef | Parallel | _End
 
 
 @dataclass(frozen=True)

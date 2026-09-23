@@ -42,6 +42,8 @@ CLAIM_FILES = ("README.md", "RESULTS.md")
 _NUMBER = re.compile(
     r"(?<![\w.,$])(-?)(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:_\d+)*(?:\.\d+)?)(?![\d_,.])"
 )
+#: A results-file key that is a number and nothing else: a latency rung, an accuracy level.
+_NUMERIC_KEY = re.compile(r"-?\d+(?:\.\d+)?")
 _NUMBERS_OK = re.compile(r"numbers-ok:\s*\S")
 _CITED = re.compile(r"\[cited\]", re.IGNORECASE)
 
@@ -97,7 +99,12 @@ def _numeric_strings(value: object, out: set[str]) -> None:
         for match in _NUMBER.finditer(value):
             out.add(match.group(1) + match.group(2))
     elif isinstance(value, dict):
-        for item in value.values():
+        for key, item in value.items():
+            # A file that files its points under their settings -- ``"by_alpha": {"0.75": ...}``
+            # -- records those settings as much as it records its values. Only a key that is a
+            # number outright counts: the "95" in ``ci-95`` is part of a name, not a figure.
+            if isinstance(key, str) and _NUMERIC_KEY.fullmatch(key):
+                _numeric_strings(float(key) if "." in key else int(key), out)
             _numeric_strings(item, out)
     elif isinstance(value, list):
         for item in value:
@@ -194,6 +201,16 @@ _MEASURED = {"48.5", "0.7", "1842", "1,842", "12"}
 )
 def test_the_detector_fires_on_an_untraceable_number(planted: str) -> None:
     assert untraceable(planted, _MEASURED), f"detector missed a planted number: {planted!r}"
+
+
+def test_a_number_a_results_file_files_its_points_under_traces(tmp_path: Path) -> None:
+    (tmp_path / "grid.json").write_text(
+        json.dumps({"by_alpha": {"0.75": {"saving": 0.048}}, "ci-95": {"low": 0.031}}),
+        encoding="utf-8",
+    )
+    measured = measured_numbers(tmp_path)
+    assert "0.75" in measured
+    assert "95" not in measured, "a digit inside a key's name was taken for a measurement"
 
 
 @pytest.mark.parametrize(

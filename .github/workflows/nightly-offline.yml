@@ -33,6 +33,10 @@ jobs:
         run: uv run python bench/chaos/run_chaos.py --concurrency --out bench/results/concurrency.json
       - name: adversarial suite
         run: uv run python bench/adversarial/run_attacks.py --all --out bench/results/attacks.json
+      - name: break-even accuracy (scripted model, no network)
+        run: uv run python bench/offline/run_break_even.py --out bench/results/break_even.json
+      - name: fewer replies and parallel nodes (stand-in model, no network)
+        run: uv run python bench/offline/run_model_bound.py --out bench/results/model_bound.json
       - name: overhead
         run: uv run python bench/offline/run_opportunity.py --overhead --out bench/results/overhead.json
       - name: regenerate RESULTS.md and check README traceability

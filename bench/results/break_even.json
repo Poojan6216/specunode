@@ -1,0 +1,462 @@
+{
+  "baseline": "tier-0 early issue on, no guessing (Policy(speculation=False))",
+  "bench": "break_even",
+  "model": "scripted",
+  "points": {
+    "2000": {
+      "by_alpha": {
+        "0.00": {
+          "reads_and_writes": {
+            "guesses_accepted": 0,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0045,
+              "ci95_low": -0.0014,
+              "mean": 0.0015
+            },
+            "wall_ms": [
+              11063.854,
+              11063.052,
+              11062.2,
+              11060.934,
+              11078.182,
+              11068.4,
+              11113.195,
+              11103.502
+            ],
+            "wall_ms_mean": 11076.7
+          },
+          "reads_only": {
+            "guesses_accepted": 0,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0034,
+              "ci95_low": -0.0019,
+              "mean": 0.0006
+            },
+            "wall_ms": [
+              11096.475,
+              11089.496,
+              11080.396,
+              11080.727,
+              11090.191,
+              11085.934,
+              11089.302,
+              11078.353
+            ],
+            "wall_ms_mean": 11086.4
+          }
+        },
+        "0.25": {
+          "reads_and_writes": {
+            "guesses_accepted": 5,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0394,
+              "ci95_low": 0.0083,
+              "mean": 0.0238
+            },
+            "wall_ms": [
+              10568.765,
+              10569.862,
+              11082.449,
+              11073.511,
+              10566.668,
+              10633.95,
+              11076.713,
+              11069.981
+            ],
+            "wall_ms_mean": 10830.2
+          },
+          "reads_only": {
+            "guesses_accepted": 4,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0415,
+              "ci95_low": 0.0092,
+              "mean": 0.0251
+            },
+            "wall_ms": [
+              10570.874,
+              10558.75,
+              11068.756,
+              11076.598,
+              10561.841,
+              10561.745,
+              11061.402,
+              11059.41
+            ],
+            "wall_ms_mean": 10814.9
+          }
+        },
+        "0.50": {
+          "reads_and_writes": {
+            "guesses_accepted": 10,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0496,
+              "ci95_low": 0.0294,
+              "mean": 0.0417
+            },
+            "wall_ms": [
+              10557.126,
+              10575.57,
+              10557.126,
+              11083.41,
+              10559.899,
+              10560.087,
+              10563.008,
+              10592.072
+            ],
+            "wall_ms_mean": 10631.0
+          },
+          "reads_only": {
+            "guesses_accepted": 7,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0501,
+              "ci95_low": 0.0301,
+              "mean": 0.0423
+            },
+            "wall_ms": [
+              10554.638,
+              10586.948,
+              10564.162,
+              11071.017,
+              10555.643,
+              10561.654,
+              10554.382,
+              10545.606
+            ],
+            "wall_ms_mean": 10624.3
+          }
+        },
+        "0.75": {
+          "reads_and_writes": {
+            "guesses_accepted": 12,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0506,
+              "ci95_low": 0.0455,
+              "mean": 0.0479
+            },
+            "wall_ms": [
+              10558.553,
+              10562.598,
+              10560.161,
+              10563.473,
+              10568.758,
+              10564.942,
+              10551.453,
+              10560.693
+            ],
+            "wall_ms_mean": 10561.3
+          },
+          "reads_only": {
+            "guesses_accepted": 8,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0497,
+              "ci95_low": 0.0444,
+              "mean": 0.0469
+            },
+            "wall_ms": [
+              10557.353,
+              10568.799,
+              10582.138,
+              10572.183,
+              10567.359,
+              10572.515,
+              10592.457,
+              10570.297
+            ],
+            "wall_ms_mean": 10572.9
+          }
+        },
+        "1.00": {
+          "reads_and_writes": {
+            "guesses_accepted": 16,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0501,
+              "ci95_low": 0.0442,
+              "mean": 0.0471
+            },
+            "wall_ms": [
+              10559.653,
+              10564.14,
+              10633.376,
+              10553.063,
+              10561.453,
+              10568.871,
+              10561.72,
+              10562.381
+            ],
+            "wall_ms_mean": 10570.6
+          },
+          "reads_only": {
+            "guesses_accepted": 8,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0505,
+              "ci95_low": 0.0453,
+              "mean": 0.0479
+            },
+            "wall_ms": [
+              10561.26,
+              10562.717,
+              10562.74,
+              10560.095,
+              10561.835,
+              10556.087,
+              10550.237,
+              10581.68
+            ],
+            "wall_ms_mean": 10562.1
+          }
+        }
+      },
+      "early_issue_only_ms": 11093.0,
+      "early_issue_only_wall_ms": [
+        11174.295,
+        11156.404,
+        11085.982,
+        11071.122,
+        11071.744,
+        11050.336,
+        11076.88,
+        11057.229
+      ]
+    },
+    "500": {
+      "by_alpha": {
+        "0.00": {
+          "reads_and_writes": {
+            "guesses_accepted": 0,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": -0.0001,
+              "ci95_low": -0.0032,
+              "mean": -0.0017
+            },
+            "wall_ms": [
+              3553.217,
+              3562.218,
+              3542.798,
+              3551.912,
+              3555.262,
+              3556.249,
+              3558.297,
+              3554.89
+            ],
+            "wall_ms_mean": 3554.4
+          },
+          "reads_only": {
+            "guesses_accepted": 0,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0,
+              "ci95_low": -0.0093,
+              "mean": -0.0036
+            },
+            "wall_ms": [
+              3556.712,
+              3552.238,
+              3554.909,
+              3554.259,
+              3548.326,
+              3555.058,
+              3543.592,
+              3626.297
+            ],
+            "wall_ms_mean": 3561.4
+          }
+        },
+        "0.25": {
+          "reads_and_writes": {
+            "guesses_accepted": 5,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.001,
+              "ci95_low": -0.0088,
+              "mean": -0.0031
+            },
+            "wall_ms": [
+              3557.053,
+              3553.502,
+              3531.455,
+              3624.122,
+              3557.301,
+              3558.613,
+              3552.141,
+              3541.436
+            ],
+            "wall_ms_mean": 3559.5
+          },
+          "reads_only": {
+            "guesses_accepted": 4,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0008,
+              "ci95_low": -0.0037,
+              "mean": -0.0013
+            },
+            "wall_ms": [
+              3539.498,
+              3550.886,
+              3549.433,
+              3552.062,
+              3546.698,
+              3574.744,
+              3555.267,
+              3556.898
+            ],
+            "wall_ms_mean": 3553.2
+          }
+        },
+        "0.50": {
+          "reads_and_writes": {
+            "guesses_accepted": 10,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0009,
+              "ci95_low": -0.0042,
+              "mean": -0.0016
+            },
+            "wall_ms": [
+              3556.23,
+              3552.168,
+              3577.653,
+              3551.697,
+              3556.037,
+              3551.543,
+              3533.846,
+              3553.879
+            ],
+            "wall_ms_mean": 3554.1
+          },
+          "reads_only": {
+            "guesses_accepted": 7,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": 0.0015,
+              "ci95_low": -0.0048,
+              "mean": -0.0015
+            },
+            "wall_ms": [
+              3554.874,
+              3544.538,
+              3582.493,
+              3574.367,
+              3534.373,
+              3539.275,
+              3555.207,
+              3546.38
+            ],
+            "wall_ms_mean": 3553.9
+          }
+        },
+        "0.75": {
+          "reads_and_writes": {
+            "guesses_accepted": 12,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": -0.007,
+              "ci95_low": -0.0105,
+              "mean": -0.0087
+            },
+            "wall_ms": [
+              3575.113,
+              3579.759,
+              3580.13,
+              3582.385,
+              3573.549,
+              3594.306,
+              3572.394,
+              3577.079
+            ],
+            "wall_ms_mean": 3579.3
+          },
+          "reads_only": {
+            "guesses_accepted": 8,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": -0.0051,
+              "ci95_low": -0.0106,
+              "mean": -0.008
+            },
+            "wall_ms": [
+              3579.564,
+              3575.519,
+              3545.196,
+              3571.001,
+              3581.389,
+              3591.233,
+              3586.738,
+              3585.035
+            ],
+            "wall_ms_mean": 3577.0
+          }
+        },
+        "1.00": {
+          "reads_and_writes": {
+            "guesses_accepted": 16,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": -0.0073,
+              "ci95_low": -0.0215,
+              "mean": -0.0129
+            },
+            "wall_ms": [
+              3583.437,
+              3691.266,
+              3561.27,
+              3588.967,
+              3576.228,
+              3578.179,
+              3594.042,
+              3580.638
+            ],
+            "wall_ms_mean": 3594.3
+          },
+          "reads_only": {
+            "guesses_accepted": 8,
+            "guesses_offered": 16,
+            "saving_vs_early_issue_ci95": {
+              "ci95_high": -0.0084,
+              "ci95_low": -0.0202,
+              "mean": -0.013
+            },
+            "wall_ms": [
+              3580.169,
+              3577.161,
+              3579.451,
+              3592.461,
+              3588.205,
+              3580.408,
+              3676.927,
+              3579.621
+            ],
+            "wall_ms_mean": 3594.3
+          }
+        }
+      },
+      "early_issue_only_ms": 3548.4,
+      "early_issue_only_wall_ms": [
+        3560.081,
+        3543.458,
+        3547.331,
+        3539.837,
+        3554.907,
+        3543.377,
+        3548.669,
+        3549.599
+      ]
+    }
+  },
+  "seed": 20260923,
+  "tasks_per_point": 8,
+  "think_ms_per_block": 500.0,
+  "wall_seconds": 1262.2,
+  "workload": "ops_agent"
+}

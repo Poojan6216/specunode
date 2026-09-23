@@ -32,6 +32,7 @@ from specunode.core.graph import (
     AdapterCapabilities,
     NextNode,
     NodeRef,
+    Parallel,
     RoutingIsInternal,
     RunSession,
 )
@@ -111,7 +112,8 @@ class PlainAdapter:
     """A graph of decorated functions plus a router. The scheduler drives it."""
 
     node_fns: Mapping[str, NodeFn]
-    route: Callable[[Mapping[str, JsonValue]], str | None]
+    #: The next node's name; several names to run those nodes side by side; ``None`` to stop.
+    route: Callable[[Mapping[str, JsonValue]], str | Sequence[str] | None]
     _order: tuple[str, ...] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -119,7 +121,9 @@ class PlainAdapter:
 
     @classmethod
     def of(
-        cls, fns: Iterable[NodeFn], route: Callable[[Mapping[str, JsonValue]], str | None]
+        cls,
+        fns: Iterable[NodeFn],
+        route: Callable[[Mapping[str, JsonValue]], str | Sequence[str] | None],
     ) -> PlainAdapter:
         return cls({_name_of(fn): fn for fn in fns}, route)
 
@@ -150,9 +154,14 @@ class PlainAdapter:
         chosen = self.route(state)
         if chosen is None:
             return END
-        if chosen not in self.node_fns:
-            raise KeyError(f"router chose {chosen!r}, which is not a node in this graph")
-        return NodeRef(name=chosen)
+        # A router may name several nodes at once: they are independent and run side by side.
+        names = [chosen] if isinstance(chosen, str) else list(chosen)
+        for name in names:
+            if name not in self.node_fns:
+                raise KeyError(f"router chose {name!r}, which is not a node in this graph")
+        if len(names) == 1:
+            return NodeRef(name=names[0])
+        return Parallel(nodes=tuple(NodeRef(name=name) for name in names))
 
     async def run_node(self, node: NodeRef, session: RunSession) -> Decision:
         fn = self.node_fns.get(node.name)

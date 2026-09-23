@@ -730,12 +730,21 @@ Goal: numbers, with the negative ones first.
   *Verify:* `B_naive_parallel` leaks on the Demo 1 workload and the leak count is reported, not hidden.
 - [ ] **6.4 Online latency bench.** `bench/online/run_latency.py`: the three sample apps × 30 seeded tasks × {B_seq, B_readonly_spec, B_specunode} with the real target model, budget-capped; per run: wall clock, tokens (target, draft), wasted tokens, α per tier, stalls by hazard, stale reads, effects dispatched, leaks (must be 0). Report the break-even α per workload (the α at which `B_specunode` wall clock equals `B_seq`). Bootstrap CIs over tasks.
   *Verify:* `bench/results/latency.json`; spend stays under the cap and the report records the spend.
+  *Status, 2026-09-23:* run once — 270 runs, $1.64 — and two faults were found in its arms afterwards: `B_seq` already issued reads early, so it was not the sequential baseline it was labelled as, and `B_readonly_spec` was handed no predictor, so it never guessed. Both are fixed and tested (`B_strict_seq` is the new baseline; both guessing arms get the same drafter). The table is not quoted until it is re-run. The corrected comparison is 6.8's 0 ms rung, and the break-even α is 6.9.
 - [x] **6.5 Overhead.** Journaling + classification overhead of `B_seq` vs the same graph on vanilla LangGraph with no SpecuNode, same `ReplayModel`. Reported as absolute ms per step and as a fraction of wall clock.
   *Verify:* `bench/results/overhead.json`.
 - [x] **6.6 Report generation.** `bench/report.py` → `RESULTS.md`; `bench/plots/make_plots.py` → PNGs; `bench/check_numbers.py` enforces README traceability.
 - [x] **6.7 Acceptance rate, measured.** `bench/corpus/fetch.py --values` writes the argument values the committed corpus drops to a sidecar (`values.json`, digests over 64 canonical bytes; the corpus and its hash untouched). `bench/offline/run_acceptance.py` grades `PatternDrafter` with `resolve_decision` — the runtime's own gate — leave-one-trajectory-out over every trajectory, under the runtime's within-turn policy and the across-turns policy it does not implement, next to the copying ceiling (steps whose argument values have all been seen before). Output `bench/results/acceptance.json`; `RESULTS.md` and the README quote it and never the signature figure alone.
   *Verify:* leave-one-out by subtraction equals retraining; a right signature with a wrong value is a miss; a guess at a turn boundary is a miss within a turn and a hit across turns; the drafter sees only the turn's calls within a turn; acceptance never exceeds signature accuracy or the copying ceiling; the committed numbers regenerate identically.
   *Verify:* `RESULTS.md` regenerates identically from committed JSON; CI fails on a planted untraceable number.
+- [x] **6.8 Latency sweep, against a real model.** `bench/online/run_latency_sweep.py`: every tool slowed to 0, 500 and 2000 ms, reads and writes alike; four arms (`B_strict_seq`, `B_seq` = early issue only, `B_readonly_spec`, `B_specunode`); 20 tasks per arm per rung against `claude-sonnet-5`; bootstrap intervals on the difference. Output `bench/results/sweep.json`.
+  *Result:* the only resolved saving is early issue on `ops_agent`, the one sample app that hands its model turn to the runtime: +11.8% [+7.8%, +15.5%] at 500 ms and +16.7% [+15.1%, +18.2%] at 2000 ms. Guessing on top of it: every interval spans zero.
+- [x] **6.9 Break-even α.** `bench/offline/run_break_even.py`: a guesser of controlled accuracy — right with probability α, otherwise a valid near miss — against early issue alone, on a stand-in calibrated from 6.8. Output `bench/results/break_even.json`.
+  *Result:* with 500 ms tools a guess of any accuracy costs time (−0.2% to −1.3%, even at α = 1); with 2000 ms tools it pays from α = 0.25 and tops out near +4.8%. Guessing reads and writes is indistinguishable from guessing reads only in every cell: a staged write cannot leave before its branch retires.
+- [x] **6.10 Tier-2 acceptance rate, against a real draft model.** `bench/online/run_tier2_acceptance.py`: `claude-haiku-4-5` shown the last 12 calls with their real argument values (`values_full.json`, gitignored), graded by `resolve_decision` with guesses carried across turns, 1000 sampled steps. Output `bench/results/tier2.json`.
+  *Result:* 0.069 [0.054, 0.086], against tier 1's 0.0002 under the same rule. Under the runtime's own within-turn rule it is zero for any predictor on this corpus (6.7).
+- [ ] **6.11 When the model is the slow part.** Three changes for model-bound runs, none of which touches what makes speculation safe: `specunode.core.loop.agent_loop` (every result of a reply back in one message, the reply echoed back unchanged, thinking blocks included); prompt caching on by default (`target.cache`); and parallel nodes (a router may name several nodes; they run side by side and retire in the order named). `bench/offline/run_model_bound.py` measures the runtime's side against a stand-in (`bench/results/model_bound.json`): the same alert in 4 replies instead of 9, three independent model calls in flight instead of one, every run correct, nothing leaked.
+  *Open:* what a real model does when told it may ask for several calls at once, and what caching saves on a real prompt, need a paid run.
 
 **Phase Gate 6:** opportunity + latency + overhead results committed with CIs; `RESULTS.md` generated; the anti-results (workloads where speculation buys ≤ 5% or is disabled by policy) are in the README with the same prominence as the wins.
 
@@ -821,6 +830,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 - **D1 — Corpus.** If `nebius/SWE-rebench-openhands-trajectories` is unavailable at build time or its license changes, generate the corpus from the sample apps (6.1) and state in the README that the opportunity analysis is on self-generated traces.
 - **D2 — Online bench budget.** If the spend cap is hit before 30 tasks per app, report what completed with the reduced *n* and its wider CI; do not raise the cap silently.
 - **D3 — T1 never beats break-even.** If the measured break-even α exceeds the measured T1 α on every workload, the headline is "T0 early-issue plus the store buffer is the useful part; pattern drafting did not pay for itself on these workloads". That is a publishable result. Do not tune the workloads until it flips.
+  *Fired.* Tier-1 α is 0.0000 under the runtime's policy (6.7); a guess of any accuracy is worth −1.3% to +4.8% (6.9) and nothing any interval resolves against a real model (6.8). The headline is early issue plus the store buffer's safety, as this gate says, and no workload was tuned to flip it. — 2026-09-23
 - **D4 — LangGraph API drift.** If the node-runner substitution needs private APIs, use them, pin the version, and document the pin; do not fork LangGraph.
 - **D5 — MCP annotations sparse in the wild.** If tested upstream servers ship no annotations, the proxy defaults everything to WRITE (Rule 2) and the docs say the per-tool override table is mandatory for any speedup.
 
@@ -1011,15 +1021,30 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [6.7] DEFECT (fixed): the ceiling was published as a bound on "any predictor that copies values out of history", which is more than it measures. PatternDrafter also copies from tool *results*, which this corpus does not keep, and an argument of 20.5% of graded steps came from one. It bounds tier 1 as graded here — no results — and every document now says so. — 2026-09-17
 [6.7] DEFECT (fixed): the within-turn signature column read 0.0000 because signature_hit was gated on the same resolvability flag as the gate's verdict, so on a corpus where every call opens a turn it could not be true. It measured the policy, not the index, beside a row that already reported the policy. Ungated it is 0.5219: the index ranks the right signature about half the time under either policy, and the acceptance rate is still zero. — 2026-09-17
 [7.7] Attack 7.7 now runs the poisoned drafter inside the real scheduler instead of hand-driving a Budget with an invented 250 tokens per squash. What is measured is what the runtime did: 4 guesses forked, 4 charges staged and discarded, the alpha gate closed after its 4-sample window filled with misses and the closure journaled 1 time, wasted_tokens 0 because a pattern-index guess costs no model tokens, leaked effects 0. The previous row's wasted_tokens=2000 was arithmetic, not a measurement. A first cut counted every branch_forked and every branch_resolved{confirmed}, which include the canonical branch of each node visit; guesses are now counted from resolutions that name an adopter. — 2026-09-17
+[6.4] DEFECT (fixed): B_seq was not sequential. Tier-0 early issue ran in every arm, so the baseline already contained the only mechanism that saves time and every saving was measured against it. Policy.early_issue switches it off; B_strict_seq is the new baseline. — 2026-09-23
+[6.4] DEFECT (fixed): B_readonly_spec was handed no predictor, so the PASTE arm never guessed and "PASTE's policy, credited" compared nothing. Both guessing arms now get the same drafter; Policy.speculate_writes=False is PASTE's rule, enforced by the WRITE_ON_PATH hazard. — 2026-09-23
+[6.4] DEFECT (fixed), and a retraction: guesses were counted as branches forked minus squashed, and every node visit forks a canonical branch, so ordinary steps counted as correct guesses. A workload whose drafter offered nothing reported alpha 1.0, and support_agent's -15.5% was described to the user as "a perfect predictor, and still slower". No guess had been made. Guesses are now counted where they are made. — 2026-09-23
+[6.4] DEFECT (fixed): the retirement re-check probed witnessed reads one at a time, so re-checking a turn cost the sum of its reads' latencies instead of the longest. Probes run concurrently, verdicts kept in read-set order. — 2026-09-23
+[6.4] DEFECT (fixed): a turn that failed mid-stream left its early-issued reads running; they finished after run_finished and journaled into a closed run. The turn now cancels and awaits them before re-raising. — 2026-09-23
+[6.10] DEFECT (fixed): tier-2 spend was priced at Sonnet rates for a Haiku draft model, and the draft model was shown hashed argument values it could never reproduce. Per-model prices; the real values live in a gitignored sidecar. 1000 steps: 0.069 [0.054, 0.086] for $3.04; the 428-step run before it gave 0.0607 [0.0397, 0.0841]. — 2026-09-23
+[6.8] Sweep against claude-sonnet-5, 20 tasks per arm per rung: early issue saves 11.8% at 500 ms and 16.7% at 2000 ms on ops_agent; every guessing interval spans zero. $4.43. — 2026-09-23
+[6.9] Break-even alpha measured with an oracle of controlled accuracy: guessing costs time with 500 ms tools at every alpha, pays from 0.25 with 2000 ms tools, and guessing writes adds nothing over guessing reads. — 2026-09-23
+[6.11] Decision: when the model is the slow part, guessing tool calls cannot help, so the next work is the model-facing levers — fewer replies, prompt caching, parallel nodes. None of them touches the store buffer or the gate. — 2026-09-23
+[6.11] DEFECT (fixed): replay served recorded turns by step alone. An agent loop makes every turn at its node's one program position, and parallel nodes make several nodes' turns at one position, so replay served the wrong turn and diverged. It keys on (node, step) and serves each node's turns in order; a test records replies in the reverse of the order replay asks for them. — 2026-09-23
+[6.11] DEFECT (fixed): the parallel-group write-conflict check ran only when every body had finished, which is exactly when nothing staged is left to protect. It runs when every body is at rest, again before each node's writes leave, and at commit; the tests pin what each point can and cannot see. — 2026-09-23
+[6.11] DEFECT (fixed): a node refused at retirement for a stale witnessed read was reported as "failed after its effects were dispatched", on the sequential path and the parallel one. Nothing of it had been sent. — 2026-09-23
+[6.11] DEFECT (fixed): the shipped example config set temperature: 0.0 for claude-sonnet-5, which answers any temperature with a 400, so everyone who copied it would have failed on their first request. — 2026-09-23
+[6.6] DEFECT (fixed): the traceability check read only a results file's values, so the settings a file is keyed by -- latency rungs, accuracy levels -- could not be traced. Keys that are numbers outright count now; digits inside a key's name do not. — 2026-09-23
 ```
 
 ---
 
 ## Final Report
 
-**Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit.**
+**Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
+2026-09-23 after the first measurements against a real model.**
 
-**730 tests pass, 24 skip — 8 of them against a real Postgres 16 server.** `ruff check`,
+**838 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
@@ -1097,11 +1122,15 @@ corpus keeps none. On this corpus the tier-1 predictor as built is worth nothing
 for the store buffer rests on a predictor that generates values, which needs an API key to
 measure.
 
-**The second headline number does not exist.** There is no wall-clock figure in this repository
-for a real model, because the online latency benchmark has not been run. Demo 2 measures wall
-clock against a scripted model and prints what it measures; nothing from it is quoted here or in
-the README, because it is a per-machine number and committing one would be either flaky or
-unmeasured.
+**The second headline number exists now, and it is small** (revised 2026-09-23). Against
+`claude-sonnet-5`, with every tool slowed to 500 ms or 2000 ms, issuing each read the moment its
+block parses saves 11.8% and 16.7% on the one sample app that hands its model turn to the
+runtime, and guessing on top of it adds nothing any interval resolves (6.8). A guesser of
+controlled accuracy is worth at most +4.8% even when always right, because a guess runs at most
+one block ahead of the model (6.9), and a real draft model is right 6.9% of the time (6.10). So
+speculation's measured contribution is safety, not speed. When the model is the slow part, the
+levers are fewer replies and replies side by side (6.11) — built, tested, and measured so far
+only against a stand-in.
 
 ### The anti-results
 
@@ -1110,9 +1139,9 @@ unmeasured.
 - **Tier-1 acceptance rate: 0.0002 across turns, 0.0000 within.** 3 of 19,184
   graded steps would have retired; the ceiling for that grading is 0.0984. Signature accuracy
   was an upper bound, and a loose one.
-- **Break-even α: not measured.** It is the α at which the speculative arm's wall clock equals
-  the sequential arm's, and wall clock against a real model has not been measured. `alpha_floor`
-  defaults to `None` — the gate is inactive rather than set to a guessed number.
+- **Break-even α: never, with 500 ms tools; about 0.25 with 2000 ms tools, for at most +4.8%**
+  (6.9). With fast tools a guess of any accuracy costs time. `alpha_floor` still defaults to
+  `None` — a floor would only encode which of those regimes a deployment is in.
 - **Undetectable stale reads: 0.5** of the stale reads in attack 7.3's fixture were unwitnessed
   and therefore undetectable. That fraction, not the stale rate, is the honest number.
 - **Journaling and classification overhead: 6.645 ms per step**, 87.7% of wall clock in that
@@ -1364,7 +1393,12 @@ accept that the clause holds only for clients that report node ids.
 
 ### Manual steps left for you
 
-1. **An Anthropic API key and a spend cap**, for the online latency benchmark (task 6.4). Set
+1. **Done, 2026-09-18:** a key was supplied and the real-model runs in 6.4, 6.8 and 6.10 were
+   made, each under its cap and each recording its spend in its results file. Still to pay for:
+   re-running 6.4 with the corrected arms, and 6.11 against a real model. The original
+   instructions follow.
+
+   **An Anthropic API key and a spend cap**, for the online latency benchmark (task 6.4). Set
    `ANTHROPIC_API_KEY` and `SPECUNODE_BENCH_BUDGET_USD` (default 25), then run
    `python bench/online/run_latency.py --out bench/results/latency.json`.
 

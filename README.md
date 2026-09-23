@@ -47,7 +47,7 @@ matches a fresh run.
 
 ---
 
-## What running ahead past a write actually buys
+## What issuing a read early buys, past a staged write
 
 ```
 python bench/demo.py --demo past-write
@@ -61,17 +61,25 @@ the first tool with side effects has nothing before it to run ahead into.
 The demo prints measured durations, so the figures differ between machines and runs and none
 of them is reproduced here. What does not vary is the shape, and the demo asserts it:
 
-- **`readonly-spec` matches `sequential`.** PASTE's rule ends speculation at `restart_job`.
+- **`readonly-spec` matches `sequential`.** Both baselines take the model's turn and then
+  make its calls in order, and turn 1 emits the write first, so nothing runs ahead of it.
 - **`specunode` is faster by the part of `fetch_runbook` that overlapped the staged write**,
   and the demo prints that overlap as a measured number rather than inferring it from the
   wall-clock difference.
+- **No guess is made anywhere in this demo.** The runtime arm has no predictor. The saving is
+  tier-0 early issue — the read is issued the moment its block parses, instead of after the
+  write before it — and the store buffer is what makes that safe: it holds the model's own
+  write until the turn that asked for it is durable, while the independent read overtakes it.
+  The `readonly-spec` arm models a runtime that runs a turn's calls in order after the model
+  finishes; it is not this runtime's reads-only policy, under which the saving is the same.
 - **All three change the world identically** — same tools, same canonical arguments, same
   order. The demo prints the digest and fails if they diverge.
 - **Model turn 2 is not hidden.** It needs `restart_job`'s real result in its prompt, so it
   waits for the drain. The demo says so in its own output.
 
-The saving is one read's latency. That is what speculating past a write buys on this shape, and
-the demo is written to make that hard to mistake for more.
+The saving is one read's latency. That is what issuing a read early buys on this shape, and
+the demo is written to make that hard to mistake for more — including for the speculation this
+project is named after, which the benchmarks below find adds nothing on top of it.
 
 ---
 
@@ -114,11 +122,20 @@ graded here* — a predictor copying values out of earlier calls, with no tool r
 because this corpus keeps none — and half this corpus is `execute_bash` with a free-form command
 string. An argument of 20.5% of steps did come from a prior result, so the bound for a drafter that
 can read those is higher and is not measured. Anything above the ceiling has to come from a
-predictor that generates values — a draft model — and that has not been measured because it needs an
-API key.
+predictor that generates values — a draft model. That is now measured too: `claude-haiku-4-5`,
+shown the last 12 calls with their real argument values and graded by the same gate with its
+guesses carried across turns, is right **6.9%** of the time (95% interval 5.4% to 8.6%, over
+1000 sampled steps), where tier 1 was right 0.0002 of the time under the same rule. Under the
+rule the runtime actually runs it is zero for any predictor, for the reason above.
 
-No wall-clock figure appears anywhere in this repository. The online latency benchmark needs an
-API key and has not been run.
+**Against a real model, the only wall-clock saving is issuing reads early, and none of it is from
+guessing.** On the one sample app that hands its model turn to the runtime, with every tool
+slowed to 500 ms, issuing each read the moment its block parses saves 11.8% [7.8%, 15.5%]; with
+2000 ms tools, 16.7% [15.1%, 18.2%]. Guessing added nothing any interval resolves, and a guesser
+of controlled accuracy is measured to be worth at most 4.8% even when it is always right, because
+a guess can run at most one block ahead of the model. When the model is the slow part, what
+helps is fewer model replies and replies side by side — measured in [RESULTS.md](RESULTS.md),
+against a stand-in so far.
 
 ---
 
@@ -163,16 +180,23 @@ v0.1.0, and honest about where it is. Working today:
 - the sequential scheduler, the LangGraph integration, the plain-Python API, `resume`
 - tier-0 early issue, the tier-1 pattern index, and a tier-2 draft model behind an extra —
   "working" here means they run and are measured, not that they pay: tier 1's measured
-  acceptance on the corpus above is 0.0000 within a turn and 0.0002 across
+  acceptance on the corpus above is 0.0000 within a turn and 0.0002 across, and tier 2's is
+  0.069
+- agent loops that hand every result of a reply back in one message
+  (`specunode.core.loop.agent_loop`), prompt caching on by default, and parallel nodes — a
+  router may name several nodes at once, and they run side by side and retire in the order named
 - the MCP proxy's rules, the offline benchmark, the overhead benchmark, the adversarial suite
 - the three invariant tests below
 
 Known gaps, stated rather than left to be discovered:
 
-- **No wall-clock figure exists anywhere in this repository.** The online latency benchmark
-  needs an API key and has not been run.
-- **The tier-2 (draft model) acceptance rate has not been measured**, and it is the number the
-  whole case rests on now that tier 1's is known to be ~0. It needs an API key too.
+- **Guessing has not produced a wall-clock saving against a real model.** Issuing reads early
+  has; guessing on top of it added nothing any interval resolves.
+- **Fewer replies and parallel nodes are measured only against a stand-in model so far.**
+  There, the same alert takes 4 replies instead of 9 and 48.1% less time, and three independent
+  checks side by side take 66.1% less time than one after another, with every run correct and
+  nothing leaked. Whether a real model asks for several calls at once when invited to, and what
+  prompt caching saves, needs a paid run that has not been made.
 - One sample workload, not three. The invariant tests hold on it and on tiers 0 and 1.
 
 `BUILD_SPEC.md`'s Final Report lists every one of these with the reason it is open. Every

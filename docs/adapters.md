@@ -66,6 +66,28 @@ waiting for something only the retirement produces. That is a deadlock, and it f
 first write of the first sequential run, before any speculation is involved. Hand the runtime a
 thunk; let it own the task.
 
+### Naming several nodes at once
+
+On the plain path a router may return a list of node names instead of one. The runtime reads
+that as "these are independent": it forks every one of them from the same committed state and
+program position, runs their bodies side by side, and retires them one at a time in the order
+the list names them. So their effects reach the world in that order, and their idempotency keys
+are the same whether they overlapped or not. `policy.parallel_nodes: false` runs the same group
+one body at a time; it changes the wall clock and nothing else.
+
+What the list promises is yours to keep, and the runtime checks what it can:
+
+- **Two nodes may not both write one state key** unless a reducer is declared for it. The clash
+  is refused before anything is sent whenever it is visible by then -- that is, whenever the
+  writes to the key come before the nodes' own writes to the world. A node that writes the key
+  only after its own write returns can be checked only after that write has gone out.
+- **A node that read what an earlier one in the list then changed is refused** at its
+  retirement, if the read was witnessed, and nothing it staged is sent. It is not re-run.
+- **Bodies overlap up to each one's first write.** A body parked on a staged write stays parked
+  until its turn to retire, so a group of nodes that each write early overlaps little. The
+  shape that gains is several model-bound investigations followed by one node that acts on all
+  of them -- `examples/fanout_agent`.
+
 ### Retirement can end mid-node
 
 A node that stages a write and then reads the result retires in the middle of itself: the

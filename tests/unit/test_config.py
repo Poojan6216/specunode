@@ -132,3 +132,58 @@ def test_malformed_yaml_says_which_file(tmp_path: Path) -> None:
     path = _write(tmp_path, "schema_version: [unclosed\n")
     with pytest.raises(ConfigError, match=r"specunode\.yaml"):
         load_config(path)
+
+
+def test_every_policy_field_is_configurable_and_nothing_else_is() -> None:
+    """The runtime grew three policy knobs the config never learned.
+
+    ``on_unverifiable_read``, ``early_issue`` and ``speculate_writes`` existed on ``Policy`` and
+    not on ``PolicyConfig``, and the config model forbids unknown keys, so a YAML file naming
+    any of them was rejected rather than honoured. Held to the same field set by introspection,
+    so the next knob cannot be added to one side only.
+    """
+    import dataclasses
+
+    from specunode.config import PolicyConfig
+    from specunode.core.policy import Policy
+
+    runtime = {f.name for f in dataclasses.fields(Policy)}
+    configurable = set(PolicyConfig.model_fields)
+    assert runtime == configurable, (
+        f"only in Policy: {sorted(runtime - configurable)}; "
+        f"only in the config: {sorted(configurable - runtime)}"
+    )
+    # And the defaults agree, so an empty ``policy:`` block means the runtime's defaults.
+    assert PolicyConfig().to_policy() == Policy()
+
+
+def test_the_example_config_names_every_policy_field() -> None:
+    """The template is what a new user copies, so a knob it omits is a knob nobody finds."""
+    import dataclasses
+    from importlib import resources
+
+    import yaml
+
+    from specunode.core.policy import Policy
+
+    example = resources.files("specunode").joinpath("specunode.yaml.example").read_text()
+    policy = yaml.safe_load(example)["policy"]
+    missing = {f.name for f in dataclasses.fields(Policy)} - set(policy) - {"speculation"}
+    assert not missing, f"the example config does not mention {sorted(missing)}"
+
+
+def test_the_example_config_sends_nothing_its_model_rejects() -> None:
+    """It set ``temperature: 0.0`` for a model that answers any temperature with a 400, so the
+    first real request of everyone who copied it failed."""
+    from importlib import resources
+
+    import yaml
+
+    example = resources.files("specunode").joinpath("specunode.yaml.example").read_text()
+    target = yaml.safe_load(example)["target"]
+    assert str(target["model"]).startswith(("claude-sonnet-5", "claude-opus-5"))
+    assert not {"temperature", "top_p", "top_k"} & set(target), "a rejected parameter is set"
+    assert target["cache"] is True
+    path = Path(str(resources.files("specunode").joinpath("specunode.yaml.example")))
+    loaded = load_config(path).target
+    assert loaded.temperature is None and loaded.cache is True

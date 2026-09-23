@@ -321,3 +321,37 @@ async def test_a_stalled_speculation_reaches_the_ledger(tmp_path: Path) -> None:
         if entry.payload.get("status") == "stalled"
     ]
     assert stalled, "no branch_resolved{stalled} entry was written"
+
+
+async def test_under_pastes_rule_a_predicted_read_runs_and_a_predicted_write_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The benchmark's PASTE arm has to speculate on reads and refuse writes -- both halves.
+
+    It used to be ``speculation=True`` with no predictor, which forks nothing at all: the
+    sequential arm under another name. So "does staging writes beat read-only speculation?",
+    the comparison this project's thesis rests on, was made against nothing. The arm now has
+    the same predictor as ``B_specunode`` and ``speculate_writes=False``, and this asserts it
+    does what its label says.
+    """
+    from specunode.core.hazards import Hazard
+
+    read_guess = FixedDrafter(ToolCall("fetch_runbook", {"section": "restart"}))
+    scheduler, world, journal, run_id = build(tmp_path, read_guess, db="paste-read.db")
+    scheduler.policy = Policy(speculation=True, speculate_writes=False)
+    assert (await scheduler.run(run_id, {})).ok
+    assert scheduler.counters.branches_forked > 1, "a predicted read was not speculated"
+
+    write_guess = FixedDrafter(ToolCall("restart_job", {"job_id": "etl-1"}))
+    scheduler, world, journal, run_id = build(tmp_path, write_guess, db="paste-write.db")
+    scheduler.policy = Policy(speculation=True, speculate_writes=False)
+    result = await scheduler.run(run_id, {})
+    assert result.ok, result.error
+    stalls = [
+        e.payload
+        for e in journal.read(run_id, kinds=["branch_resolved"])
+        if e.payload.get("status") == "stalled"
+    ]
+    assert [s["hazard"] for s in stalls] == [Hazard.WRITE_ON_PATH.name], stalls
+    # Refused before anything was staged, so the world saw only the model's own write.
+    assert [m.tool for m in world.mutations] == ["restart_job"]
