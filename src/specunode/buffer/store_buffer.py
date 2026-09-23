@@ -158,6 +158,10 @@ class StoreBuffer:
     #: first pass's effects.
     _settled: dict[str, set[str]] = field(default_factory=dict)
     _dispatch_seq: dict[str, int] = field(default_factory=dict)
+    #: Effects per branch known to be in the world: dispatched here, or found already
+    #: dispatched by an earlier process. What an error has to admit to when a branch fails
+    #: after its drain.
+    _delivered: dict[str, int] = field(default_factory=dict)
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     #: Futures a node body awaits for a staged write's real result. Completed only by the
     #: drain, and only after the confirming entry is durable.
@@ -472,6 +476,17 @@ class StoreBuffer:
         self._last_discarded = tuple(dropped)
         return len(dropped)
 
+    def close(self, branch: Branch) -> None:
+        """Refuse any further write from this branch, keeping what it has already staged.
+
+        For a branch whose drain halted on a dead letter and whose node is about to be
+        cancelled. A ``finally`` in that node that writes -- giving a lease back -- must be
+        refused at once, not parked on an ack nothing will complete, or the wait for the
+        cancelled node never returns. What the branch staged before stays unsent and unrevoked:
+        it was authorised, and a resume re-derives it under the same key.
+        """
+        self._closed.add(branch.id)
+
     def discard_reporting(self, branch: Branch) -> tuple[StagedEffect, ...]:
         """Discard, and return exactly the effects that were dropped."""
         self.discard(branch)
@@ -509,6 +524,10 @@ class StoreBuffer:
 
     def pending(self, branch_id: str) -> tuple[StagedEffect, ...]:
         return tuple(self._staged.get(branch_id, ()))
+
+    def delivered(self, branch_id: str) -> int:
+        """How many of this branch's effects are known to be in the world."""
+        return self._delivered.get(branch_id, 0)
 
     def branch_ids(self) -> tuple[str, ...]:
         """Every branch this buffer currently holds staged effects for."""
@@ -658,6 +677,7 @@ class StoreBuffer:
             )
             if claim.outcome is Claim.ALREADY_DISPATCHED:
                 settled.add(effect.id)
+                self._delivered[branch.id] = self._delivered.get(branch.id, 0) + 1
                 self._complete_ack(effect.id, claim.ack)
                 outcomes.append((effect.id, EffectOutcome.SKIPPED_DEDUPE))
                 continue
@@ -686,6 +706,7 @@ class StoreBuffer:
             settled.add(effect.id)
             self._dispatch_seq[branch.id] = dispatch_index + 1
             if result.ok:
+                self._delivered[branch.id] = self._delivered.get(branch.id, 0) + 1
                 await self.journal.settle_dispatch(
                     run_id=self.run_id,
                     nkey=effect.nkey,

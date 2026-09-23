@@ -24,6 +24,7 @@ from specunode.core.model import (
     ContentBlock,
     ModelError,
     ModelResponse,
+    OpaqueBlock,
     RequestEnvelope,
     StreamEvent,
     TextBlock,
@@ -73,6 +74,8 @@ def block_to_api(block: ContentBlock) -> JsonValue:
                 else [{"type": "text", "text": canonical(content).decode("utf-8")}],
                 "is_error": is_error,
             }
+        case OpaqueBlock(payload=verbatim):
+            return dict(verbatim)
 
 
 def envelope_to_params(envelope: RequestEnvelope, *, cache: bool = False) -> dict[str, JsonValue]:
@@ -146,7 +149,23 @@ def _block_from_api(raw: object) -> ContentBlock | None:
             name=str(_field(raw, "name", "")),
             args=dict(raw_input) if isinstance(raw_input, Mapping) else {},
         )
+    if isinstance(kind, str) and kind:
+        # Anything else -- redacted_thinking, and whatever a later API version adds -- is kept
+        # verbatim, because the next request has to send the reply back exactly as it came.
+        return OpaqueBlock(type=kind, payload=_raw_block(raw))
     return None
+
+
+def _raw_block(raw: object) -> dict[str, JsonValue]:
+    """A block as the provider sent it, as JSON: the SDK's own dump, without unset fields."""
+    if isinstance(raw, Mapping):
+        return {str(k): cast(JsonValue, v) for k, v in raw.items()}
+    dump = getattr(raw, "model_dump", None)
+    if callable(dump):
+        dumped = dump(mode="json", exclude_none=True)
+        if isinstance(dumped, Mapping):
+            return {str(k): cast(JsonValue, v) for k, v in dumped.items()}
+    return {"type": str(_field(raw, "type", ""))}
 
 
 def _blocks_from_api(content: object) -> tuple[ContentBlock, ...]:

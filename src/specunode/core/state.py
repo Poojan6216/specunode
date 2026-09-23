@@ -619,6 +619,51 @@ class CommittedState:
             result_state_hash=result.hash,
         )
 
+    def commit_values(
+        self,
+        written: Mapping[str, JsonValue],
+        removed: Iterable[str] = (),
+        *,
+        reducers: Mapping[str, Reducer] | None = None,
+    ) -> CommitResult:
+        """Commit the value a node wrote for each key it touched, instead of its patch.
+
+        For a node in a Parallel group. Its delta was taken against the state the whole group
+        forked from, and the lanes named before it have committed since, so the positions in
+        its patch no longer point where they did. Replayed on top of a sibling's commit, an
+        ``append`` from ``[]`` duplicated the sibling's item and a ``last_write`` of an object
+        produced a value neither lane wrote. By key and by value, a reducer sees what it sees
+        for a node run one after another -- the committed value and the value the node wrote --
+        which is also how a fan-out's updates are combined in LangGraph. A lane's value for a
+        key is taken whole: two lanes editing parts of one object combine only through a
+        reducer that knows how to merge them.
+
+        The journaled ``patch`` is the effective one, from the committed state before to the
+        state after, so a resume that replays journaled patches lands on this state.
+        """
+        table = reducers or {}
+        before = self.to_dict()
+        after = dict(before)
+        applied: list[tuple[str, str]] = []
+        for key in sorted(removed):
+            after.pop(key, None)
+        for key in sorted(written):
+            value = _normalise(written[key])
+            reducer = table.get(key)
+            if reducer is None:
+                after[key] = value
+                continue
+            after[key] = _normalise(reducer(before.get(key), value))
+            applied.append((key, reducer.name))
+        result = CommittedState(after)
+        return CommitResult(
+            state=result,
+            patch=tuple(diff(cast("JsonValue", before), cast("JsonValue", after))),
+            reducers_applied=tuple(applied),
+            base_state_hash=self.hash,
+            result_state_hash=result.hash,
+        )
+
 
 def _touched_keys(patch: Patch) -> set[str]:
     """The top-level state keys a patch reaches. Reducers are declared per state key."""

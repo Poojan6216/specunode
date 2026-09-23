@@ -61,6 +61,7 @@ ENTRY_KINDS: Final[tuple[str, ...]] = (
     "tool_result",
     "branch_forked",
     "branch_resolved",
+    "group_forked",
     "effect_adopted",
     "effect_staged",
     "effect_dispatched",
@@ -87,6 +88,9 @@ REQUIRED_FIELDS: Final[Mapping[str, frozenset[str]]] = {
     "tool_result": frozenset({"step", "branch_id", "call_id", "ok", "reached_upstream"}),
     "branch_forked": frozenset({"branch_id", "lineage", "fork_step", "predicted_hash", "tier"}),
     "branch_resolved": frozenset({"branch_id", "step", "status"}),
+    # A router's decision to run several nodes side by side, journaled whole before any of them
+    # forks, so a crash in the middle of the group resumes into it rather than re-deciding it.
+    "group_forked": frozenset({"group_id", "lanes", "fork_cursor"}),
     # A confirmed speculation's staged effects moving to the branch that retires.
     "effect_adopted": frozenset({"branch_id", "from_branch_id", "effect_ids"}),
     # key_inputs lets normalise_for_equivalence re-derive the key from journaled facts alone.

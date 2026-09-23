@@ -66,7 +66,7 @@ from specunode.drafters.base import DraftContext, Drafter
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
 from specunode.journal.ledger import Ledger, build_ledger
-from specunode.journal.replay import recover
+from specunode.journal.replay import OpenGroup, recover
 from specunode.verify.gate import resolve_decision
 from specunode.verify.witness import validate_reads
 
@@ -127,6 +127,14 @@ def _not_retired(node_name: str, branch: Branch) -> str:
     if branch.reason:
         return f"node {node_name} failed after its effects were dispatched: {branch.reason}"
     return f"effects from node {node_name} did not all dispatch"
+
+
+def _cursor_payload(cursor: StepCursor) -> JsonValue:
+    """A program position as the journal records it, and as recovery reads it back."""
+    return {
+        "step_index": cursor.step_index,
+        "visits": [[name, count] for name, count in cursor.visits],
+    }
 
 
 @dataclass(frozen=True)
@@ -298,6 +306,11 @@ class Scheduler:
     _cursor: StepCursor = field(default_factory=StepCursor)
     _committed: CommittedState = field(default_factory=CommittedState)
     _reducers: Mapping[str, Reducer] = field(default_factory=dict)
+    #: A Parallel group a crash interrupted, which a resume finishes before routing on.
+    _open_group: OpenGroup | None = None
+    #: Node bodies still running, and the branch each runs on. A run that ends by an exception
+    #: nothing catches -- cancelled from outside, by a timeout or a shutdown -- ends them too.
+    _node_tasks: dict[asyncio.Task[Decision], Branch] = field(default_factory=dict)
     _steps: int = 0
     #: Signalled by the tool port when a branch parks on a staged write's result. An Event
     #: rather than a flag because the scheduler has to wait for the *next* park, not merely
@@ -481,8 +494,18 @@ class Scheduler:
         cursor = self._cursor
         reducers = self._reducers
         ok, error, steps = True, None, 0
+        open_group, self._open_group = self._open_group, None
         try:
-            while True:
+            if open_group is not None:
+                # Finish the group the crash interrupted before asking the router anything: it
+                # was one decision, made on the state before any of its lanes committed.
+                group = await self._resume_group(open_group, committed, reducers)
+                committed, cursor = group.committed, group.cursor
+                self._committed, self._cursor = committed, cursor
+                steps += group.retired
+                if not group.ok:
+                    ok, error = False, group.error
+            while ok:
                 node = self.graph.next(committed.to_dict())
                 if node is END or isinstance(node, type(END)):
                     break
@@ -532,6 +555,9 @@ class Scheduler:
                     break
         except Exception as exc:  # a run fault, journaled rather than swallowed
             ok, error = False, f"{type(exc).__name__}: {exc}"
+        except BaseException:
+            self._stop_node_tasks()
+            raise
 
         await self._close_gate_if_spent(steps)
         await self._journal_run_finished(ok, error, steps, committed)
@@ -578,6 +604,7 @@ class Scheduler:
         self.buffer.scheduler_task = asyncio.current_task()
         self._committed = CommittedState(recovery.state)
         self._cursor = recovery.cursor
+        self._open_group = recovery.open_group
         self._reducers = resolve_reducers(dict(self.reducers))
         self._steps = 0
 
@@ -627,6 +654,9 @@ class Scheduler:
                 final = await self.graph.drive(session, inputs)
         except Exception as exc:
             ok, error = False, f"{type(exc).__name__}: {exc}"
+        except BaseException:
+            self._stop_node_tasks()
+            raise
 
         await self._close_gate_if_spent(self._steps)
         await self._journal_run_finished(ok, error, self._steps, self._committed)
@@ -741,9 +771,15 @@ class Scheduler:
         Every lane forks from the same committed state and the same program position, and its
         node id -- ``name#visit``, minted here in declared order -- is what keeps two lanes'
         idempotency keys apart. So the keys, the positions and the journal order are the same
-        whether the bodies overlap or not (``Policy.parallel_nodes``), and a crash in the middle
-        resumes onto the same keys. Retiring in declared order is what makes their effects
-        reach the world in a reproducible order, however the scheduler interleaved them.
+        whether the bodies overlap or not (``Policy.parallel_nodes``). Retiring in declared
+        order is what makes their effects reach the world in a reproducible order, however the
+        scheduler interleaved them.
+
+        The group is one routing decision, and it is journaled whole before any lane forks. A
+        crash in the middle must not re-decide it: resumed, the router would see the state some
+        lanes had already committed and could name something else, or the same lanes under new
+        visit counts -- new keys, and effects that already went out going out again. A resume
+        finishes the journaled group instead (:meth:`_resume_group`).
 
         A lane parked on a staged write stays parked until its turn to retire, so bodies
         overlap up to each one's first write and no further. And nodes named together must be
@@ -755,13 +791,69 @@ class Scheduler:
         for node in group.nodes:
             visited, node_id = visited.visit(node.structural_id)
             lanes.append((node, node_id))
-        branches = [self._fork_canonical(visited, node_id) for _node, node_id in lanes]
+        group_id = new_ulid()
+        await self.journal.append_async(
+            self.run_id,
+            "group_forked",
+            {
+                "v": 1,
+                "group_id": group_id,
+                "lanes": [
+                    {"name": node.name, "path": list(node.path), "node_id": node_id}
+                    for node, node_id in lanes
+                ],
+                "fork_cursor": _cursor_payload(visited),
+            },
+        )
+        return await self._run_lanes(group_id, lanes, visited, committed, committed, reducers)
+
+    async def _resume_group(
+        self, group: OpenGroup, committed: CommittedState, reducers: Mapping[str, Reducer]
+    ) -> _GroupOutcome:
+        """Finish a group a crash interrupted, as the group it was.
+
+        Only its unretired lanes run, each under its own node id, from the position and the
+        committed state the whole group forked from -- which is what they saw the first time,
+        and what their keys were derived from. A lane whose writes went out before the crash
+        derives the same keys again, and the dedupe table claims them rather than sending them
+        twice. The lanes that retired are not re-run; the state keys they wrote stay claimed.
+        """
+        lanes = [
+            (NodeRef(name=name, path=path), node_id)
+            for name, path, node_id in group.lanes
+            if node_id not in group.retired
+        ]
+        return await self._run_lanes(
+            group.group_id,
+            lanes,
+            group.fork_cursor,
+            CommittedState(dict(group.base_state)),
+            committed,
+            reducers,
+            prior_step=group.max_step,
+            claimed=dict(group.claimed),
+        )
+
+    async def _run_lanes(
+        self,
+        group_id: str,
+        lanes: Sequence[tuple[NodeRef, str]],
+        fork_cursor: StepCursor,
+        base: CommittedState,
+        committed: CommittedState,
+        reducers: Mapping[str, Reducer],
+        *,
+        prior_step: int | None = None,
+        claimed: dict[str, str] | None = None,
+    ) -> _GroupOutcome:
+        """Fork ``lanes`` from ``base`` at ``fork_cursor``, run them, retire them in order."""
+        branches = [self._fork_canonical(fork_cursor, node_id) for _node, node_id in lanes]
         for (_node, node_id), branch in zip(lanes, branches, strict=True):
-            await self._journal_fork(branch, node_id)
+            await self._journal_fork(branch, node_id, group_id=group_id)
 
         async def start(index: int) -> tuple[BranchOutcome, Decision]:
             node, node_id = lanes[index]
-            return await self._run_node(node, branches[index], node_id, committed)
+            return await self._run_node(node, branches[index], node_id, base)
 
         if self.policy.parallel_nodes:
             outcomes = list(await asyncio.gather(*(start(i) for i in range(len(lanes)))))
@@ -770,7 +862,10 @@ class Scheduler:
 
         def cursor_after() -> StepCursor:
             # Past every position any lane consumed, with every lane's visit counted.
-            return replace(visited, step_index=max(b.cursor.step_index for b in branches))
+            steps = [b.cursor.step_index for b in branches]
+            if prior_step is not None:
+                steps.append(prior_step)
+            return replace(fork_cursor, step_index=max(steps))
 
         faulted = next(
             (i for i, (outcome, _) in enumerate(outcomes) if outcome is BranchOutcome.FAULTED),
@@ -787,12 +882,12 @@ class Scheduler:
         # so far is refused now, with nothing sent. A lane parked on its own write can still
         # write state after that write returns, which no check can see before it goes out; that
         # is caught at the lane's commit, and the lanes after it are abandoned unsent.
-        conflict = _first_conflict(lanes, branches, reducers)
+        claimed = dict(claimed or {})
+        conflict = _first_conflict(lanes, branches, reducers, claimed)
         if conflict is not None:
             await self._abandon_lanes(lanes, branches, str(conflict))
             return _GroupOutcome(False, str(conflict), committed, cursor_after(), 0)
 
-        claimed: dict[str, str] = {}
         for index, ((node, node_id), branch) in enumerate(zip(lanes, branches, strict=True)):
             rest = (lanes[index + 1 :], branches[index + 1 :])
             # Again before this lane's writes leave: a lane retired above may have committed,
@@ -801,13 +896,28 @@ class Scheduler:
             if conflict is not None:
                 await self._abandon_lanes(lanes[index:], branches[index:], str(conflict))
                 return _GroupOutcome(False, str(conflict), committed, cursor_after(), index)
+            # The last lane to retire journals the group's cursor, not its own: it is where the
+            # run goes on from, and the one a resume after the next node's crash must restore.
+            # Its own would put that node at a lower step, under a key the dedupe table has
+            # never seen, and send what it had already sent.
+            last = index == len(lanes) - 1
             try:
                 drained, updated = await self._retire(
-                    branch, node_id, committed, reducers, claimed=claimed
+                    branch,
+                    node_id,
+                    committed,
+                    reducers,
+                    claimed=claimed,
+                    cursor_after=cursor_after if last else None,
                 )
-            except ParallelWriteConflict as conflict:
-                await self._abandon_lanes(*rest, str(conflict))
-                return _GroupOutcome(False, str(conflict), committed, cursor_after(), index)
+            except Exception as exc:
+                # Raised after the lane was confirmed, so after its writes may have gone out: a
+                # state clash or a reducer refusing at commit, or a write that dead-lettered.
+                # Catching only the clash let the others escape with the lanes after this one
+                # still parked and their forks never resolved.
+                error = await self._close_failed_lane(node, node_id, branch, exc)
+                await self._abandon_lanes(*rest, error)
+                return _GroupOutcome(False, error, committed, cursor_after(), index)
             if updated is not None:
                 committed = updated
             if not drained:
@@ -816,26 +926,78 @@ class Scheduler:
                 return _GroupOutcome(False, error, committed, cursor_after(), index + 1)
         return _GroupOutcome(True, None, committed, cursor_after(), len(lanes))
 
+    async def _close_failed_lane(
+        self, node: NodeRef, node_id: str, branch: Branch, exc: Exception
+    ) -> str:
+        """A lane whose retirement raised: stop it, close its lifecycle, say what went out.
+
+        It was confirmed, so it is not abandoned -- what it sent was authorised -- but it did
+        not retire either. Without a resolution it read as confirmed forever, which recovery
+        takes to mean a drain that was in flight when the process died. And the operator is
+        told how many of its effects are in the world, because a failure that does not say so
+        sends them looking for an effect that never happened, or away from one that did.
+        """
+        task = branch.task
+        if isinstance(task, asyncio.Task) and not task.done():
+            self.buffer.close(branch)
+            task.cancel()
+            await asyncio.wait({task})
+        if isinstance(task, asyncio.Task) and task.done() and not task.cancelled():
+            task.exception()
+        cause = str(exc) if isinstance(exc, SchedulerError) else f"{type(exc).__name__}: {exc}"
+        sent = self.buffer.delivered(branch.id)
+        reason = f"{cause} ({sent} of its effects had already been dispatched)" if sent else cause
+        await self.journal.append_async(
+            self.run_id,
+            "branch_resolved",
+            {
+                "v": 1,
+                "branch_id": branch.id,
+                "step": branch.fork_step,
+                "status": "faulted",
+                "reason": reason,
+                "node_id": node_id,
+            },
+        )
+        return f"node {node.name} did not retire: {reason}"
+
     async def _abandon_lanes(
         self, lanes: Sequence[tuple[NodeRef, str]], branches: Sequence[Branch], reason: str
     ) -> None:
-        """Close lanes that will not retire: stop them, discard what they staged, journal it.
+        """Close lanes that will not retire: revoke them, stop them, journal it.
 
         None of them has retired, so none of their writes has left -- which is the whole of
         what makes abandoning them safe. Each still ends in exactly one of the ways a branch
         ends, in the durable record, so no reader finds a fork without a resolution.
+
+        Revoke first, cancel second, as a squashed speculation is. A lane parked on its own
+        write whose body has a ``finally`` that writes -- give a lease back -- used to be
+        cancelled while its buffer was still open: the ``finally`` staged a write nothing
+        would drain, parked on its ack, and the wait for it never returned. A revoked branch's
+        next write is refused at once. The wait does not swallow a cancellation of the run
+        itself either; it used to, so a run cancelled from outside finished as if it had not
+        been.
         """
-        for (_node, node_id), branch in zip(lanes, branches, strict=True):
-            task = branch.task
-            if isinstance(task, asyncio.Task) and not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-            own = branch.reason
+        owns: list[str | None] = []
+        for branch in branches:
+            owns.append(branch.reason)
             if branch.status is not BranchStatus.SQUASHED:
                 branch.squash(f"abandoned: {reason}")
             discarded = await self.buffer.discard_and_journal(branch, f"abandoned: {reason}")
             self.counters.effects_discarded += discarded
+        running = [
+            branch.task
+            for branch in branches
+            if isinstance(branch.task, asyncio.Task) and not branch.task.done()
+        ]
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.wait(running)
+        for task in running:
+            if not task.cancelled():
+                task.exception()  # retrieved: it is reported below, not by the event loop
+        for (_node, node_id), branch, own in zip(lanes, branches, owns, strict=True):
             await self.journal.append_async(
                 self.run_id,
                 "branch_resolved",
@@ -861,12 +1023,15 @@ class Scheduler:
         self.counters.branches_forked += 1
         return branch
 
-    async def _journal_fork(self, branch: Branch, node_id: str) -> None:
+    async def _journal_fork(
+        self, branch: Branch, node_id: str, *, group_id: str | None = None
+    ) -> None:
         await self.journal.append_async(
             self.run_id,
             "branch_forked",
             {
                 "v": 1,
+                **({"group_id": group_id} if group_id is not None else {}),
                 "branch_id": branch.id,
                 "parent_id": branch.parent_id,
                 "lineage": list(branch.lineage),
@@ -927,6 +1092,8 @@ class Scheduler:
 
         task: asyncio.Task[Decision] = asyncio.create_task(body())
         branch.task = task
+        self._node_tasks[task] = branch
+        task.add_done_callback(self._forget_node_task)
         outcome = await self._quiesce(branch, task)
         if outcome is BranchOutcome.FAULTED:
             return outcome, ToolCall("", {})
@@ -934,6 +1101,24 @@ class Scheduler:
             return outcome, task.result()
         # PARKED: the decision is not available until the drain releases the node body.
         return outcome, ToolCall("", {})
+
+    def _forget_node_task(self, task: asyncio.Task[Decision]) -> None:
+        self._node_tasks.pop(task, None)
+
+    def _stop_node_tasks(self) -> None:
+        """End every node body a run left running when it ended by an uncaught exception.
+
+        Its caller cancelled it -- a timeout, a shutdown -- and its node bodies went on without
+        it: reading upstream and staging writes for a run that was over. Each body's branch is
+        closed first, so a ``finally`` that writes is refused rather than parked on an ack no
+        drain will ever complete, and then it is cancelled. Nothing is journaled: a run ended
+        this way is resumed, as a crashed one is, and what is durable is what it had written.
+        """
+        for task, branch in list(self._node_tasks.items()):
+            if task.done():
+                continue
+            self.buffer.close(branch)
+            task.cancel()
 
     async def _quiesce(self, branch: Branch, task: asyncio.Task[Decision]) -> BranchOutcome:
         """Wait until the branch's task finishes, or parks on a value only the drain supplies.
@@ -1034,6 +1219,7 @@ class Scheduler:
         committed: CommittedState | None = None,
         reducers: Mapping[str, Reducer] | None = None,
         claimed: dict[str, str] | None = None,
+        cursor_after: Callable[[], StepCursor] | None = None,
     ) -> tuple[bool, CommittedState | None]:
         """R5 through R9: validate reads, confirm, make it durable, drain, then retire."""
         # E3, before anything is confirmed. ``validate_reads`` is the retirement-time witness
@@ -1146,7 +1332,19 @@ class Scheduler:
                 break
 
         if isinstance(task, asyncio.Task) and not task.done():
+            # Refuse its next write before cancelling it, and wait for it to stop: a node left
+            # running here outlived the run, and one whose ``finally`` writes would park on an
+            # ack nothing completes.
+            self.buffer.close(branch)
             task.cancel()
+            await asyncio.wait({task})
+            if not task.cancelled():
+                task.exception()
+            if not ok:
+                raise SchedulerError(
+                    f"a write from node {node_id} was dead-lettered, so the run halts here "
+                    "for a human; a resume retries it under the same key"
+                )
             raise SchedulerError(
                 f"node {node_id} did not finish after its writes were dispatched; it is "
                 "waiting on something the runtime never completes"
@@ -1202,10 +1400,9 @@ class Scheduler:
                 # verbatim rather than inferring it from the highest step it can see: inferring
                 # lands the resumed run at a different position, so every key it derives differs
                 # from the pre-crash one, the dedupe table misses, and the effects go out twice.
-                "cursor_after": {
-                    "step_index": branch.cursor.step_index,
-                    "visits": [[name, count] for name, count in branch.cursor.visits],
-                },
+                "cursor_after": _cursor_payload(
+                    cursor_after() if cursor_after is not None else branch.cursor
+                ),
             },
         )
         return ok, new_committed
@@ -1221,6 +1418,7 @@ class Scheduler:
         patch = branch.state.delta()
         if not patch:
             return committed
+        touched: set[str] | None = None
         if claimed is not None:
             # A node in a Parallel group. Its delta was taken against the state the whole group
             # forked from, so applying it on top of a sibling's would silently overwrite any key
@@ -1233,7 +1431,13 @@ class Scheduler:
                     raise ParallelWriteConflict(key, owner, branch.node_id)
             for key in touched:
                 claimed.setdefault(key, branch.node_id)
-        result = committed.commit(patch, reducers=reducers)
+            result = committed.commit_values(
+                {key: branch.state[key] for key in touched if key in branch.state},
+                [key for key in touched if key not in branch.state],
+                reducers=reducers,
+            )
+        else:
+            result = committed.commit(patch, reducers=reducers)
         await self.journal.append_async(
             self.run_id,
             "state_delta_applied",
@@ -1248,6 +1452,10 @@ class Scheduler:
                 "reducers_applied": [
                     {"key": key, "reducer": name} for key, name in result.reducers_applied
                 ],
+                # What a lane in a group wrote, which a resume needs to keep claimed: the patch
+                # above is the effective change, and a write of the value already committed
+                # changes nothing while still being a write.
+                **({"touched_keys": sorted(touched)} if touched is not None else {}),
             },
         )
         return result.state
@@ -1535,7 +1743,17 @@ class SpeculativeTurn:
 
         # Any speculation still open when the turn ended predicted a call the model never made.
         await self._squash_open("turn_ended")
-        return TurnResults(await self._settle_turn(tools, slots), self.response)
+        try:
+            results = await self._settle_turn(tools, slots)
+        except BaseException:
+            # Settling is where a node parks on its own staged write, so it is where a node is
+            # cancelled when a sibling in its group fails, and where a write whose ack fails
+            # raises. The reads this turn issued early for later blocks were still running
+            # then: they reached upstream after the run returned, and journaled after
+            # ``run_finished``. The stream's failure path already ended them; this one did not.
+            await self._abandon(slots)
+            raise
+        return TurnResults(results, self.response)
 
     async def _abandon(self, slots: list[asyncio.Task[JsonValue] | None]) -> None:
         """Cancel and await every call this turn started, so none outlives the turn.

@@ -155,7 +155,7 @@ class PlainAdapter:
         if chosen is None:
             return END
         # A router may name several nodes at once: they are independent and run side by side.
-        names = [chosen] if isinstance(chosen, str) else list(chosen)
+        names = _named(chosen)
         for name in names:
             if name not in self.node_fns:
                 raise KeyError(f"router chose {name!r}, which is not a node in this graph")
@@ -174,6 +174,29 @@ class PlainAdapter:
             "PlainAdapter is driven by the scheduler; drive() is for adapters that own their "
             "own run loop"
         )
+
+
+def _named(chosen: object) -> list[str]:
+    """The node names a router returned, in the order the group retires them.
+
+    A list or a tuple, and nothing else. The order is load-bearing: it fixes each lane's node
+    id, so its idempotency keys, and the order its effects reach the world. A set iterates in
+    an order string hashing decides afresh in every process, so a resume or a replay would mint
+    the lanes under different ids -- and send again what had already been sent.
+    """
+    if isinstance(chosen, str):
+        return [chosen]
+    if not isinstance(chosen, list | tuple):
+        raise TypeError(
+            f"a router returns a node name, a list or tuple of names in the order they should "
+            f"retire, or None to end the run; got {type(chosen).__name__}"
+        )
+    names = [str(name) for name in chosen]
+    if not names:
+        raise ValueError("the router named no nodes; return None to end the run")
+    if len(set(names)) != len(names):
+        raise ValueError(f"the router named a node twice in one group: {names}")
+    return names
 
 
 def _name_of(fn: NodeFn) -> str:

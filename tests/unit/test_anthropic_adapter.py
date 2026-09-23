@@ -237,3 +237,36 @@ def test_a_structured_tool_result_reaches_the_model_as_json() -> None:
     # Canonical, so the same result is always the same bytes and a cached prefix holds.
     same = ToolResultBlock(tool_use_id="t1", content={"a": [1, 2], "b": None, "ok": True})
     assert block_to_api(block) == block_to_api(same)
+
+
+async def test_a_block_the_runtime_does_not_know_comes_back_exactly_as_it_was_sent() -> None:
+    """An agent loop echoes the model's reply on the next request, and the API refuses one with
+    a block missing. ``redacted_thinking`` used to be dropped on the way in."""
+    from specunode.core.model import (
+        Message,
+        OpaqueBlock,
+        block_from_json,
+        block_to_json,
+        request_hash,
+    )
+
+    redacted = {"type": "redacted_thinking", "data": "EmwKAhgBEgy3va3pzix/LafPsn4a"}
+    reply = [
+        {"type": "thinking", "thinking": "", "signature": "sig-1"},
+        redacted,
+        {"type": "tool_use", "id": "u1", "name": "a", "input": {}},
+    ]
+    model, _ = _model_with(reply)
+    response = await model.complete(RequestEnvelope(model="claude-sonnet-5"))
+    assert [b.kind for b in response.content] == ["thinking", "opaque", "tool_use"]
+    echoed = [block_to_api(block) for block in response.content]
+    assert echoed[1] == redacted, "the block did not go back as it came"
+    # It survives the journal, and it is part of what the model is asked.
+    opaque = response.content[1]
+    assert isinstance(opaque, OpaqueBlock)
+    assert block_from_json(block_to_json(opaque)) == opaque  # type: ignore[arg-type]
+    asked = RequestEnvelope(model="m", messages=(Message(role="assistant", content=(opaque,)),))
+    other = replace(opaque, payload={**redacted, "data": "different"})
+    assert request_hash(asked) != request_hash(
+        replace(asked, messages=(Message(role="assistant", content=(other,)),))
+    )

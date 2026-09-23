@@ -478,9 +478,9 @@ class Journal:
     def read(self, run_id: str, after: int = 0) -> Iterator[Entry]: ...
 
 # entry kinds (schema.sql): run_started, model_request, model_response, tool_request,
-#   tool_result, branch_forked, branch_resolved, effect_staged, effect_dispatched,
-#   effect_dead_lettered, effect_discarded, state_delta_applied, read_validated,
-#   policy_event, run_finished
+#   tool_result, branch_forked, branch_resolved, group_forked, effect_staged,
+#   effect_dispatched, effect_dead_lettered, effect_discarded, state_delta_applied,
+#   read_validated, policy_event, run_finished
 
 # src/specunode/journal/replay.py
 class ReplayModel(ModelClient):
@@ -1036,6 +1036,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [6.11] DEFECT (fixed): the shipped example config set temperature: 0.0 for claude-sonnet-5, which answers any temperature with a 400, so everyone who copied it would have failed on their first request. — 2026-09-23
 [6.11] DEFECT (fixed, before it cost the budget): the first real round of the online run came back with every incident cell identical -- five replies, ten calls, whatever the prompt said. Told to make one call per reply, the model batched anyway, so the "before" arm was running the "after" behaviour. Stopped in round two after nine runs ($0.19); the one-call style now sets the API's disable_parallel_tool_use. A per-run progress line is what made it visible in time. — 2026-09-23
 [6.11] Real-model result, claude-sonnet-5, 15 rounds, $2.33: 11 replies to 5, 35.4% less time, 77.7% less cost with caching; parallel nodes 60.2% less time; caching alone -72.7% cost and no resolved change in time; 105 runs, all correct, no leaks. Told nothing, the model batches independent calls by itself: what held runs at one call per reply was the app. — 2026-09-23
+[6.11] REVIEW: an independent adversarial review of parallel nodes, the agent loop and replay keying found 9 defects, each with a failing test, all reproduced here first and all fixed with a revert check -- two critical (a crash after or in the middle of a group made a resume re-send effects), and one more found while fixing (a cancelled run left its node bodies running). Final Report, "What the fifth review found". — 2026-09-23
 [6.6] DEFECT (fixed): the traceability check read only a results file's values, so the settings a file is keyed by -- latency rungs, accuracy levels -- could not be traced. Keys that are numbers outright count now; digits inside a key's name do not. — 2026-09-23
 ```
 
@@ -1046,14 +1047,15 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**838 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
+**866 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Three independent adversarial audits have found 53 defects here, nine of them critical, and
-all 53 are fixed.** The counts, in order, were **23, 17, 13.** That number is the most useful thing in this report, so it is at the top rather
+**Five independent adversarial reviews have found 86 defects here, 13 of them critical, and
+all 86 are fixed.** The counts, in order, were **23, 17, 13, 24, 9.** That number is the most useful thing in this report, so it is at the top rather
 than buried: the version of this document written a day earlier described a finished project.
+The fifth review (2026-09-23) is summarised below; the fourth is in commit `c8802ec`.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
 were incomplete, and **two of its four criticals were inside those fixes** — one of them was two
@@ -1172,6 +1174,39 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (4 guesses forked, 4 squashed, 4 charges staged and discarded, the
 alpha gate closed once, 0 wasted tokens — a pattern-index guess costs no model tokens — and 0
 leaks) and 7.8 replay under model drift (both cases diverge at step 0).
+
+### What the fifth review found, in parallel nodes and crash recovery
+
+One reviewer, told to break what the last three commits added -- parallel nodes, the agent
+loop, replay keying -- and to prove every finding with a failing test. Nine findings, every
+one reproduced here before it was fixed, and every fix checked by undoing it and watching its
+test fail. Nothing reached the world from a branch that never retired in any of them; what they
+found was that **a crash could make a resume send an effect twice**, which is the other half
+of what this runtime promises.
+
+- **Critical: a crash just after a group re-sent the next node's effect.** The last lane
+  journaled its own position, not the group's, so the next node resumed at a lower position,
+  under a key the dedupe table had never seen.
+- **Critical: a crash in the middle of a group re-sent an unretired lane's effect.** A resume
+  asked the router again, which saw the state some lanes had already committed and named the
+  rest under new visit counts. A group is now journaled whole before any lane forks, and a
+  resume finishes it -- same node ids, same position, same starting state.
+- A reducer combined parallel lanes by replaying one lane's positional patch on top of
+  another's commit: ``append`` duplicated items, ``last_write`` produced a value neither lane
+  wrote. Lanes now commit by value, as LangGraph combines a fan-out's updates.
+- A failure at a lane's retirement other than a state clash escaped the group, leaving later
+  lanes parked forever and their forks unresolved; a clash found at commit left its lane
+  "confirmed" for good, and the error never said its effect was already out.
+- Abandoning a lane cancelled it before closing its buffer, so a ``finally`` that wrote hung
+  the run -- and the wait swallowed a cancellation of the run itself.
+- A turn torn down while settling left its early-issued reads running past ``run_finished``.
+- Replay of a resumed run served the dead process's answer instead of the one the run kept.
+- ``redacted_thinking`` and every other block type without a class was dropped from the reply
+  the agent loop echoes back, which the API refuses.
+- A router could return a set, whose order changes from process to process.
+
+Fixing them found one more: a run cancelled from outside left its node bodies running,
+reading upstream for a run that was over. It is fixed on both the one-node and the group path.
 
 ### What the third audit found, in the second audit's fixes
 

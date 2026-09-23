@@ -68,12 +68,29 @@ thunk; let it own the task.
 
 ### Naming several nodes at once
 
-On the plain path a router may return a list of node names instead of one. The runtime reads
-that as "these are independent": it forks every one of them from the same committed state and
-program position, runs their bodies side by side, and retires them one at a time in the order
-the list names them. So their effects reach the world in that order, and their idempotency keys
-are the same whether they overlapped or not. `policy.parallel_nodes: false` runs the same group
-one body at a time; it changes the wall clock and nothing else.
+On the plain path a router may return a list (or tuple) of node names instead of one. The
+runtime reads that as "these are independent": it forks every one of them from the same
+committed state and program position, runs their bodies side by side, and retires them one at a
+time in the order the list names them. So their effects reach the world in that order, and their
+idempotency keys are the same whether they overlapped or not. `policy.parallel_nodes: false`
+runs the same group one body at a time; it changes the wall clock and nothing else.
+
+The order is load-bearing, so a router must return a list or a tuple: a set is refused, because
+its order is decided afresh in every process and a resume would mint the lanes under different
+ids. An empty list is refused too (return `None` to end the run), as is a node named twice.
+
+**A group is one decision, and a crash does not re-make it.** The journal records the group
+before any lane forks. If the process dies in the middle, a resume finishes that group -- its
+unretired lanes, under their own node ids, from the position and the state the group forked
+from -- instead of asking the router again, which would see the state some lanes had already
+committed. A lane whose writes went out before the crash derives the same keys, and the dedupe
+table claims them rather than sending them twice.
+
+**A reducer combines lanes by value.** Each lane's delta was taken against the group's starting
+state, so it is not replayed on top of a sibling's commit. For each key a lane touched, the
+reducer sees the committed value and the value the lane wrote -- what it sees for nodes run one
+after another, and how a fan-out's updates are combined in LangGraph. A lane's value is taken
+whole: two lanes editing parts of one object combine only through a reducer that merges them.
 
 What the list promises is yours to keep, and the runtime checks what it can:
 

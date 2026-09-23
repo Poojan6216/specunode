@@ -158,6 +158,11 @@ order named (`docs/adapters.md`). Two consequences follow, and neither is hidden
   then changed is refused at its retirement -- but only if the read was witnessed; an
   unwitnessed read cannot be checked (above) and retires on the value it saw. Refused means the
   run fails, loudly, with nothing of the refused node sent. It is not re-run on the fresh value.
+- **A clash found after a lane's write went out cannot un-send it.** A lane that writes a state
+  key only after its own write returns is checked only then; the lane is recorded as faulted,
+  the error says how many of its effects were already dispatched, and the lanes after it are
+  abandoned unsent. A resume re-runs the unfinished lanes under the same keys -- so nothing is
+  sent twice -- and refuses the same clash, unless a reducer has been declared for the key.
 
 ## A drafter cannot use the result of the call it was just asked about
 

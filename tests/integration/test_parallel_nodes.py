@@ -329,3 +329,333 @@ def test_the_router_may_name_one_node_or_several() -> None:
     assert adapter.next({"done:a": 1}) == NodeRef(name="finish")  # type: ignore[attr-defined]
     with pytest.raises(ValueError):
         Parallel(nodes=(NodeRef(name="a"),))
+
+
+# -- found by an independent adversarial review, each with a failing test first -----------------
+
+
+def pending_tasks() -> list[str]:
+    return sorted(
+        task.get_coro().__qualname__  # type: ignore[union-attr]
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() and not task.done()
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "reducer", "initial", "values"),
+    [
+        # A node writes what it contributes; ``append`` adds it to what is committed.
+        ("log", "append", [], {"a": ["a"], "b": ["b"]}),
+        ("log", "append", ["x"], {"a": ["a"], "b": ["b"]}),
+        # The later lane in declared order wins, whole -- not a value neither lane wrote.
+        ("cfg", "last_write", {"p": 1, "q": 1}, {"a": {"p": 2, "q": 1}, "b": {"p": 1, "q": 3}}),
+    ],
+    ids=["append-empty", "append-seeded", "last_write-object"],
+)
+async def test_a_reducer_combines_lanes_as_it_combines_nodes_run_one_after_another(
+    tmp_path: Path, key: str, reducer: str, initial: JsonValue, values: Mapping[str, JsonValue]
+) -> None:
+    """A lane's delta was replayed on top of a sibling's commit, positions and all."""
+    final = {}
+    for grouped in (False, True):
+        world = standard_world()
+
+        @tool(effect=EffectClass.WRITE, idempotent=False)
+        async def post_summary(channel: str, text: str) -> JsonValue:
+            return await world.post_summary(channel=channel, text=text)  # noqa: B023
+
+        def lane(name: str) -> object:
+            @node(name=name)
+            async def body(session: RunSession) -> Decision:
+                await session.call_tool("post_summary", {"channel": f"#{name}", "text": name})
+                session.state[key] = values[name]
+                session.state[f"done:{name}"] = True
+                return FreeText.of(name)
+
+            return body
+
+        def route(state: Mapping[str, JsonValue], grouped: bool = grouped) -> object:
+            pending = [n for n in ("a", "b") if f"done:{n}" not in state]
+            return (pending if grouped else pending[0]) if pending else None
+
+        adapter = PlainAdapter.of([lane("a"), lane("b")], route)  # type: ignore[list-item,arg-type]
+        journal = Journal(tmp_path / f"{key}-{grouped}.db")
+        scheduler = Scheduler(
+            graph=adapter,
+            registry=registry_of([post_summary]),  # type: ignore[list-item]
+            journal=journal,
+            buffer=StoreBuffer(journal=journal, run_id=""),
+            dispatcher=Dispatcher(registry=registry_of([post_summary]), base_delay_ms=0.5),  # type: ignore[list-item]
+            target=JournaledModel(ScriptedModel(turns=[]), journal, provider="scripted"),
+            policy=Policy(speculation=False),
+            reducers={key: reducer},
+        )
+        result = await scheduler.run(new_ulid(), {key: initial})
+        assert result.ok, result.error
+        final[grouped] = result.state[key]
+    assert final[True] == final[False]
+
+
+async def test_a_clash_found_at_commit_closes_the_lane_and_a_resume_sends_nothing_twice(
+    tmp_path: Path,
+) -> None:
+    """``b`` writes the key only after its post returned, so the clash is found after the post.
+
+    The lane used to stay confirmed forever, with an error that did not say its post was out,
+    and a resume dropped it and the lane after it and reported success.
+    """
+    world = standard_world()
+    adapter, registry = writers(world, same_key=True)
+    result, journal, run_id = await run_graph(tmp_path, adapter, registry, db="clash.db")
+    assert not result.ok
+    assert "both write state key 'shared'" in str(result.error)
+    assert "1 of its effects had already been dispatched" in str(result.error)
+    every_fork_resolved(journal, run_id)
+    lane_b = next(
+        e.payload["branch_id"]
+        for e in journal.read(run_id, kinds=["branch_forked"])
+        if e.payload["node_id"] == "b#0"
+    )
+    statuses = [
+        e.payload["status"]
+        for e in journal.read(run_id, kinds=["branch_resolved"])
+        if e.payload["branch_id"] == lane_b
+    ]
+    assert statuses[-1] == "faulted", f"lane b's lifecycle ended at {statuses}"
+    assert posted(world) == ["#a", "#b"]
+
+    def resume(reducers: Mapping[str, str]) -> Scheduler:
+        again = Journal(tmp_path / "clash.db")
+        return Scheduler(
+            graph=adapter,  # type: ignore[arg-type]
+            registry=registry,  # type: ignore[arg-type]
+            journal=again,
+            buffer=StoreBuffer(journal=again, run_id=""),
+            dispatcher=Dispatcher(registry=registry, base_delay_ms=0.5),  # type: ignore[arg-type]
+            target=JournaledModel(ScriptedModel(turns=[]), again, provider="scripted"),
+            policy=Policy(speculation=False),
+            reducers=dict(reducers),
+        )
+
+    # Resumed as it is, it re-runs b and c under their own keys and refuses the same clash.
+    refused = await resume({}).resume(run_id)
+    assert not refused.ok and "both write state key 'shared'" in str(refused.error)
+    assert posted(world) == ["#a", "#b"], "the resume sent b's post again"
+    # With the clash resolved -- a reducer declared -- the resume finishes the group.
+    finished = await resume({"shared": "last_write"}).resume(run_id)
+    assert finished.ok, finished.error
+    assert finished.state["shared"] == "c"
+    assert posted(world) == ["#a", "#b", "#c"]
+
+
+@pytest.mark.parametrize("failure", ["dead-letter", "reducer-refuses"])
+async def test_a_lane_that_fails_at_retirement_strands_nothing(
+    tmp_path: Path, failure: str
+) -> None:
+    """Only a state clash used to be caught; anything else escaped with later lanes parked."""
+    from specunode.buffer.dispatcher import ToolDispatchError
+
+    world = standard_world()
+
+    @tool(effect=EffectClass.WRITE, idempotent=False)
+    async def post_summary(channel: str, text: str) -> JsonValue:
+        return await world.post_summary(channel=channel, text=text)
+
+    @tool(effect=EffectClass.WRITE, idempotent=False)
+    async def page_oncall(team: str) -> JsonValue:
+        raise ToolDispatchError("pager is down", sent="no", retriable=False)
+
+    @node(name="a")
+    async def a(session: RunSession) -> Decision:
+        if failure == "dead-letter":
+            await session.call_tool("page_oncall", {"team": "data"})
+        else:
+            await session.call_tool("post_summary", {"channel": "#a", "text": "a"})
+            session.state["level"] = 5
+        return FreeText.of("a")
+
+    @node(name="b")
+    async def b(session: RunSession) -> Decision:
+        await session.call_tool("post_summary", {"channel": "#b", "text": "b"})
+        session.state["level"] = "high"  # ``max`` cannot order it against 5
+        return FreeText.of("b")
+
+    @node(name="c")
+    async def c(session: RunSession) -> Decision:
+        await session.call_tool("post_summary", {"channel": "#c", "text": "c"})
+        session.state["c"] = True
+        return FreeText.of("c")
+
+    def route(state: Mapping[str, JsonValue]) -> list[str] | None:
+        return None if "c" in state else ["a", "b", "c"]
+
+    adapter = PlainAdapter.of([a, b, c], route)  # type: ignore[list-item]
+    registry = registry_of([post_summary, page_oncall])  # type: ignore[list-item]
+    result, journal, run_id = await run_graph(
+        tmp_path, adapter, registry, reducers={"level": "max"}, db=f"{failure}.db"
+    )
+    assert not result.ok
+    assert ("dead-lettered" if failure == "dead-letter" else "ReducerError") in str(result.error)
+    every_fork_resolved(journal, run_id)
+    assert pending_tasks() == []
+    assert "#c" not in posted(world), "a lane after the failure was sent"
+
+
+async def test_a_lane_whose_finally_writes_does_not_hang_an_abandoned_group(
+    tmp_path: Path,
+) -> None:
+    """Hold something, always give it back: the ``finally`` wrote into a buffer nobody drained."""
+    world = standard_world()
+
+    @tool(effect=EffectClass.WRITE, idempotent=True, forward_keys="job:{args.job_id}")
+    async def reserve_capacity(job_id: str, units: int) -> JsonValue:
+        return await world.reserve_capacity(job_id=job_id, units=units)
+
+    @tool(effect=EffectClass.WRITE, idempotent=True, forward_keys="job:{args.job_id}")
+    async def release_capacity(job_id: str, units: int) -> JsonValue:
+        return await world.release_capacity(job_id=job_id, units=units)
+
+    @node(name="lease")
+    async def lease(session: RunSession) -> Decision:
+        try:
+            await session.call_tool("reserve_capacity", {"job_id": "etl-2", "units": 1})
+            session.state["lease"] = True
+            return FreeText.of("lease")
+        finally:
+            await session.call_tool("release_capacity", {"job_id": "etl-2", "units": 1})
+
+    @node(name="y")
+    async def y(session: RunSession) -> Decision:
+        await asyncio.sleep(0.02)
+        raise RuntimeError("y fell over")
+
+    def route(state: Mapping[str, JsonValue]) -> list[str] | None:
+        return None if "lease" in state else ["lease", "y"]
+
+    adapter = PlainAdapter.of([lease, y], route)  # type: ignore[list-item]
+    registry = registry_of([reserve_capacity, release_capacity])  # type: ignore[list-item]
+    result, journal, run_id = await asyncio.wait_for(
+        run_graph(tmp_path, adapter, registry, db="lease.db"), timeout=10
+    )
+    assert not result.ok and "node y failed" in str(result.error)
+    assert world.mutations == [], "a revoked lane's write was sent"
+    every_fork_resolved(journal, run_id)
+
+
+@pytest.mark.parametrize("torn_down_by", ["a sibling failing", "its own write dead-lettering"])
+async def test_a_turn_torn_down_while_settling_leaves_nothing_running(
+    tmp_path: Path, torn_down_by: str
+) -> None:
+    """The read a turn issued early for a later block kept running after the run returned."""
+    from specunode.buffer.dispatcher import ToolDispatchError
+    from specunode.core.model import Message
+    from specunode.testing.models import tool_turn
+
+    world = standard_world()
+    write_fails = torn_down_by == "its own write dead-lettering"
+
+    @tool(effect=EffectClass.WRITE, idempotent=False)
+    async def post_summary(channel: str, text: str) -> JsonValue:
+        if write_fails:
+            raise ToolDispatchError("upstream refused", sent="no", retriable=False)
+        return await world.post_summary(channel=channel, text=text)
+
+    @tool(effect=EffectClass.READ, witness=True)
+    async def slow_status(pipeline_id: str) -> JsonValue:
+        await asyncio.sleep(0.3)
+        return await world.get_pipeline_status(pipeline_id=pipeline_id)
+
+    @node(name="x")
+    async def x(session: RunSession) -> Decision:
+        assert session.call_turn is not None
+        await session.call_turn(
+            RequestEnvelope(
+                model="scripted",
+                messages=(Message(role="user", content=(TextBlock(text="go"),)),),
+                stream=True,
+            )
+        )
+        session.state["x"] = True
+        return FreeText.of("x")
+
+    @node(name="y")
+    async def y(session: RunSession) -> Decision:
+        await asyncio.sleep(0.05)
+        raise RuntimeError("y fell over")
+
+    def route(state: Mapping[str, JsonValue]) -> str | list[str] | None:
+        return None if "x" in state else ("x" if write_fails else ["x", "y"])
+
+    adapter = PlainAdapter.of([x, y], route)  # type: ignore[list-item]
+    registry = registry_of([post_summary, slow_status])  # type: ignore[list-item]
+    model = ScriptedModel(
+        turns=[
+            tool_turn(
+                ("post_summary", {"channel": "#ops", "text": "restarting"}),
+                ("slow_status", {"pipeline_id": "etl-2"}),
+            )
+        ]
+    )
+    result, journal, run_id = await run_graph(
+        tmp_path, adapter, registry, model=model, db="settle.db"
+    )
+    assert not result.ok
+    assert pending_tasks() == [], "something the turn started outlived the run"
+    await asyncio.sleep(0.4)
+    assert world.reads == [], "a read reached upstream after the run returned"
+    assert [e.kind for e in journal.read(run_id)][-1] == "run_finished"
+
+
+@pytest.mark.parametrize(
+    ("chosen", "complaint"),
+    [({"a", "b"}, "list or tuple"), ([], "return None"), (["a", "a"], "twice")],
+    ids=["a set, whose order changes per process", "nothing", "a node twice"],
+)
+def test_a_router_names_its_group_in_an_order_that_survives_a_resume(
+    chosen: object, complaint: str
+) -> None:
+    world = standard_world()
+    adapter, _ = writers(world)
+    router = PlainAdapter.of(list(adapter.node_fns.values()), lambda state: chosen)  # type: ignore[attr-defined,arg-type]
+    with pytest.raises((TypeError, ValueError), match=complaint):
+        router.next({})
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["one node", "a group"])
+async def test_a_run_cancelled_from_outside_leaves_none_of_its_nodes_running(
+    tmp_path: Path, grouped: bool
+) -> None:
+    """A timeout or a shutdown cancels ``run()``. Its nodes used to keep running without it,
+    making calls for a run that was over."""
+    world = standard_world()
+
+    @tool(effect=EffectClass.READ, witness=True)
+    async def slow_status(pipeline_id: str) -> JsonValue:
+        await asyncio.sleep(0.5)
+        return await world.get_pipeline_status(pipeline_id=pipeline_id)
+
+    def lane(name: str) -> object:
+        @node(name=name)
+        async def body(session: RunSession) -> Decision:
+            await asyncio.sleep(0.05)
+            await session.call_tool("slow_status", {"pipeline_id": "etl-1"})
+            session.state[name] = True
+            return FreeText.of(name)
+
+        return body
+
+    def route(state: Mapping[str, JsonValue]) -> str | list[str] | None:
+        return None if "a" in state else (["a", "b"] if grouped else "a")
+
+    adapter = PlainAdapter.of([lane("a"), lane("b")], route)  # type: ignore[list-item]
+    registry = registry_of([slow_status])  # type: ignore[list-item]
+    running = asyncio.ensure_future(run_graph(tmp_path, adapter, registry, db="cancel.db"))
+    await asyncio.sleep(0.02)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    await asyncio.sleep(0)
+    assert pending_tasks() == [], "a node outlived the run that was cancelled"
+    await asyncio.sleep(0.6)
+    assert world.reads == [], "a cancelled run's node still reached upstream"

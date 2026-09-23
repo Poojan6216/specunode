@@ -61,6 +61,7 @@ __all__ = [
     "ModelClient",
     "ModelError",
     "ModelResponse",
+    "OpaqueBlock",
     "PromptBuilder",
     "RequestEnvelope",
     "StreamEvent",
@@ -122,7 +123,23 @@ class ToolResultBlock:
     kind: Literal["tool_result"] = "tool_result"
 
 
-ContentBlock: TypeAlias = TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock
+@dataclass(frozen=True, slots=True)
+class OpaqueBlock:
+    """A block this runtime does not interpret, carried exactly as the provider sent it.
+
+    In a tool-use loop the API wants the model's reply back unchanged -- ``redacted_thinking``
+    included, and whatever block types a later API version adds. A block with no class here
+    used to be dropped on the way in, so the next request echoed a reply with a block missing,
+    which the API refuses. ``payload`` is the block as the provider sent it, ``type`` included.
+    It is part of what the model is asked, so it is part of the request hash.
+    """
+
+    type: str
+    payload: Mapping[str, JsonValue]
+    kind: Literal["opaque"] = "opaque"
+
+
+ContentBlock: TypeAlias = TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock | OpaqueBlock
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +233,8 @@ def _block_payload(block: ContentBlock, ids: Mapping[str, str]) -> JsonValue:
                 "content": content,
                 "is_error": is_error,
             }
+        case OpaqueBlock(type=block_type, payload=payload):
+            return {"kind": "opaque", "type": block_type, "payload": dict(payload)}
 
 
 def _positional_ids(messages: Sequence[Message]) -> dict[str, str]:
@@ -387,6 +406,8 @@ def block_to_json(block: ContentBlock) -> JsonValue:
                 "content": content,
                 "is_error": is_error,
             }
+        case OpaqueBlock(type=block_type, payload=payload):
+            return {"kind": "opaque", "type": block_type, "payload": dict(payload)}
 
 
 def block_from_json(payload: Mapping[str, JsonValue]) -> ContentBlock:
@@ -411,6 +432,11 @@ def block_from_json(payload: Mapping[str, JsonValue]) -> ContentBlock:
                 content=payload["content"],
                 is_error=bool(payload.get("is_error", False)),
             )
+        case "opaque":
+            raw = payload["payload"]
+            if not isinstance(raw, Mapping):
+                raise ValueError(f"opaque block has a non-object payload: {payload!r}")
+            return OpaqueBlock(type=str(payload["type"]), payload=dict(raw))
         case _:
             raise ValueError(f"unknown content block kind {kind!r}")
 

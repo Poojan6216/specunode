@@ -161,6 +161,25 @@ class ReplayModel:
 
     def __post_init__(self) -> None:
         self._load()
+        self._keep_one_attempt()
+
+    def _keep_one_attempt(self) -> None:
+        """Serve each (node, position) the turns of the attempt the run kept, and no other.
+
+        A resumed run re-runs a node that never retired from the same position, under the same
+        node id, and asks the model again -- so the journal holds two attempts' turns under one
+        key: the dead process's and the resumed one's. Served in journal order, replay handed
+        the node the dead attempt's answer and reproduced a decision the committed run never
+        made; for a conversation it compared the resumed turns against the dead ones and
+        refused a faithful re-run. The attempt that retired is the one the run kept. When none
+        did -- a run that ended mid-node -- the latest attempt is the nearest thing to it.
+        """
+        for key, turns in self._turns.items():
+            attempts = list(dict.fromkeys(turn.branch_id for turn in turns))
+            if len(attempts) < 2:
+                continue
+            kept = [a for a in attempts if a in self.retired_branches] or attempts[-1:]
+            self._turns[key] = [turn for turn in turns if turn.branch_id in kept]
 
     def _load(self) -> None:
         requests: dict[str, Mapping[str, JsonValue]] = {}
@@ -299,6 +318,30 @@ def attested_origins(
 
 
 @dataclass(frozen=True)
+class OpenGroup:
+    """A Parallel group that some but not all of its lanes had retired from.
+
+    Everything a resume needs to finish the group as the group it was: which lanes it named,
+    under which node ids, from which position and which committed state they forked -- so a
+    lane re-run after a crash derives the keys it derived before -- and what the lanes that did
+    retire already wrote, so a clash with them is still refused.
+    """
+
+    group_id: str
+    #: ``(name, path, node_id)`` for every lane, in the order the router named them.
+    lanes: tuple[tuple[str, tuple[str, ...], str], ...]
+    #: Node ids of the lanes that retired.
+    retired: frozenset[str]
+    fork_cursor: StepCursor
+    #: Committed state when the group forked: what every lane saw, the first time.
+    base_state: Mapping[str, JsonValue]
+    #: The furthest position a retired lane reached. The group's cursor is past it.
+    max_step: int
+    #: State keys the retired lanes wrote, by the node id that wrote them.
+    claimed: Mapping[str, str]
+
+
+@dataclass(frozen=True)
 class Recovery:
     """What a crashed run left behind, and what a resumed one may build on.
 
@@ -327,6 +370,9 @@ class Recovery:
     unresolved_dispatches: tuple[Mapping[str, JsonValue], ...]
     last_offset: int
     finished: bool
+    #: A Parallel group the run was in the middle of, if any. A resume finishes it rather than
+    #: asking the router again.
+    open_group: OpenGroup | None = None
 
     @property
     def exists(self) -> bool:
@@ -375,12 +421,27 @@ def recover(journal: Journal, run_id: str) -> Recovery:
     cursor = StepCursor()
     last_offset = -1
     finished = False
+    # Parallel groups: each one's journaled decision, and which of its lanes retired.
+    groups: dict[str, _GroupRecord] = {}
+    last_group: str | None = None
+    lane_of: dict[str, tuple[str, str]] = {}
+    touched_by: dict[str, list[str]] = {}
 
     for entry in journal.read(run_id):
         last_offset = entry.offset
         payload = entry.payload
         if entry.kind == "run_finished":
             finished = True
+        elif entry.kind == "group_forked":
+            group_id = payload.get("group_id")
+            if isinstance(group_id, str):
+                groups[group_id] = _GroupRecord.read(payload, entry.offset)
+                last_group = group_id
+        elif entry.kind == "branch_forked":
+            group_id = payload.get("group_id")
+            branch_id = payload.get("branch_id")
+            if isinstance(group_id, str) and isinstance(branch_id, str):
+                lane_of[branch_id] = (group_id, str(payload.get("node_id") or ""))
         elif entry.kind == "branch_resolved":
             branch_id = payload.get("branch_id")
             status = payload.get("status")
@@ -389,6 +450,11 @@ def recover(journal: Journal, run_id: str) -> Recovery:
                     retired.add(branch_id)
                     confirmed.discard(branch_id)
                     cursor = _cursor_from(payload.get("cursor_after"), cursor)
+                    if branch_id in lane_of:
+                        group_id, node_id = lane_of[branch_id]
+                        if group_id in groups:
+                            groups[group_id].retired[node_id] = branch_id
+                            groups[group_id].steps.append(cursor.step_index)
                 elif status == "confirmed":
                     confirmed.add(branch_id)
         elif entry.kind == "state_delta_applied":
@@ -396,13 +462,40 @@ def recover(journal: Journal, run_id: str) -> Recovery:
             patch = payload.get("patch")
             if isinstance(branch_id, str) and isinstance(patch, Sequence):
                 deltas.append((entry.offset, branch_id, patch))
+            touched = payload.get("touched_keys")
+            if isinstance(branch_id, str) and isinstance(touched, Sequence):
+                touched_by[branch_id] = [str(key) for key in touched]
 
-    state: JsonValue = {}
-    for _offset, branch_id, patch in deltas:
-        if branch_id not in retired:
-            continue
-        operations = [operation_from_json(op) for op in patch if isinstance(op, Mapping)]
-        state = apply(state, operations)
+    def state_before(offset: int | None) -> JsonValue:
+        state: JsonValue = {}
+        for delta_offset, branch_id, patch in deltas:
+            if branch_id not in retired or (offset is not None and delta_offset >= offset):
+                continue
+            operations = [operation_from_json(op) for op in patch if isinstance(op, Mapping)]
+            state = apply(state, operations)
+        return state
+
+    state = state_before(None)
+    open_group: OpenGroup | None = None
+    record = groups.get(last_group) if last_group is not None else None
+    if record is not None and set(record.retired) != {lane[2] for lane in record.lanes}:
+        base = state_before(record.offset)
+        max_step = max([record.fork_cursor.step_index, *record.steps])
+        open_group = OpenGroup(
+            group_id=record.group_id,
+            lanes=tuple(record.lanes),
+            retired=frozenset(record.retired),
+            fork_cursor=record.fork_cursor,
+            base_state=dict(base) if isinstance(base, Mapping) else {},
+            max_step=max_step,
+            claimed={
+                key: node_id
+                for node_id, branch_id in record.retired.items()
+                for key in touched_by.get(branch_id, ())
+            },
+        )
+        # Where the run is, for the status command: inside the group, past its retired lanes.
+        cursor = StepCursor(step_index=max_step, visits=record.fork_cursor.visits)
 
     return Recovery(
         run_id=run_id,
@@ -414,7 +507,43 @@ def recover(journal: Journal, run_id: str) -> Recovery:
         unresolved_dispatches=tuple(journal.unresolved_dispatches(run_id)),
         last_offset=last_offset,
         finished=finished,
+        open_group=open_group,
     )
+
+
+@dataclass
+class _GroupRecord:
+    """A ``group_forked`` entry as recovery reads it, and what happened to its lanes since."""
+
+    group_id: str
+    lanes: list[tuple[str, tuple[str, ...], str]]
+    fork_cursor: StepCursor
+    offset: int
+    #: Node id -> the branch that retired it.
+    retired: dict[str, str] = field(default_factory=dict)
+    steps: list[int] = field(default_factory=list)
+
+    @classmethod
+    def read(cls, payload: Mapping[str, JsonValue], offset: int) -> _GroupRecord:
+        lanes: list[tuple[str, tuple[str, ...], str]] = []
+        raw_lanes = payload.get("lanes")
+        if isinstance(raw_lanes, Sequence) and not isinstance(raw_lanes, str):
+            for lane in raw_lanes:
+                if not isinstance(lane, Mapping):
+                    continue
+                raw_path = lane.get("path")
+                path = (
+                    tuple(str(part) for part in raw_path)
+                    if isinstance(raw_path, Sequence) and not isinstance(raw_path, str)
+                    else ()
+                )
+                lanes.append((str(lane.get("name") or ""), path, str(lane.get("node_id") or "")))
+        return cls(
+            group_id=str(payload.get("group_id")),
+            lanes=lanes,
+            fork_cursor=_cursor_from(payload.get("fork_cursor"), StepCursor()),
+            offset=offset,
+        )
 
 
 # -- the context fold (Hard Rule 13's rebuild) --------------------------------------------------
