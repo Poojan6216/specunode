@@ -441,3 +441,47 @@ def test_the_model_bound_bench_counts_replies_and_calls_in_flight() -> None:
     assert branches["summaries_identical"], "side by side posted a different report"
     totals = report["totals"]
     assert totals == {"runs": 4, "correct": 4, "leaks": 0}
+
+
+def test_the_real_model_bound_runner_runs_every_cell_without_a_credential() -> None:
+    """The paid benchmark, dry: every cell completes, correct and leak-free, and the four
+    comparisons it exists to report come out with an interval each."""
+    from bench.online.run_latency import Spend
+    from bench.online.run_model_bound import CELLS, COMPARISONS, measure
+
+    report = asyncio.run(measure("scripted", runs=2, spend=Spend(cap_usd=5.0)))
+    assert report["failure"] is None and report["halted_at"] is None
+    for cell in CELLS:
+        summary = report["cells"][cell.name]
+        assert (summary["n"], summary["correct"], summary["leaks"]) == (2, 2, 0), cell.name
+    assert set(report["comparisons"]) == {label for label, _, _ in COMPARISONS}
+    assert all(c["wall_saving_ci95"] for c in report["comparisons"].values())
+
+
+def test_the_real_model_bound_runner_stops_at_its_cap() -> None:
+    """Decision Gate D2: a cap is where the benchmark stops, not a figure it reports after."""
+    from bench.online.run_latency import Spend
+    from bench.online.run_model_bound import measure
+
+    report = asyncio.run(measure("scripted", runs=3, spend=Spend(cap_usd=0.05)))
+    assert report["halted_at"] is not None
+    assert report["failure"] is None
+
+
+def test_the_real_model_bound_runner_stops_spending_on_the_first_failed_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken setup -- the API refusing a request, say -- must not be paid for seven times."""
+    import bench.online.run_model_bound as runner
+    from bench.online.run_latency import Spend
+
+    attempted: list[str] = []
+
+    async def refused(cell: object, kind: str, spend: object) -> dict[str, object]:
+        attempted.append(cell.name)  # type: ignore[attr-defined]
+        raise runner.RunFailed(f"{cell.name}: the API refused the request")  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(runner, "run_cell", refused)
+    report = asyncio.run(runner.measure("scripted", runs=3, spend=Spend(cap_usd=5.0)))
+    assert str(report["failure"]).startswith("round 1:")
+    assert attempted == [runner.CELLS[0].name], "it kept going after a run failed"
