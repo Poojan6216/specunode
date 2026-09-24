@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "specunode"
 version = "0.1.0"
-description = "Speculative out-of-order execution for agent graphs, with a store buffer: reads run early, writes wait until the model's real decision confirms them."
+description = "A runtime for AI agents whose tools change the world: every write held until the model's decision is durable, claimed under a deterministic key so a crash never sends it twice, and every run journaled and replayable."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Poojan Patel" }]
-keywords = ["llm", "agents", "speculative-execution", "langgraph", "mcp", "durable-execution"]
+keywords = ["llm", "agents", "tool-calling", "idempotency", "durable-execution", "crash-recovery", "langgraph", "mcp", "speculative-execution"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
