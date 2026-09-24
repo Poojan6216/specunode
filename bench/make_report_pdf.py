@@ -467,6 +467,44 @@ def build_story(styles: Any) -> list[Any]:
             f"Spend ${online['estimated_spend_usd']}. Effects from a branch that never retired: "
             f"{leaks}."
         )
+    para("11. Pull the plug: what a crash sends twice", h2)
+    crash = load("crash_safety.json")
+    if crash is None:
+        para("Not measured. Run <font face='Courier'>bench/offline/run_crash_safety.py</font>.")
+    else:
+        para(
+            f"A billing run with {crash['writes']} effects, killed {crash['crash_points']} "
+            "times -- just before each request reached the upstream, and just after each took "
+            "effect but before its reply came back -- and restarted the way each system "
+            f"restarts. LangGraph {crash['langgraph']}; no model and no network."
+        )
+        rows = [["System", "Exact", "Stopped for a human", "Sent twice", "Extra effects"]]
+        labels = (
+            ("plain_loop", "Plain async loop"),
+            ("langgraph_nodes", "LangGraph, node per customer"),
+            ("langgraph_tasks", "LangGraph, @task per call"),
+            ("specunode", "SpecuNode"),
+            ("specunode_reconcile", "SpecuNode with reconcile"),
+        )
+        for key, label in labels:
+            row = crash["systems"].get(key)
+            if row is None:
+                continue
+            rows.append(
+                [
+                    label,
+                    str(row["exact"]),
+                    str(row["held"]),
+                    str(row["duplicated"]),
+                    str(row["duplicate_effects"]),
+                ]
+            )
+        table(rows)
+        para(
+            "A lost reply is the crash that double-charges. SpecuNode sent nothing twice in any "
+            "of them; without a way to ask the upstream it stops for a human, and with a "
+            "reconcile per tool it finished every one, nothing sent twice and nothing missing."
+        )
     return story
 
 

@@ -71,6 +71,13 @@ world then receives both, and no bookkeeping in this design connects them.
 So the honest statement is: **a resumed run never delivers the same call twice, and can deliver
 a second, different call the uninterrupted run would not have made.**
 
+The ambiguous window itself -- the upstream took the call, the reply never came back -- is
+closed only by the upstream. A tool that declares a `reconcile` is asked, on resume, whether the
+call under its key took effect, and the runtime acts on the answer; one that does not is
+dead-lettered. `reconcile` is only as good as the record it reads: it must be one the upstream
+writes atomically with the effect, or a request still in flight can be reported as absent and
+then land (`docs/adapters.md`).
+
 There is no setting that closes this window, and on the current models there is not even one
 that narrows it: `temperature`, `top_p` and `top_k` are rejected outright by Claude Sonnet 5 and
 Claude Opus 5 (HTTP 400, "`temperature` is deprecated for this model"), so the advice this page

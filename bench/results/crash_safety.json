@@ -1,0 +1,1000 @@
+{
+  "bench": "crash_safety",
+  "crash_points": 14,
+  "langgraph": "1.2.11",
+  "systems": {
+    "langgraph_nodes": {
+      "control": "exact",
+      "crashes": 14,
+      "duplicate_effects": 13,
+      "duplicated": 10,
+      "exact": 4,
+      "held": 0,
+      "inconsistent": 0,
+      "lost": 0,
+      "points": [
+        {
+          "at": 1,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 1,
+          "duplicated": {
+            "charge cus-1": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 2,
+          "duplicated": {
+            "charge cus-1": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 2,
+          "duplicated": {
+            "charge cus-1": 1,
+            "receipt cus-1": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 3,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 3,
+          "duplicated": {
+            "charge cus-2": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 4,
+          "duplicated": {
+            "charge cus-2": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 4,
+          "duplicated": {
+            "charge cus-2": 1,
+            "receipt cus-2": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 5,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 5,
+          "duplicated": {
+            "charge cus-3": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 6,
+          "duplicated": {
+            "charge cus-3": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 6,
+          "duplicated": {
+            "charge cus-3": 1,
+            "receipt cus-3": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 7,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 7,
+          "duplicated": {
+            "summary": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_nodes",
+          "when": "reply_lost",
+          "why": null
+        }
+      ]
+    },
+    "langgraph_tasks": {
+      "control": "exact",
+      "crashes": 14,
+      "duplicate_effects": 7,
+      "duplicated": 7,
+      "exact": 7,
+      "held": 0,
+      "inconsistent": 0,
+      "lost": 0,
+      "points": [
+        {
+          "at": 1,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 1,
+          "duplicated": {
+            "charge cus-1": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 2,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 2,
+          "duplicated": {
+            "receipt cus-1": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 3,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 3,
+          "duplicated": {
+            "charge cus-2": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 4,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 4,
+          "duplicated": {
+            "receipt cus-2": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 5,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 5,
+          "duplicated": {
+            "charge cus-3": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 6,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 6,
+          "duplicated": {
+            "receipt cus-3": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 7,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 7,
+          "duplicated": {
+            "summary": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "langgraph_tasks",
+          "when": "reply_lost",
+          "why": null
+        }
+      ]
+    },
+    "plain_loop": {
+      "control": "exact",
+      "crashes": 14,
+      "duplicate_effects": 49,
+      "duplicated": 13,
+      "exact": 1,
+      "held": 0,
+      "inconsistent": 0,
+      "lost": 0,
+      "points": [
+        {
+          "at": 1,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 1,
+          "duplicated": {
+            "charge cus-1": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 2,
+          "duplicated": {
+            "charge cus-1": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 2,
+          "duplicated": {
+            "charge cus-1": 1,
+            "receipt cus-1": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 3,
+          "duplicated": {
+            "charge cus-1": 1,
+            "receipt cus-1": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 3,
+          "duplicated": {
+            "charge cus-1": 1,
+            "charge cus-2": 1,
+            "receipt cus-1": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 4,
+          "duplicated": {
+            "charge cus-1": 1,
+            "charge cus-2": 1,
+            "receipt cus-1": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 4,
+          "duplicated": {
+            "charge cus-1": 1,
+            "charge cus-2": 1,
+            "receipt cus-1": 1,
+            "receipt cus-2": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 5,
+          "duplicated": {
+            "charge cus-1": 1,
+            "charge cus-2": 1,
+            "receipt cus-1": 1,
+            "receipt cus-2": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 5,
+          "duplicated": {
+            "charge cus-1": 1,
+            "charge cus-2": 1,
+            "charge cus-3": 1,
+            "receipt cus-1": 1,
+            "receipt cus-2": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 6,
+          "duplicated": {
+            "charge cus-1": 1,
+            "charge cus-2": 1,
+            "charge cus-3": 1,
+            "receipt cus-1": 1,
+            "receipt cus-2": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 6,
+          "duplicated": {
+            "charge cus-1": 1,
+            "charge cus-2": 1,
+            "charge cus-3": 1,
+            "receipt cus-1": 1,
+            "receipt cus-2": 1,
+            "receipt cus-3": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 7,
+          "duplicated": {
+            "charge cus-1": 1,
+            "charge cus-2": 1,
+            "charge cus-3": 1,
+            "receipt cus-1": 1,
+            "receipt cus-2": 1,
+            "receipt cus-3": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 7,
+          "duplicated": {
+            "charge cus-1": 1,
+            "charge cus-2": 1,
+            "charge cus-3": 1,
+            "receipt cus-1": 1,
+            "receipt cus-2": 1,
+            "receipt cus-3": 1,
+            "summary": 1
+          },
+          "finished": true,
+          "missing": [],
+          "outcome": "duplicated",
+          "receipts_that_lie": [],
+          "system": "plain_loop",
+          "when": "reply_lost",
+          "why": null
+        }
+      ]
+    },
+    "specunode": {
+      "control": "exact",
+      "crashes": 14,
+      "duplicate_effects": 0,
+      "duplicated": 0,
+      "exact": 0,
+      "held": 14,
+      "inconsistent": 0,
+      "lost": 0,
+      "points": [
+        {
+          "at": 1,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "charge cus-1",
+            "charge cus-2",
+            "charge cus-3",
+            "receipt cus-1",
+            "receipt cus-2",
+            "receipt cus-3",
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "request_lost",
+          "why": "SchedulerError: a write from node bill_cus-1#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 1,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "charge cus-2",
+            "charge cus-3",
+            "receipt cus-1",
+            "receipt cus-2",
+            "receipt cus-3",
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "reply_lost",
+          "why": "SchedulerError: a write from node bill_cus-1#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 2,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "charge cus-2",
+            "charge cus-3",
+            "receipt cus-1",
+            "receipt cus-2",
+            "receipt cus-3",
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "request_lost",
+          "why": "SchedulerError: a write from node bill_cus-1#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 2,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "charge cus-2",
+            "charge cus-3",
+            "receipt cus-2",
+            "receipt cus-3",
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "reply_lost",
+          "why": "SchedulerError: a write from node bill_cus-1#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 3,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "charge cus-2",
+            "charge cus-3",
+            "receipt cus-2",
+            "receipt cus-3",
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "request_lost",
+          "why": "SchedulerError: a write from node bill_cus-2#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 3,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "charge cus-3",
+            "receipt cus-2",
+            "receipt cus-3",
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "reply_lost",
+          "why": "SchedulerError: a write from node bill_cus-2#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 4,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "charge cus-3",
+            "receipt cus-2",
+            "receipt cus-3",
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "request_lost",
+          "why": "SchedulerError: a write from node bill_cus-2#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 4,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "charge cus-3",
+            "receipt cus-3",
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "reply_lost",
+          "why": "SchedulerError: a write from node bill_cus-2#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 5,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "charge cus-3",
+            "receipt cus-3",
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "request_lost",
+          "why": "SchedulerError: a write from node bill_cus-3#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 5,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "receipt cus-3",
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "reply_lost",
+          "why": "SchedulerError: a write from node bill_cus-3#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 6,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "receipt cus-3",
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "request_lost",
+          "why": "SchedulerError: a write from node bill_cus-3#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 6,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "reply_lost",
+          "why": "SchedulerError: a write from node bill_cus-3#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 7,
+          "duplicated": {},
+          "finished": false,
+          "missing": [
+            "summary"
+          ],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "request_lost",
+          "why": "SchedulerError: a write from node summary#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        },
+        {
+          "at": 7,
+          "duplicated": {},
+          "finished": false,
+          "missing": [],
+          "outcome": "held",
+          "receipts_that_lie": [],
+          "system": "specunode",
+          "when": "reply_lost",
+          "why": "SchedulerError: a write from node summary#0 was dead-lettered, so the run halts here for a human; a resume retries it under the same key"
+        }
+      ]
+    },
+    "specunode_reconcile": {
+      "control": "exact",
+      "crashes": 14,
+      "duplicate_effects": 0,
+      "duplicated": 0,
+      "exact": 14,
+      "held": 0,
+      "inconsistent": 0,
+      "lost": 0,
+      "points": [
+        {
+          "at": 1,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 1,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 2,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 2,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 3,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 3,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 4,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 4,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 5,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 5,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 6,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 6,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "reply_lost",
+          "why": null
+        },
+        {
+          "at": 7,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "request_lost",
+          "why": null
+        },
+        {
+          "at": 7,
+          "duplicated": {},
+          "finished": true,
+          "missing": [],
+          "outcome": "exact",
+          "receipts_that_lie": [],
+          "system": "specunode_reconcile",
+          "when": "reply_lost",
+          "why": null
+        }
+      ]
+    }
+  },
+  "wall_seconds": 2.7,
+  "writes": 7
+}

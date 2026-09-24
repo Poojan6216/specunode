@@ -23,6 +23,7 @@ from specunode.canonical import JsonValue
 from specunode.core.decision import Decision
 from specunode.core.effects import (
     EffectClass,
+    Reconcile,
     ToolRegistry,
     ToolSpec,
     forward_keys_from_template,
@@ -54,12 +55,18 @@ def tool(
     witness: bool = False,
     name: str | None = None,
     registry: ToolRegistry | None = None,
+    reconcile: Reconcile | None = None,
 ) -> Callable[[F], F]:
     """Declare a function's effect class and register it.
 
     The default is ``WRITE``, not ``READ``, and not "infer it from the name". A tool whose
     upstream enqueues, schedules or triggers anything is a write whatever its response looks
     like: ``{"status": "queued"}`` is not a read result.
+
+    ``reconcile`` is how a resume finds out whether a call whose reply a crash lost took
+    effect: given the idempotency key it was sent under and its arguments, it asks the upstream
+    and returns the upstream's result, or ``None`` if nothing happened. Without it such a call
+    to a non-idempotent tool is dead-lettered for a human.
     """
     resolved = EffectClass(effect) if isinstance(effect, str) else effect
 
@@ -72,6 +79,7 @@ def tool(
             compensator=compensator,
             forward_keys=forward_keys_from_template(forward_keys) if forward_keys else None,
             witness=witness,
+            reconcile=reconcile,
         )
         if registry is not None:
             registry.register(spec)

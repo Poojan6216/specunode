@@ -50,6 +50,11 @@ logger = logging.getLogger("specunode.effects")
 JsonSchema: TypeAlias = Mapping[str, JsonValue]
 ToolFn: TypeAlias = Callable[..., Awaitable[JsonValue]]
 ForwardKeys: TypeAlias = Callable[[Mapping[str, JsonValue]], frozenset[str]]
+#: Asked, after a crash, whether a call whose outcome was lost took effect upstream. Given the
+#: idempotency key the call was sent under and its arguments; returns the upstream's own
+#: result if it did, ``None`` if it did not. It must answer from the upstream's record of that
+#: key -- a payment's idempotency key, a unique request id, a row keyed by it.
+Reconcile: TypeAlias = Callable[[str, Mapping[str, JsonValue]], Awaitable["JsonValue | None"]]
 
 
 class UnknownTool(RuntimeError):
@@ -109,6 +114,10 @@ class ToolSpec:
     schema: JsonSchema | None = None
     #: True when this spec was synthesised for a name nobody declared.
     synthesised: bool = False
+    #: How to find out, after a crash, whether a call whose reply was lost took effect. Without
+    #: it, a non-idempotent call in that window is dead-lettered for a human, because sending
+    #: it again could do it twice and not sending it could skip it.
+    reconcile: Reconcile | None = None
 
     def __post_init__(self) -> None:
         if self.effect is EffectClass.COMPENSABLE and not self.compensator:

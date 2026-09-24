@@ -426,11 +426,21 @@ def recover(journal: Journal, run_id: str) -> Recovery:
     last_group: str | None = None
     lane_of: dict[str, tuple[str, str]] = {}
     touched_by: dict[str, list[str]] = {}
+    # The state the run started from. Every journaled delta was taken on top of it, so the
+    # rebuild has to start there too: starting from nothing dropped the run's inputs from every
+    # resumed run -- a node reading one failed -- and a delta that changed an input key had
+    # nothing to apply to.
+    inputs: dict[str, JsonValue] = {}
+    started = False
 
     for entry in journal.read(run_id):
         last_offset = entry.offset
         payload = entry.payload
-        if entry.kind == "run_finished":
+        if entry.kind == "run_started" and not started:
+            started = True
+            raw = payload.get("inputs")
+            inputs = dict(raw) if isinstance(raw, Mapping) else {}
+        elif entry.kind == "run_finished":
             finished = True
         elif entry.kind == "group_forked":
             group_id = payload.get("group_id")
@@ -467,7 +477,7 @@ def recover(journal: Journal, run_id: str) -> Recovery:
                 touched_by[branch_id] = [str(key) for key in touched]
 
     def state_before(offset: int | None) -> JsonValue:
-        state: JsonValue = {}
+        state: JsonValue = dict(inputs)
         for delta_offset, branch_id, patch in deltas:
             if branch_id not in retired or (offset is not None and delta_offset >= offset):
                 continue

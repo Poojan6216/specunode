@@ -1,20 +1,105 @@
 # SpecuNode
 
-**Speculative out-of-order execution for agent graphs, with a store buffer.**
+**Agents that take real actions, and never take one twice.**
 
-An agent graph runs strictly serially: the model thinks, emits a tool call, waits for the tool,
-thinks again. Most of that time is spent waiting on one thing at a time.
+SpecuNode is a runtime for AI agents whose tools change the world: charging a card, restarting a
+job, sending a message. It holds every write until the model's decision behind it is durable,
+claims every effect under a deterministic key so that no crash can send it twice, journals
+everything so any run can be replayed exactly, and runs a reply's independent calls -- and
+independent nodes -- side by side. Plain Python, LangGraph and MCP.
 
-A processor has had this problem since the 1960s and solved it. It guesses which way a branch
+## Pull the plug
+
+A billing run -- look up three customers, charge each, send each a receipt, post one summary --
+killed at each of its 14 dangerous moments and restarted the way each system restarts:
+
+| | Finished, every effect once | Stopped for a human | Sent something twice | Extra effects |
+|---|---|---|---|---|
+| A plain async loop | 1 | 0 | 13 | 49 |
+| LangGraph, a checkpointed node per customer | 4 | 0 | 10 | 13 |
+| LangGraph, a `@task` per call -- its recommended pattern | 7 | 0 | 7 | 7 |
+| **SpecuNode** | 0 | 14 | **0** | **0** |
+| **SpecuNode, with a `reconcile` per tool** | **14** | 0 | **0** | **0** |
+
+```
+python bench/offline/run_crash_safety.py    # no model, no network, a few seconds
+```
+
+The crash that charges a customer twice is the one where the charge went through and the reply
+was lost. A checkpoint cannot see it: the call either finished or it did not. SpecuNode claims
+every effect in its journal under a deterministic key *before* sending it, so after a crash it
+knows exactly which effects may already be out -- and then it asks the upstream (a tool's
+`reconcile`) or stops for a human. It never guesses. Details and caveats in
+[RESULTS.md](RESULTS.md#pull-the-plug-what-a-crash-sends-twice).
+
+## Quickstart
+
+```
+git clone <this repository> && cd SpecuNode && pip install -e .   # not on PyPI yet
+python examples/quickstart.py
+```
+
+```python
+import specunode
+
+@specunode.tool(effect="write", reconcile=charge_was_taken)   # how to ask after a crash
+async def charge_card(customer_id: str, amount: float) -> dict:
+    key = specunode.current_idempotency_key()                 # the same key on every retry
+    return {"charge_id": await payments.charge(customer_id, amount, request_key=key)}
+
+@specunode.node()
+async def bill(session: specunode.RunSession) -> specunode.Decision:
+    charge = await session.call_tool("charge_card", {"customer_id": "cus-1", "amount": 25.0})
+    session.state["billed"] = True
+    return specunode.FreeText.of("billed")
+
+runtime = specunode.Runtime(specunode.graph([bill], route), tools=[charge_card])
+await runtime.run({"customer_id": "cus-1"}, run_id="bill-cus-1")
+# the process dies with the charge made and its reply lost -- then:
+await runtime.resume("bill-cus-1")
+```
+
+```
+billing cus-1 ...
+  the process died: killed after the charge went through, before its reply came back
+resuming from the journal ...
+  asked the payments API about request fe58acad3144...: ch_1
+  finished: True
+charges made: 1, receipts sent: 1
+```
+
+The whole example is [examples/quickstart.py](examples/quickstart.py), and a test runs it.
+
+## And faster, when the model is the slow part
+
+Against `claude-sonnet-5`, running every call a reply asks for together and handing the results
+back at once took an on-call task from 11 replies to 5: 35.4% less time and, with prompt caching,
+77.7% less cost, with every run correct. Three independent checks side by side took 60.2% less
+time than one after another. Nothing reached the world from a branch that never retired.
+[Details](RESULTS.md#fewer-replies-caching-and-parallel-nodes-against-a-real-model).
+
+## What did not work
+
+It started as CPU-style speculation: guess the model's next tool call and run it before the
+model finishes, holding its writes in a store buffer until the guess is confirmed. The safety
+half works -- a wrong guess never reaches the world -- but measured honestly, **guessing buys
+almost no time**: a guess can run at most one block ahead of the model, and on real agent
+traces the predictors are rarely right. The measurements are below, negative half first, and
+they are why the project's claim is now safety plus the model-bound speedups above, not
+speculation.
+
+## How it works
+
+A processor solved "waiting on one thing at a time" in the 1960s. It guesses which way a branch
 goes, runs the next instructions early, and keeps any *writes* in a holding area called a store
 buffer. Only once the guess is confirmed do the writes leave. If the guess was wrong, the buffer
 is discarded and nothing outside the processor ever saw it.
 
 SpecuNode applies that to agents. Reads run early. Writes go into a store buffer tied to the
-speculative branch that produced them. When the model's real decision arrives, it is compared to
-the guess — exactly, not approximately. Match: the buffer drains to the world. Mismatch: the
+branch that produced them. When the model's real decision arrives, it is compared to the
+guess — exactly, not approximately. Match: the buffer drains to the world. Mismatch: the
 buffer is discarded, unsent. **The model's real decision is the only thing that can ever release
-a write.**
+a write** -- and the same journal that holds it is what makes a crash safe to resume.
 
 ---
 

@@ -683,19 +683,58 @@ class StoreBuffer:
                 continue
             if claim.outcome is Claim.AMBIGUOUS and not effect.idempotent:
                 # A previous attempt may already have taken effect and the tool has not said a
-                # repeat is harmless. Guessing either way is worse than stopping.
-                settled.add(effect.id)
-                await self._dead_letter(
-                    effect,
-                    branch,
-                    attempts=claim.attempt,
-                    error="ambiguous_after_crash: a previous attempt may have taken effect "
-                    "and this tool did not declare itself idempotent",
-                    authorised_by_offset=authorised_by_offset,
-                )
-                outcomes.append((effect.id, EffectOutcome.DEAD_LETTER))
-                halted_at, ok = dispatch_index, False
-                continue
+                # repeat is harmless. Guessing either way is worse than stopping -- unless the
+                # upstream can be asked.
+                verdict, why = await self._reconcile(dispatcher, effect)
+                if verdict == "landed":
+                    settled.add(effect.id)
+                    self._dispatch_seq[branch.id] = dispatch_index + 1
+                    self._delivered[branch.id] = self._delivered.get(branch.id, 0) + 1
+                    await self.journal.settle_dispatch(
+                        run_id=self.run_id,
+                        nkey=effect.nkey,
+                        status="dispatched",
+                        ack=why,
+                        attempt=claim.attempt,
+                        kind="effect_dispatched",
+                        payload={
+                            "v": 1,
+                            "effect_id": effect.id,
+                            "branch_id": branch.id,
+                            "nkey": effect.nkey,
+                            "key": effect.key,
+                            "tool": effect.call.name,
+                            "args_hash": chash(dict(effect.call.args)),
+                            "stage_index": effect.stage_index,
+                            "dispatch_index": dispatch_index,
+                            "authorised_by_offset": authorised_by_offset,
+                            "confirmed_by_offset": confirmed_offset,
+                            "attempt": claim.attempt,
+                            "deduped": True,
+                            # Sent by a process that died before it heard back; the upstream
+                            # says it took effect, and its own result is the ack.
+                            "reconciled": True,
+                            "ack": why,
+                            "dry_run": False,
+                            "compensation_for": None,
+                        },
+                    )
+                    self._complete_ack(effect.id, why)
+                    outcomes.append((effect.id, EffectOutcome.SKIPPED_DEDUPE))
+                    continue
+                if verdict == "unknown":
+                    settled.add(effect.id)
+                    await self._dead_letter(
+                        effect,
+                        branch,
+                        attempts=claim.attempt,
+                        error=f"ambiguous_after_crash: {why}",
+                        authorised_by_offset=authorised_by_offset,
+                    )
+                    outcomes.append((effect.id, EffectOutcome.DEAD_LETTER))
+                    halted_at, ok = dispatch_index, False
+                    continue
+                # "absent": the upstream has no record of it, so it is sent now -- once.
 
             result = await dispatcher.dispatch(
                 effect.call.name,
@@ -773,6 +812,27 @@ class StoreBuffer:
         future = self._acks.get(effect_id)
         if future is not None and not future.done():
             future.set_exception(ToolDispatchError(error, sent="maybe", retriable=False))
+
+    async def _reconcile(
+        self, dispatcher: Dispatcher, effect: StagedEffect
+    ) -> tuple[str, JsonValue]:
+        """Ask the upstream whether a call whose reply a crash lost took effect.
+
+        ``("landed", ack)`` if it did, ``("absent", None)`` if it did not, and
+        ``("unknown", reason)`` when there is no way to ask or the asking failed -- which is a
+        dead letter, exactly as before this existed.
+        """
+        spec = dispatcher.registry.get(effect.call.name)
+        if spec.reconcile is None:
+            return "unknown", (
+                "a previous attempt may have taken effect, and this tool neither declared itself "
+                "idempotent nor says how to check"
+            )
+        try:
+            landed = await spec.reconcile(effect.nkey, dict(effect.call.args))
+        except Exception as exc:
+            return "unknown", f"asking the upstream whether it took effect failed: {exc}"
+        return ("landed", landed) if landed is not None else ("absent", None)
 
     async def _dead_letter(
         self,

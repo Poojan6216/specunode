@@ -397,6 +397,13 @@ class World:
     def mutations_by(self, tool: str) -> list[Mutation]:
         return [m for m in self.mutations if m.tool == tool]
 
+    def record_of(self, tool: str, key: str) -> Mutation | None:
+        """The upstream's own record of a request key, as a payment API keeps its idempotency
+        keys: what a tool's ``reconcile`` asks after a crash lost the reply to that request."""
+        if not key:
+            return None
+        return next((m for m in self.mutations if m.tool == tool and m.effect_key == key), None)
+
     def reads_from(self, branch_ids: set[str]) -> list[ReadHit]:
         """Reads charged to these branches -- the cost of a speculation that was thrown away."""
         return [r for r in self.reads if r.branch_id in branch_ids]

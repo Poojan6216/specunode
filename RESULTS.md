@@ -166,6 +166,26 @@ Every run of every configuration changed the world exactly as a correct run does
 
 ---
 
+### Pull the plug: what a crash sends twice
+
+The same billing run, five ways: look up three customers, charge each one, send each a receipt, post one summary -- 7 effects on the world, none of which may happen twice. The process is killed at each of them, once just before the request reaches the upstream (*request lost*) and once just after the upstream took effect but before the reply came back (*reply lost*), and restarted the way each system restarts: 14 crashes each. No model and no network; the systems run identical business logic against the same upstream. LangGraph 1.2.11.
+
+| System | Finished, every effect once | Stopped for a human, nothing twice | Sent something twice | Extra effects in the world |
+|---|---|---|---|---|
+| A plain async loop | 1 | 0 | 13 | 49 |
+| LangGraph, a checkpointed node per customer | 4 | 0 | 10 | 13 |
+| LangGraph, each call a `@task` -- its recommended pattern | 7 | 0 | 7 | 7 |
+| SpecuNode | 0 | 14 | 0 | 0 |
+| SpecuNode, each tool with a `reconcile` | 14 | 0 | 0 | 0 |
+
+What it says:
+
+- **A lost reply is the crash that double-charges, and checkpointing does not close it.** LangGraph's recommended pattern re-runs a task whose reply it never saw, so 7 of its 14 crashes sent an effect twice -- every one where the reply was lost -- and it finished cleanly on every one where the request was. An expert can close that window by deriving a stable key per task and passing it to an upstream that honours one; that is the work the runtime here does for every effect.
+- **SpecuNode sent nothing twice in any of them.** Every effect is claimed in the journal under a deterministic key before it is sent, so a restart knows which effects may already be out. It cannot tell a request that never arrived from one whose reply was lost, so without more to go on it stops and asks a human -- in 14 of 14, including the ones where sending again would have been safe.
+- **Given a way to ask, it finished every one, with nothing sent twice and nothing missing.** A tool's `reconcile` answers *did the request under this key take effect?* from the upstream's own record of the key -- a payment's idempotency key, a unique request id. With it, 14 of 14 crashes finished with every effect in the world once and every receipt naming its customer's real charge.
+
+---
+
 ### What beats it
 
 Every strategy below defeats the runtime. Each reports a measured rate.

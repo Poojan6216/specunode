@@ -686,6 +686,79 @@ def model_bound_online_section() -> str:
     return "\n".join(lines)
 
 
+_CRASH_SYSTEMS = (
+    ("plain_loop", "A plain async loop"),
+    ("langgraph_nodes", "LangGraph, a checkpointed node per customer"),
+    ("langgraph_tasks", "LangGraph, each call a `@task` -- its recommended pattern"),
+    ("specunode", "SpecuNode"),
+    ("specunode_reconcile", "SpecuNode, each tool with a `reconcile`"),
+)
+
+
+def crash_safety_section() -> str:
+    report = load("crash_safety.json")
+    title = "Pull the plug: what a crash sends twice"
+    if report is None:
+        return missing(
+            title, "python bench/offline/run_crash_safety.py --out bench/results/crash_safety.json"
+        )
+    systems = report["systems"]
+    crashes = report["crash_points"]
+    writes = report["writes"]
+    lines = [
+        f"### {title}",
+        "",
+        "The same billing run, five ways: look up three customers, charge each one, send each a "
+        f"receipt, post one summary -- {writes} effects on the world, none of which may happen "
+        "twice. The process is killed at each of them, once just before the request reaches the "
+        "upstream (*request lost*) and once just after the upstream took effect but before the "
+        "reply came back (*reply lost*), and restarted the way each system restarts: "
+        f"{crashes} crashes each. No model and no network; the systems run identical business "
+        f"logic against the same upstream. LangGraph {report['langgraph']}.",
+        "",
+        "| System | Finished, every effect once | Stopped for a human, nothing twice "
+        "| Sent something twice | Extra effects in the world |",
+        "|---|---|---|---|---|",
+    ]
+    for key, label in _CRASH_SYSTEMS:
+        row = systems.get(key)
+        if row is None:
+            continue
+        lines.append(
+            f"| {label} | {row['exact']} | {row['held']} | {row['duplicated']} | "
+            f"{row['duplicate_effects']} |"
+        )
+    tasks, ours = systems.get("langgraph_tasks") or {}, systems.get("specunode") or {}
+    reconciled = systems.get("specunode_reconcile") or {}
+    if tasks and ours and reconciled:
+        lines += [
+            "",
+            "What it says:",
+            "",
+            "- **A lost reply is the crash that double-charges, and checkpointing does not close "
+            "it.** LangGraph's recommended pattern re-runs a task whose reply it never saw, so "
+            f"{tasks['duplicated']} of its {crashes} crashes sent an effect twice -- every one "
+            "where the reply was lost -- and it finished cleanly on every one where the request "
+            "was. An expert can close that window by deriving a stable key per task and passing "
+            "it to an upstream that honours one; that is the work the runtime here does for "
+            "every effect.",
+            "- **SpecuNode sent nothing twice in any of them.** Every effect is claimed in the "
+            "journal under a deterministic key before it is sent, so a restart knows which "
+            "effects may already be out. It cannot tell a request that never arrived from one "
+            "whose reply was lost, so without more to go on it stops and asks a human -- in "
+            f"{ours['held']} of {crashes}, including the ones where sending again would have "
+            "been safe.",
+            "- **Given a way to ask, it finished every one, with nothing sent twice and "
+            "nothing missing.** A tool's `reconcile` "
+            "answers *did the request under this key take effect?* from the upstream's own "
+            "record of the key -- a payment's idempotency key, a unique request id. With it, "
+            f"{reconciled['exact']} of {crashes} crashes finished with every effect in the "
+            "world once and every receipt naming its customer's real charge.",
+            "",
+        ]
+    return "\n".join(lines)
+
+
 def sweep_section() -> str:
     report = load("sweep.json")
     if report is None:
@@ -769,6 +842,9 @@ def build() -> str:
             "---",
             "",
             model_bound_online_section(),
+            "---",
+            "",
+            crash_safety_section(),
             "---",
             "",
             attacks_section(),

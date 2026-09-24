@@ -28,6 +28,30 @@ than fresh.
 **Honest about what it does.** See [effect-classes.md](effect-classes.md). A `READ` that writes
 defeats the store buffer, and nothing in the runtime can notice.
 
+**A way to be asked, if you want a crash answered rather than escalated.** A crash can land after
+the upstream took a write and before its reply came back. On resume the runtime knows that write
+may be out -- it was claimed in the journal under its key before it was sent -- but not whether it
+is. An idempotent tool is simply sent again under the same key. A non-idempotent one is
+dead-lettered for a human, unless it says how to find out:
+
+```python
+async def charge_was_taken(key: str, args: dict) -> dict | None:
+    """The upstream's own record of a request key, e.g. a payment's idempotency key."""
+    charge = await payments.find_by_request_key(key)
+    return None if charge is None else {"charge_id": charge.id}
+
+@specunode.tool(effect="write", reconcile=charge_was_taken)
+async def charge_card(customer_id: str, amount: float) -> dict:
+    key = specunode.current_idempotency_key()
+    return await payments.charge(customer_id, amount, request_key=key)
+```
+
+Return the upstream's result if the request took effect -- the node gets it exactly as if the
+reply had arrived -- or `None` if it did not, and it is sent once. If asking fails, the write is
+dead-lettered, as it would have been. Answer from a record the upstream writes *atomically with
+the effect*; a lookup that can miss a request still in flight can say "no" to one that lands a
+moment later.
+
 ### Failures
 
 Raise `ToolDispatchError` and say whether the request left the process:

@@ -302,3 +302,48 @@ async def test_recovery_reports_the_group_a_crash_interrupted(tmp_path: Path) ->
     assert group.retired == frozenset({"a#0"})
     assert group.base_state == {}, "the lanes forked from the state before either committed"
     assert group.claimed == {"done:a": "a#0"}
+
+
+# -- a crash while a write is in flight ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("when", ["request_lost", "reply_lost"])
+@pytest.mark.parametrize("at", range(1, 8))
+async def test_a_crash_at_any_write_never_sends_it_twice(at: int, when: str) -> None:
+    """Pulled at every write, before the request left and after its reply was lost: the
+    runtime never sends an effect twice. Without a way to ask the upstream it stops for a
+    human; with one it finishes, each effect in the world once, on the upstream's own answer."""
+    from bench.offline.run_crash_safety import one
+
+    held = await one("specunode", at, when)
+    assert held["duplicated"] == {} and held["outcome"] == "held", held
+    assert "dead-lettered" in str(held["why"])
+    asked = await one("specunode_reconcile", at, when)
+    assert asked["outcome"] == "exact", asked
+    assert asked["receipts_that_lie"] == []
+
+
+async def test_an_upstream_that_cannot_be_asked_is_a_dead_letter_not_a_guess(
+    tmp_path: Path,
+) -> None:
+    """If asking fails, the answer is unknown -- and unknown is a human's call, as before."""
+    from bench.offline.run_crash_safety import Plug, SpecuNodeReconcile
+
+    class Unreachable(SpecuNodeReconcile):
+        def _asker(self, tool_name: str, reply: Any) -> Any:
+            async def reconcile(key: str, args: Mapping[str, JsonValue]) -> JsonValue:
+                raise ConnectionError("the upstream's lookup API is down")
+
+            return reconcile
+
+    world = standard_world()
+    plug = Plug(at=1, when="reply_lost")
+    runner = Unreachable(world, plug, tmp_path)
+    with pytest.raises(BaseException, match="took effect"):
+        await runner.first()
+    await bury_the_dead_process()
+    assert await runner.restart() is False
+    assert "the upstream's lookup API is down" in str(runner.why) or "dead-lettered" in str(
+        runner.why
+    )
+    assert len(world.tables["charges"]) == 1, "the charge was sent again on a guess"
