@@ -68,7 +68,7 @@ from specunode.journal.journal import Journal
 from specunode.journal.ledger import Ledger, build_ledger
 from specunode.journal.replay import OpenGroup, recover
 from specunode.verify.gate import resolve_decision
-from specunode.verify.witness import validate_reads
+from specunode.verify.witness import ReadValidation, validate_reads
 
 __all__ = ["BranchOutcome", "RunResult", "Scheduler", "SchedulerError", "SpeculativeTurn"]
 
@@ -888,6 +888,18 @@ class Scheduler:
             await self._abandon_lanes(lanes, branches, str(conflict))
             return _GroupOutcome(False, str(conflict), committed, cursor_after(), 0)
 
+        # Every lane's witnessed reads are re-checked now, together, rather than one lane at a
+        # time as each retires: lanes retire in order, so the re-checks used to queue behind one
+        # another, one tool latency per lane, and a fan-out of read-only lanes paid for all of
+        # them in series. A lane is at rest, so the reads checked here are the ones its
+        # retirement would check. Only one thing can make a verdict out of date before the lane
+        # retires: an effect an earlier lane in this group sends -- a lane that read what a
+        # sibling then changed -- and a lane after one of those is checked again at its own
+        # retirement, as before.
+        checked = list(
+            await asyncio.gather(*(validate_reads(branch, self.registry) for branch in branches))
+        )
+
         for index, ((node, node_id), branch) in enumerate(zip(lanes, branches, strict=True)):
             rest = (lanes[index + 1 :], branches[index + 1 :])
             # Again before this lane's writes leave: a lane retired above may have committed,
@@ -901,6 +913,7 @@ class Scheduler:
             # Its own would put that node at a lower step, under a key the dedupe table has
             # never seen, and send what it had already sent.
             last = index == len(lanes) - 1
+            sent_before = sum(self.buffer.delivered(earlier.id) for earlier in branches[:index])
             try:
                 drained, updated = await self._retire(
                     branch,
@@ -909,6 +922,7 @@ class Scheduler:
                     reducers,
                     claimed=claimed,
                     cursor_after=cursor_after if last else None,
+                    validation=checked[index] if sent_before == 0 else None,
                 )
             except Exception as exc:
                 # Raised after the lane was confirmed, so after its writes may have gone out: a
@@ -1220,6 +1234,7 @@ class Scheduler:
         reducers: Mapping[str, Reducer] | None = None,
         claimed: dict[str, str] | None = None,
         cursor_after: Callable[[], StepCursor] | None = None,
+        validation: ReadValidation | None = None,
     ) -> tuple[bool, CommittedState | None]:
         """R5 through R9: validate reads, confirm, make it durable, drain, then retire."""
         # E3, before anything is confirmed. ``validate_reads`` is the retirement-time witness
@@ -1230,7 +1245,8 @@ class Scheduler:
         # was dead config that was nonetheless journaled into ``run_started`` and rendered as
         # though it applied; and the ledger printed "reads validated at retirement: 0/0 fresh"
         # on every run, which is the difference between a receipt and a reassurance.
-        validation = await validate_reads(branch, self.registry)
+        if validation is None:
+            validation = await validate_reads(branch, self.registry)
         if validation.verdicts:
             await self.journal.append_async(
                 self.run_id,

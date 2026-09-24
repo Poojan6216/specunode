@@ -117,15 +117,26 @@ A guess buys at most one block of a model's stream (above). When the model is wh
 
 | Tool latency | One call per reply | Every independent call at once | Saving |
 |---|---|---|---|
-| 0 ms | 9 replies, 19200 ms | 4 replies, 9968 ms | +48.1% [+47.6%, +49.0%] |
-| 300 ms | 9 replies, 20246 ms | 4 replies, 11198 ms | +44.7% [+44.6%, +44.8%] |
+| 0 ms | 9 replies, 19035 ms | 4 replies, 9973 ms | +47.6% [+47.5%, +47.7%] |
+| 300 ms | 9 replies, 20239 ms | 4 replies, 11181 ms | +44.8% [+44.7%, +44.8%] |
 
 **Parallel nodes** (`examples/fanout_agent`). Three independent checks, each one model reply, then a report. The router names the three at once; the runtime runs their bodies side by side and retires them in the order it named them, so their effects reach the world in that order however the bodies interleaved.
 
 | Tool latency | One after another | Side by side | Saving |
 |---|---|---|---|
-| 0 ms | 1 model call in flight, 6350 ms | 3 in flight, 2153 ms | +66.1% [+65.7%, +66.3%] |
-| 300 ms | 1 model call in flight, 8467 ms | 3 in flight, 3656 ms | +56.8% [+56.7%, +56.9%] |
+| 0 ms | 1 model call in flight, 6346 ms | 3 in flight, 2137 ms | +66.3% [+66.3%, +66.4%] |
+| 300 ms | 1 model call in flight, 7869 ms | 3 in flight, 3059 ms | +61.1% [+60.9%, +61.3%] |
+
+**What the safety costs.** Against the fastest loop a developer would write by hand -- stream the reply, then run every call it asked for at once, with no journal, no store buffer, no order among the writes and nothing a crash could be resumed from -- on the same replies, the same tools and the same stand-in. The interval is on the difference, where a negative figure is the runtime being slower.
+
+| Tool latency | Workload | By hand | Through the runtime | Runtime slower by | Interval on the difference |
+|---|---|---|---|---|---|
+| 0 ms | alert, several calls per reply | 9915 ms | 9973 ms | 0.6% | -0.6% [-0.6%, -0.5%] |
+| 0 ms | three checks side by side | 2102 ms | 2137 ms | 1.7% | -1.7% [-1.8%, -1.5%] |
+| 300 ms | alert, several calls per reply | 10828 ms | 11181 ms | 3.3% | -3.3% [-3.3%, -3.2%] |
+| 300 ms | three checks side by side | 2705 ms | 3059 ms | 13.1% | -13.1% [-13.8%, -12.5%] |
+
+Where it goes: the journal's writes, which are what a resume and a replay are made of; one round of re-checking each witnessed read before the writes it informed are released, made concurrently for every lane of a group; and a reply's writes sent one after another in the order the model listed them, which the loop by hand sends at once. What it buys is everything in the next sections.
 
 Runs that changed the world exactly as a correct run does: 40 of 40. **Effects reaching the world from a branch that never retired: 0.**
 

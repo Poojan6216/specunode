@@ -2,24 +2,39 @@
   "bench": "model_bound",
   "branches": {
     "0": {
+      "by_hand": {
+        "correct": 5,
+        "in_flight_max": 3,
+        "leaks": 0,
+        "n": 5,
+        "wall_ms": [
+          2101.4,
+          2101.0,
+          2101.4,
+          2102.0,
+          2102.5
+        ],
+        "wall_ms_mean": 2101.6
+      },
+      "cost_vs_by_hand": 0.0169,
       "one_at_a_time": {
         "correct": 5,
         "in_flight_max": 1,
         "leaks": 0,
         "n": 5,
         "wall_ms": [
-          6344.5,
-          6345.9,
-          6352.6,
-          6350.8,
-          6356.0
+          6350.7,
+          6346.3,
+          6347.9,
+          6344.0,
+          6340.5
         ],
-        "wall_ms_mean": 6350.0
+        "wall_ms_mean": 6345.9
       },
       "saving_ci95": {
-        "ci95_high": 0.6631,
-        "ci95_low": 0.6572,
-        "mean": 0.661
+        "ci95_high": 0.6638,
+        "ci95_low": 0.6627,
+        "mean": 0.6632
       },
       "side_by_side": {
         "correct": 5,
@@ -27,35 +42,55 @@
         "leaks": 0,
         "n": 5,
         "wall_ms": [
-          2140.0,
-          2138.2,
-          2141.9,
-          2142.8,
-          2200.3
+          2137.9,
+          2142.9,
+          2131.8,
+          2134.8,
+          2138.1
         ],
-        "wall_ms_mean": 2152.6
+        "wall_ms_mean": 2137.1
       },
-      "summaries_identical": true
+      "summaries_identical": true,
+      "vs_by_hand_ci95": {
+        "ci95_high": -0.0153,
+        "ci95_low": -0.0184,
+        "mean": -0.0169
+      }
     },
     "300": {
+      "by_hand": {
+        "correct": 5,
+        "in_flight_max": 3,
+        "leaks": 0,
+        "n": 5,
+        "wall_ms": [
+          2703.4,
+          2701.3,
+          2706.1,
+          2706.6,
+          2705.4
+        ],
+        "wall_ms_mean": 2704.6
+      },
+      "cost_vs_by_hand": 0.131,
       "one_at_a_time": {
         "correct": 5,
         "in_flight_max": 1,
         "leaks": 0,
         "n": 5,
         "wall_ms": [
-          8449.8,
-          8465.7,
-          8477.9,
-          8460.9,
-          8479.1
+          7875.9,
+          7873.2,
+          7864.8,
+          7859.0,
+          7870.3
         ],
-        "wall_ms_mean": 8466.7
+        "wall_ms_mean": 7868.7
       },
       "saving_ci95": {
-        "ci95_high": 0.5691,
-        "ci95_low": 0.5674,
-        "mean": 0.5683
+        "ci95_high": 0.6132,
+        "ci95_low": 0.6089,
+        "mean": 0.6113
       },
       "side_by_side": {
         "correct": 5,
@@ -63,15 +98,20 @@
         "leaks": 0,
         "n": 5,
         "wall_ms": [
-          3646.2,
-          3663.5,
-          3652.7,
-          3650.8,
-          3664.4
+          3054.3,
+          3064.0,
+          3092.8,
+          3044.8,
+          3038.0
         ],
-        "wall_ms_mean": 3655.6
+        "wall_ms_mean": 3058.8
       },
-      "summaries_identical": true
+      "summaries_identical": true,
+      "vs_by_hand_ci95": {
+        "ci95_high": -0.1254,
+        "ci95_low": -0.1377,
+        "mean": -0.131
+      }
     }
   },
   "is_real_model": false,
@@ -81,19 +121,34 @@
   },
   "replies": {
     "0": {
+      "by_hand": {
+        "correct": 5,
+        "leaks": 0,
+        "n": 5,
+        "replies": 4,
+        "wall_ms": [
+          9915.8,
+          9910.9,
+          9916.4,
+          9917.4,
+          9916.7
+        ],
+        "wall_ms_mean": 9915.4
+      },
+      "cost_vs_by_hand": 0.0058,
       "one_call": {
         "correct": 5,
         "leaks": 0,
         "n": 5,
         "replies": 9,
         "wall_ms": [
-          19026.8,
-          19037.7,
-          19009.6,
-          19012.3,
-          19915.3
+          19005.3,
+          19024.6,
+          19007.6,
+          19022.3,
+          19115.0
         ],
-        "wall_ms_mean": 19200.3
+        "wall_ms_mean": 19035.0
       },
       "parallel": {
         "correct": 5,
@@ -101,34 +156,54 @@
         "n": 5,
         "replies": 4,
         "wall_ms": [
-          9971.9,
-          9969.5,
-          9966.2,
-          9970.1,
-          9963.3
+          9969.8,
+          9965.4,
+          9979.0,
+          9970.4,
+          9978.8
         ],
-        "wall_ms_mean": 9968.2
+        "wall_ms_mean": 9972.7
       },
       "saving_ci95": {
-        "ci95_high": 0.4904,
-        "ci95_low": 0.4757,
-        "mean": 0.4809
+        "ci95_high": 0.4772,
+        "ci95_low": 0.4753,
+        "mean": 0.4761
+      },
+      "vs_by_hand_ci95": {
+        "ci95_high": -0.0053,
+        "ci95_low": -0.0063,
+        "mean": -0.0058
       }
     },
     "300": {
+      "by_hand": {
+        "correct": 5,
+        "leaks": 0,
+        "n": 5,
+        "replies": 4,
+        "wall_ms": [
+          10820.1,
+          10826.5,
+          10826.0,
+          10835.8,
+          10831.0
+        ],
+        "wall_ms_mean": 10827.9
+      },
+      "cost_vs_by_hand": 0.0326,
       "one_call": {
         "correct": 5,
         "leaks": 0,
         "n": 5,
         "replies": 9,
         "wall_ms": [
-          20255.3,
-          20271.0,
-          20227.7,
-          20235.6,
-          20242.3
+          20234.2,
+          20239.7,
+          20187.1,
+          20247.2,
+          20285.4
         ],
-        "wall_ms_mean": 20246.4
+        "wall_ms_mean": 20238.7
       },
       "parallel": {
         "correct": 5,
@@ -136,18 +211,23 @@
         "n": 5,
         "replies": 4,
         "wall_ms": [
-          11226.6,
-          11169.6,
-          11212.3,
-          11182.1,
-          11200.4
+          11177.9,
+          11176.4,
+          11178.2,
+          11193.3,
+          11181.0
         ],
-        "wall_ms_mean": 11198.2
+        "wall_ms_mean": 11181.4
       },
       "saving_ci95": {
-        "ci95_high": 0.4478,
-        "ci95_low": 0.446,
-        "mean": 0.4469
+        "ci95_high": 0.4483,
+        "ci95_low": 0.4467,
+        "mean": 0.4475
+      },
+      "vs_by_hand_ci95": {
+        "ci95_high": -0.032,
+        "ci95_low": -0.0333,
+        "mean": -0.0327
       }
     }
   },
@@ -165,5 +245,5 @@
     "leaks": 0,
     "runs": 40
   },
-  "wall_seconds": 407.0
+  "wall_seconds": 527.8
 }

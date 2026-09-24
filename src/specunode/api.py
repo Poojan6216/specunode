@@ -2,7 +2,7 @@
 
 Every piece here exists elsewhere in the package. What this module adds is the wiring every
 first run needs and nobody should have to write -- a journal, a store buffer, a dispatcher and a
-scheduler, assembled with the defaults that keep the guarantees on -- so that a run is::
+scheduler, assembled with every safety check left on -- so that a run is::
 
     import specunode
 

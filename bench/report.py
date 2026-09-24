@@ -534,6 +534,43 @@ def model_bound_section() -> str:
             f"{serial['wall_ms_mean']:.0f} ms | {side['in_flight_max']} in flight, "
             f"{side['wall_ms_mean']:.0f} ms | {_band(point['saving_ci95'])} |"
         )
+    by_hand = [
+        (ms, point) for ms, point in report["replies"].items() if point.get("vs_by_hand_ci95")
+    ]
+    if by_hand:
+        lines += [
+            "",
+            "**What the safety costs.** Against the fastest loop a developer would write by "
+            "hand -- stream the reply, then run every call it asked for at once, with no journal, "
+            "no store buffer, no order among the writes and nothing a crash could be resumed from "
+            "-- on the same replies, the same tools and the same stand-in. The interval is on the "
+            "difference, where a negative figure is the runtime being slower.",
+            "",
+            "| Tool latency | Workload | By hand | Through the runtime | Runtime slower by "
+            "| Interval on the difference |",
+            "|---|---|---|---|---|---|",
+        ]
+        for ms, point in sorted(by_hand, key=lambda kv: int(kv[0])):
+            fan = report["branches"][ms]
+            lines += [
+                f"| {ms} ms | alert, several calls per reply | "
+                f"{point['by_hand']['wall_ms_mean']:.0f} ms | "
+                f"{point['parallel']['wall_ms_mean']:.0f} ms | "
+                f"{point['cost_vs_by_hand']:.1%} | {_band(point['vs_by_hand_ci95'])} |",
+                f"| {ms} ms | three checks side by side | "
+                f"{fan['by_hand']['wall_ms_mean']:.0f} ms | "
+                f"{fan['side_by_side']['wall_ms_mean']:.0f} ms | "
+                f"{fan['cost_vs_by_hand']:.1%} | {_band(fan['vs_by_hand_ci95'])} |",
+            ]
+        lines += [
+            "",
+            "Where it goes: the journal's writes, which are what a resume and a replay are made "
+            "of; "
+            "one round of re-checking each witnessed read before the writes it informed are "
+            "released, made concurrently for every lane of a group; and a reply's writes sent one "
+            "after another in the order the model listed them, which the loop by hand sends at "
+            "once. What it buys is everything in the next sections.",
+        ]
     lines += [
         "",
         f"Runs that changed the world exactly as a correct run does: {totals['correct']} of "

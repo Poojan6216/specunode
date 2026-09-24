@@ -78,6 +78,12 @@ back at once took an on-call task from 11 replies to 5: 35.4% less time and, wit
 time than one after another. Nothing reached the world from a branch that never retired.
 [Details](RESULTS.md#fewer-replies-caching-and-parallel-nodes-against-a-real-model).
 
+What the safety costs is measured too. Against the fastest loop you would write by hand --
+every call of a reply at once, no journal, nothing a crash could be resumed from -- the runtime
+is 0.6% slower with instant tools and 3.3% slower with 300 ms tools on the same alert; a fan-out
+of read-only checks pays 13.1% with slow tools, one round of re-checking its reads.
+[Details](RESULTS.md#when-the-model-is-the-slow-part-fewer-replies-and-replies-side-by-side).
+
 ## What did not work
 
 It started as CPU-style speculation: guess the model's next tool call and run it before the

@@ -441,6 +441,9 @@ def test_the_model_bound_bench_counts_replies_and_calls_in_flight() -> None:
     assert branches["summaries_identical"], "side by side posted a different report"
     totals = report["totals"]
     assert totals == {"runs": 4, "correct": 4, "leaks": 0}
+    # The loop written by hand, which the runtime's safety is priced against, does the same work.
+    assert replies["by_hand"]["replies"] == 4 and replies["by_hand"]["correct"] == 1
+    assert branches["by_hand"]["correct"] == 1 and branches["vs_by_hand_ci95"]
 
 
 def test_the_real_model_bound_runner_runs_every_cell_without_a_credential() -> None:

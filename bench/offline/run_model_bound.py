@@ -150,6 +150,115 @@ async def branches(
     }
 
 
+async def handwritten_replies(tool_ms: int, reply_ms: float, block_ms: float) -> dict[str, Any]:
+    """The fastest loop a developer would write by hand, and what the runtime's safety is priced
+    against: stream the reply, then run every call it asked for at once. No journal, no store
+    buffer, no order among the writes, and nothing a crash could be resumed from."""
+    from dataclasses import replace
+
+    from examples.incident_agent.agent import MAX_TURNS, build_tools, envelope
+
+    from specunode.core.model import Message, ToolResultBlock, TurnComplete
+
+    world = _slowed(tool_ms)
+    tools = {fn.__name__: fn for fn in build_tools(world)}  # type: ignore[attr-defined]
+    model = ScriptedModel(
+        turns=scripted_replies("parallel"), reply_delay_ms=reply_ms, block_delay_ms=block_ms
+    )
+    request = envelope("parallel")
+    messages = list(request.messages)
+    replies = 0
+    started = time.monotonic()
+    for _ in range(MAX_TURNS):
+        response = None
+        async for event in model.stream(replace(request, messages=tuple(messages))):
+            if isinstance(event, TurnComplete):
+                response = event.response
+        replies += 1
+        assert response is not None
+        uses = response.tool_uses
+        if not uses:
+            break
+        results = await asyncio.gather(*(tools[use.name](**dict(use.args)) for use in uses))
+        messages.append(Message(role="assistant", content=response.content))
+        messages.append(
+            Message(
+                role="user",
+                content=tuple(
+                    ToolResultBlock(tool_use_id=use.id, content=result)
+                    for use, result in zip(uses, results, strict=True)
+                ),
+            )
+        )
+    wall_ms = (time.monotonic() - started) * 1000.0
+    changes = {
+        "restarted": sorted(m.row_id for m in world.mutations if m.tool == "restart_job"),
+        "summaries": sum(1 for m in world.mutations if m.tool == "post_summary"),
+    }
+    return {
+        "wall_ms": wall_ms,
+        "replies": replies,
+        "correct": changes == expected_world_changes(),
+        "leaks": 0,
+    }
+
+
+async def handwritten_branches(tool_ms: int, reply_ms: float, block_ms: float) -> dict[str, Any]:
+    """The same three checks and report, by hand: ``asyncio.gather`` over the checks."""
+    from examples.fanout_agent.agent import MAX_TOKENS, SYSTEM, TOOL_DEFS
+    from examples.fanout_agent.agent import build_tools as fanout_tools
+
+    from specunode.core.model import Message, RequestEnvelope, TextBlock, TurnComplete
+
+    world = _slowed(tool_ms)
+    tools = {fn.__name__: fn for fn in fanout_tools(world)}  # type: ignore[attr-defined]
+    model = KeyedScriptedModel(think_ms=reply_ms + 2 * block_ms)
+
+    async def check(pipeline: str) -> Any:
+        request = RequestEnvelope(
+            model="scripted",
+            system=(TextBlock(text=SYSTEM),),
+            messages=(Message(role="user", content=(TextBlock(text=f"Check {pipeline}."),)),),
+            tools=TOOL_DEFS,
+            max_tokens=MAX_TOKENS,
+            stream=True,
+        )
+        response = None
+        async for event in model.stream(request):
+            if isinstance(event, TurnComplete):
+                response = event.response
+        assert response is not None
+        results = await asyncio.gather(
+            *(tools[use.name](**dict(use.args)) for use in response.tool_uses)
+        )
+        return results[-1]
+
+    started = time.monotonic()
+    found = await asyncio.gather(*(check(pipeline) for pipeline in PIPELINES))
+    lines = []
+    for pipeline, status in zip(PIPELINES, found, strict=True):
+        value = status.get("value") if isinstance(status, dict) else None
+        lines.append(f"{pipeline}: {value.get('status') if isinstance(value, dict) else 'unknown'}")
+    await tools["post_summary"](channel="#ops", text="; ".join(lines))
+    wall_ms = (time.monotonic() - started) * 1000.0
+    posts = [row["text"] for row in world.tables["messages"].values()]
+    return {
+        "wall_ms": wall_ms,
+        "in_flight_max": model.high_water,
+        "model_calls": len(model.calls),
+        "correct": len(posts) == 1 and "unknown" not in str(posts[0]),
+        "leaks": 0,
+        "summary": posts[0] if posts else None,
+    }
+
+
+def _cost(runtime: Sequence[dict[str, Any]], by_hand: Sequence[dict[str, Any]]) -> float:
+    """How much longer the runtime took than the loop by hand: mean over mean, minus one."""
+    ours = statistics.fmean(row["wall_ms"] for row in runtime)
+    theirs = statistics.fmean(row["wall_ms"] for row in by_hand)
+    return round(ours / theirs - 1.0, 4)
+
+
 def _cell(rows: Sequence[dict[str, Any]], counted: str) -> dict[str, Any]:
     walls = [row["wall_ms"] for row in rows]
     counts = sorted({row[counted] for row in rows})
@@ -172,16 +281,27 @@ async def measure(
         # Interleaved, so drift in the machine's load lands on both arms alike.
         rows: dict[str, list[dict[str, Any]]] = {style: [] for style in STYLES}
         lanes: dict[bool, list[dict[str, Any]]] = {False: [], True: []}
+        by_hand: dict[str, list[dict[str, Any]]] = {"replies": [], "branches": []}
         for _ in range(runs):
             for style in STYLES:
                 rows[style].append(await replies(style, tool_ms, reply_ms, block_ms))
             for parallel in (False, True):
                 lanes[parallel].append(await branches(parallel, tool_ms, reply_ms, block_ms))
+            by_hand["replies"].append(await handwritten_replies(tool_ms, reply_ms, block_ms))
+            by_hand["branches"].append(await handwritten_branches(tool_ms, reply_ms, block_ms))
         by_replies[str(tool_ms)] = {
             **{style: _cell(rows[style], "replies") for style in STYLES},
             "saving_ci95": difference_ci(
                 [r["wall_ms"] for r in rows["parallel"]], [r["wall_ms"] for r in rows["one_call"]]
             ),
+            # What the safety costs: the same replies through the runtime, against by hand.
+            "by_hand": _cell(by_hand["replies"], "replies"),
+            "vs_by_hand_ci95": difference_ci(
+                [r["wall_ms"] for r in rows["parallel"]],
+                [r["wall_ms"] for r in by_hand["replies"]],
+            ),
+            # The same comparison as a price: how much longer the runtime took, as a fraction.
+            "cost_vs_by_hand": _cost(rows["parallel"], by_hand["replies"]),
         }
         by_branches[str(tool_ms)] = {
             "one_at_a_time": _cell(lanes[False], "in_flight_max"),
@@ -190,12 +310,19 @@ async def measure(
                 [r["wall_ms"] for r in lanes[True]], [r["wall_ms"] for r in lanes[False]]
             ),
             "summaries_identical": len({r["summary"] for r in lanes[False] + lanes[True]}) == 1,
+            "by_hand": _cell(by_hand["branches"], "in_flight_max"),
+            "vs_by_hand_ci95": difference_ci(
+                [r["wall_ms"] for r in lanes[True]], [r["wall_ms"] for r in by_hand["branches"]]
+            ),
+            "cost_vs_by_hand": _cost(lanes[True], by_hand["branches"]),
         }
+    # Runs through the runtime only: the loop by hand has no branches to leak from, and its
+    # runs are the price list, not the product.
     cells = [
         cell
         for group in (*by_replies.values(), *by_branches.values())
-        for cell in group.values()
-        if isinstance(cell, dict) and "n" in cell
+        for name, cell in group.items()
+        if name != "by_hand" and isinstance(cell, dict) and "n" in cell
     ]
     totals = {
         "runs": sum(cell["n"] for cell in cells),

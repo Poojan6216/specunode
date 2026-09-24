@@ -659,3 +659,49 @@ async def test_a_run_cancelled_from_outside_leaves_none_of_its_nodes_running(
     assert pending_tasks() == [], "a node outlived the run that was cancelled"
     await asyncio.sleep(0.6)
     assert world.reads == [], "a cancelled run's node still reached upstream"
+
+
+async def test_a_read_only_groups_rechecks_are_made_together_not_one_lane_at_a_time(
+    tmp_path: Path,
+) -> None:
+    """Lanes retire in order, and each lane's witnessed reads used to be re-checked at its own
+    retirement -- so a fan-out of read-only lanes paid one re-check latency per lane, in series.
+    Nothing an earlier lane sends can change a later one's reads here, so one round serves."""
+    world = standard_world()
+    calls: list[tuple[str, float, float]] = []
+
+    @tool(effect=EffectClass.READ, witness=True, forward_keys="job:{args.pipeline_id}")
+    async def get_pipeline_status(pipeline_id: str) -> JsonValue:
+        start = asyncio.get_running_loop().time()
+        await asyncio.sleep(0.1)
+        calls.append((pipeline_id, start, asyncio.get_running_loop().time()))
+        return await world.get_pipeline_status(pipeline_id=pipeline_id)
+
+    def lane(pipeline: str) -> object:
+        @node(name=f"check_{pipeline.replace('-', '_')}")
+        async def body(session: RunSession) -> Decision:
+            session.state[f"status:{pipeline}"] = await session.call_tool(
+                "get_pipeline_status", {"pipeline_id": pipeline}
+            )
+            return FreeText.of(pipeline)
+
+        return body
+
+    pipelines = ("etl-1", "etl-2", "etl-3")
+
+    def route(state: Mapping[str, JsonValue]) -> list[str] | None:
+        pending = [f"check_{p.replace('-', '_')}" for p in pipelines if f"status:{p}" not in state]
+        return pending or None
+
+    adapter = PlainAdapter.of([lane(p) for p in pipelines], route)  # type: ignore[list-item]
+    registry = registry_of([get_pipeline_status])  # type: ignore[list-item]
+    result, journal, run_id = await run_graph(tmp_path, adapter, registry, db="recheck.db")
+    assert result.ok, result.error
+    # Each call is logged as it ends: the lanes' own reads first, then the re-checks.
+    rechecks = calls[len(pipelines) :]
+    assert sorted(c[0] for c in rechecks) == list(pipelines), calls
+    latest_start = max(start for _p, start, _end in rechecks)
+    earliest_end = min(end for _p, _start, end in rechecks)
+    assert latest_start < earliest_end, "the re-checks queued behind one another"
+    validated = [e.payload["fresh"] for e in journal.read(run_id, kinds=["read_validated"])]
+    assert validated == [1, 1, 1], "every lane's read is still re-checked and reported"
