@@ -110,7 +110,9 @@ class Runtime:
     tools: ToolRegistry | Sequence[Callable[..., Any]] = ()
     model: ModelClient | None = None
     journal: Journal | str | Path = DEFAULT_JOURNAL
-    policy: Policy = field(default_factory=Policy)
+    #: Guessing is off: it needs a drafter, and without one it only adds bookkeeping to every
+    #: receipt. Issuing a read the moment its block parses is not guessing, and stays on.
+    policy: Policy = field(default_factory=lambda: Policy(speculation=False))
     reducers: Mapping[str, str] = field(default_factory=dict)
     #: Attempts per effect before it is dead-lettered, and the first backoff between them.
     max_attempts: int = 3

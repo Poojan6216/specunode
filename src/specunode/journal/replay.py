@@ -425,6 +425,7 @@ def recover(journal: Journal, run_id: str) -> Recovery:
     groups: dict[str, _GroupRecord] = {}
     last_group: str | None = None
     lane_of: dict[str, tuple[str, str]] = {}
+    node_of: dict[str, str] = {}
     touched_by: dict[str, list[str]] = {}
     # The state the run started from. Every journaled delta was taken on top of it, so the
     # rebuild has to start there too: starting from nothing dropped the run's inputs from every
@@ -450,6 +451,8 @@ def recover(journal: Journal, run_id: str) -> Recovery:
         elif entry.kind == "branch_forked":
             group_id = payload.get("group_id")
             branch_id = payload.get("branch_id")
+            if isinstance(branch_id, str) and payload.get("node_id"):
+                node_of[branch_id] = str(payload["node_id"])
             if isinstance(group_id, str) and isinstance(branch_id, str):
                 lane_of[branch_id] = (group_id, str(payload.get("node_id") or ""))
         elif entry.kind == "branch_resolved":
@@ -459,6 +462,11 @@ def recover(journal: Journal, run_id: str) -> Recovery:
                 if status == "retired":
                     retired.add(branch_id)
                     confirmed.discard(branch_id)
+                    # An earlier attempt at the same node -- the one a crash interrupted mid-drain,
+                    # re-run by a resume under the same node id -- is superseded, not in flight.
+                    node_id = node_of.get(branch_id)
+                    if node_id is not None:
+                        confirmed -= {b for b in confirmed if node_of.get(b) == node_id}
                     cursor = _cursor_from(payload.get("cursor_after"), cursor)
                     if branch_id in lane_of:
                         group_id, node_id = lane_of[branch_id]

@@ -34,7 +34,7 @@ from specunode.runner import RunnerError, build_graph, build_target
 
 app = typer.Typer(
     name="specunode",
-    help="Speculative execution for agent graphs, with a store buffer.",
+    help="Agents that take real actions, and never take one twice: inspect, resume, replay.",
     no_args_is_help=True,
     add_completion=False,
 )

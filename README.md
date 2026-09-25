@@ -35,9 +35,14 @@ knows exactly which effects may already be out -- and then it asks the upstream 
 ## Quickstart
 
 ```
-git clone <this repository> && cd SpecuNode && pip install -e .   # not on PyPI yet
+pip install "specunode @ git+https://github.com/Poojan6216/specunode"     # PyPI release to come
+git clone https://github.com/Poojan6216/specunode && cd specunode
 python examples/quickstart.py
 ```
+
+Extras: `anthropic` (the Claude adapter), `langgraph` (wrap a compiled LangGraph graph), `mcp`
+(the MCP proxy), `postgres` (a Postgres journal) -- e.g.
+`pip install "specunode[anthropic,langgraph] @ git+https://github.com/Poojan6216/specunode"`.
 
 ```python
 import specunode
@@ -178,7 +183,8 @@ project is named after, which the benchmarks below find adds nothing on top of i
 
 Measured on 300 real OpenHands trajectories from
 `nebius/SWE-rebench-openhands-trajectories` — 19,484 tool calls. Full numbers with confidence
-intervals in [`RESULTS.md`](RESULTS.md).
+intervals in [`RESULTS.md`](RESULTS.md). The derived corpus is redistributed under the dataset's
+CC BY 4.0 licence, with what was changed listed in [`bench/corpus/NOTICE.md`](bench/corpus/NOTICE.md).
 
 ```
 python bench/corpus/fetch.py

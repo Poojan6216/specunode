@@ -347,3 +347,22 @@ async def test_an_upstream_that_cannot_be_asked_is_a_dead_letter_not_a_guess(
         runner.why
     )
     assert len(world.tables["charges"]) == 1, "the charge was sent again on a guess"
+
+
+async def test_a_run_a_resume_finished_is_not_reported_as_still_resumable(tmp_path: Path) -> None:
+    """The dead process's attempt at the interrupted node was left "confirmed but not retired",
+    so ``specunode status`` told the operator a finished run was still resumable."""
+    from bench.offline.run_crash_safety import Plug, SpecuNodeReconcile
+
+    world = standard_world()
+    runner = SpecuNodeReconcile(world, Plug(at=1, when="reply_lost"), tmp_path)
+    with pytest.raises(BaseException, match="took effect"):
+        await runner.first()
+    await bury_the_dead_process()
+    interrupted = recover(Journal(tmp_path / "journal.db"), runner.run_id)
+    assert interrupted.resumable and interrupted.confirmed_not_retired, "nothing to resume?"
+    assert await runner.restart() is True
+    after = recover(Journal(tmp_path / "journal.db"), runner.run_id)
+    assert after.finished
+    assert after.confirmed_not_retired == ()
+    assert not after.resumable
