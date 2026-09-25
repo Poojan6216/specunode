@@ -226,3 +226,125 @@ def test_demo_ones_specunode_row_is_produced_by_the_real_runtime() -> None:
     spec = arm(run_demo(), "specunode")
     assert spec["staged_and_discarded"] == spec["mispredictions"] > 0
     assert spec["effects_from_squashed_branches"] == 0
+
+
+@pytest.mark.slow
+def test_a_kill_at_any_point_of_the_demo_resumes_to_a_prefix_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    """The demo draws one kill point, so a narrow window can hide from it -- one did, and CI
+    found it. Here the kill walks the whole run instead, and every resume is held to the two
+    properties that matter: nothing twice, and nothing the clean run did not do."""
+    sys.path.insert(0, str(REPO))
+    from bench.demo import _delivered, _duplicate_deliveries, _helper, _work_ms
+
+    clean_dir = tmp_path / "clean"
+    clean_dir.mkdir()
+    work = _work_ms(_helper(clean_dir, "01CLEANAAAAAAAAAAAAAAAAAAA", -1)[1])
+    clean = _delivered(clean_dir)
+    killed = 0
+    for point in range(24):
+        directory = tmp_path / f"kill-{point}"
+        directory.mkdir()
+        run_id = f"01KILL{point:020d}"[:26]
+        killed += _helper(directory, run_id, work * (0.02 + 0.96 * point / 23))[0] != 0
+        _helper(directory, run_id, -1, resume=True)
+        resumed = _delivered(directory)
+        assert resumed == clean[: len(resumed)], (point, resumed, clean)
+        assert _duplicate_deliveries(directory) == 0, point
+    assert killed >= 12, f"only {killed} of 24 kill points landed inside the run"
+
+
+async def test_a_resume_is_asked_again_the_turn_the_kill_interrupted(tmp_path: Path) -> None:
+    """The window the sweep above can step over, hit exactly: the process dies after turn 1's
+    reply is journaled and before turn 1's branch is confirmed, so nothing of turn 1 was sent.
+    A resume must ask turn 1 again. The demo's script counted every recorded reply as answered,
+    so the resume was handed turn 2 instead -- and posted a summary of a restart it never made.
+    """
+    import asyncio
+    from collections.abc import Mapping
+
+    sys.path.insert(0, str(REPO))
+    from bench.demo import (
+        BLOCK_MS,
+        TURN_1,
+        TURN_2,
+        TURN_MS,
+        PastWriteGraph,
+        _delivered,
+        answered_turns,
+        demo3_registry,
+        demo3_world,
+    )
+
+    from specunode.buffer.dispatcher import Dispatcher
+    from specunode.buffer.store_buffer import StoreBuffer
+    from specunode.canonical import JsonValue
+    from specunode.core.model import JournaledModel
+    from specunode.core.policy import Policy
+    from specunode.core.scheduler import Scheduler
+    from specunode.ids import new_ulid
+    from specunode.journal.journal import Journal
+    from specunode.testing.models import ScriptedModel, tool_turn
+
+    class Died(BaseException):
+        pass
+
+    class DiesBeforeTurnOneIsConfirmed(Journal):
+        replied = False
+        dead = False
+
+        async def append_async(
+            self, run_id: str, kind: str, payload: Mapping[str, JsonValue]
+        ) -> int:
+            if self.dead:
+                raise Died("a dead process writes nothing")
+            self.replied = self.replied or kind == "model_response"
+            if self.replied and kind == "branch_resolved" and payload.get("status") == "confirmed":
+                self.dead = True
+                raise Died("killed after turn 1's reply, before its branch was confirmed")
+            return await super().append_async(run_id, kind, payload)
+
+    def scheduler(journal: Journal, world: object, skip: int) -> Scheduler:
+        registry = demo3_registry(world)  # type: ignore[arg-type]
+        return Scheduler(
+            graph=PastWriteGraph("specunode"),  # type: ignore[arg-type]
+            registry=registry,
+            journal=journal,
+            buffer=StoreBuffer(journal=journal, run_id=""),
+            dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=1.0),
+            target=JournaledModel(
+                ScriptedModel(
+                    turns=[tool_turn(*TURN_1, turn=0), tool_turn(*TURN_2, turn=1)],
+                    block_delay_ms=BLOCK_MS,
+                    complete_delay_ms=TURN_MS,
+                    consumed=skip,
+                ),
+                journal,
+                provider="scripted",
+            ),
+            policy=Policy(speculation=True),
+        )
+
+    run_id = new_ulid()
+    world = demo3_world(tmp_path)
+    with pytest.raises(Died):
+        await scheduler(DiesBeforeTurnOneIsConfirmed(tmp_path / "journal.db"), world, 0).run(
+            run_id, {}
+        )
+    leftovers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for task in leftovers:
+        task.cancel()
+    await asyncio.gather(*leftovers, return_exceptions=True)
+    world.close()
+    assert _delivered(tmp_path) == [], "the kill landed after turn 1 had already sent something"
+
+    journal = Journal(tmp_path / "journal.db")
+    assert len(list(journal.read(run_id, kinds=["model_response"]))) == 1
+    skip = answered_turns(journal, run_id)
+    assert skip == 0, "turn 1's branch never retired, so its reply is not an answer to skip"
+    resumed_world = demo3_world(tmp_path)
+    result = await scheduler(journal, resumed_world, skip).resume(run_id)
+    resumed_world.close()
+    assert result.ok, result.error
+    assert [tool for tool, _ in _delivered(tmp_path)] == ["restart_job", "post_summary"]

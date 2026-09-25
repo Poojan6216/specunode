@@ -26,6 +26,7 @@ from bench.demo import (
     TURN_2,
     TURN_MS,
     PastWriteGraph,
+    answered_turns,
     demo3_registry,
     demo3_world,
 )
@@ -47,10 +48,9 @@ async def main() -> None:
     world = demo3_world(directory)
     registry = demo3_registry(world)
     journal = Journal(directory / "journal.db")
-    # A resumed run is a new process, so the script would otherwise start over while the run
-    # does not -- the node that is the run's *second* model call would be handed the script's
-    # first turn. Count the turns the journal already records and skip them.
-    already = len(list(journal.read(run_id, kinds=["model_response"]))) if resuming else 0
+    # A resumed run is a new process, so its script would otherwise start over while the run
+    # does not; skip the turns the journal already answers for (bench.demo.answered_turns).
+    already = answered_turns(journal, run_id) if resuming else 0
     model = ScriptedModel(
         turns=[tool_turn(*TURN_1, turn=0), tool_turn(*TURN_2, turn=1)],
         block_delay_ms=BLOCK_MS,

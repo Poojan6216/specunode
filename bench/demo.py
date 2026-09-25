@@ -668,6 +668,23 @@ def _world_log(directory: Path) -> list[dict[str, JsonValue]]:
     return events
 
 
+def answered_turns(journal: Journal, run_id: str) -> int:
+    """How many scripted turns a resumed run must skip: those of branches that retired.
+
+    A resumed run is a new process, so its script starts over while the run does not. The
+    turns to skip are the ones a resume will not ask again -- those of retired branches -- and
+    not every recorded response: counting a turn whose branch the kill interrupted skipped the
+    script past it, and the resume, re-asking that turn, was handed the next one instead. At 2
+    of 40 kill points the demo "resumed" to a post_summary without the restart before it.
+    """
+    retired = recover(journal, run_id).retired_branches
+    return sum(
+        1
+        for entry in journal.read(run_id, kinds=["model_response"])
+        if not entry.payload.get("speculative") and entry.payload.get("branch_id") in retired
+    )
+
+
 def _delivered(directory: Path) -> list[tuple[str, str]]:
     """Distinct effects that reached the world, in order, as ``(tool, canonical args hash)``.
 
