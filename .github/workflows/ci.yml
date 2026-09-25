@@ -75,9 +75,11 @@ jobs:
           fi
 
   slow-disk:
-    # The tests that guess, with every journal append 40 ms slower, the way a loaded runner's
-    # disk is. A test that passes only because an append landed inside a block delay fails
-    # here on every run, instead of in the matrix above on one run in twenty.
+    # The tests that guess, with every durable journal write 40 ms slower, the way a loaded
+    # runner's disk is. A test that passes only because a write landed inside a block delay
+    # fails here on every run, instead of in the matrix above on one run in twenty. The leak
+    # property test is left out: it draws random examples, has no model stream to race, and
+    # took four minutes of the job.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -98,7 +100,8 @@ jobs:
             tests/integration/test_t1_end_to_end.py \
             tests/test_equivalence.py \
             tests/test_leak.py \
-            tests/test_context_equivalence.py
+            tests/test_context_equivalence.py \
+            --deselect tests/test_leak.py::test_no_effect_ever_reaches_the_world_from_an_unretired_branch
 
   honesty:
     # Hard Rule 12: no number that was not measured; no absolute claim without its condition.

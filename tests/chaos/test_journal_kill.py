@@ -29,33 +29,15 @@ ENTRIES = 1000
 
 
 def _run_appender(
-    db: Path, delay_ms: float, count: int = ENTRIES
+    db: Path, kill_after: int, fraction: float = 0.0, count: int = ENTRIES
 ) -> subprocess.CompletedProcess[str]:
+    """``kill_after`` appends return, then the process dies ``fraction`` of an append later."""
     return subprocess.run(
-        [sys.executable, str(HELPER), str(db), RUN, str(count), str(delay_ms)],
+        [sys.executable, str(HELPER), str(db), RUN, str(count), str(kill_after), str(fraction)],
         capture_output=True,
         text=True,
         timeout=180,
     )
-
-
-def _kill_window_ms(tmp_path: Path) -> float:
-    """How long the append loop takes on this machine: the span a kill must land inside.
-
-    Measured by the helper from where its killer's clock starts, and taken from the fastest of
-    three runs. Timing the whole subprocess counted interpreter start-up, which the killer never
-    sees, and a single warm-up is the slowest run on a cold machine; on CI the two together put
-    most delays past the end of the loop, and only 3 of 15 processes were killed.
-    """
-    windows = []
-    for warm in range(3):
-        result = _run_appender(tmp_path / f"warmup-{warm}.db", delay_ms=-1)
-        assert result.returncode == 0, result.stderr[-600:]
-        for token in result.stdout.split():
-            if token.startswith("work_ms="):
-                windows.append(float(token.split("=", 1)[1]))
-    assert len(windows) == 3, "the helper did not report how long its loop took"
-    return min(windows)
 
 
 def _assert_intact(db: Path, *, expect_at_most: int = ENTRIES) -> int:
@@ -81,43 +63,45 @@ def _assert_intact(db: Path, *, expect_at_most: int = ENTRIES) -> int:
 
 def test_an_uninterrupted_run_writes_every_entry(tmp_path: Path) -> None:
     db = tmp_path / "journal.db"
-    assert _run_appender(db, delay_ms=-1).returncode == 0
+    assert _run_appender(db, kill_after=-1).returncode == 0
     assert _assert_intact(db) == ENTRIES
 
 
 @pytest.mark.slow
 def test_killing_mid_append_never_leaves_a_partial_entry(tmp_path: Path) -> None:
-    # Calibrate against this machine, so the kills land inside the write loop rather than
-    # before it starts or after it finishes.
-    window_ms = _kill_window_ms(tmp_path)
-    assert window_ms > 20, "appends are too fast to land a kill inside one; raise ENTRIES"
+    """Fifteen kills, each inside the loop by construction, most of them inside an append.
 
+    Stronger than before in two ways. Every process must actually be killed, rather than five
+    of fifteen. And every append that *returned* before the kill must have survived it, which
+    holds only if an append commits before it returns rather than batching commits for later.
+    That it reached the disk is a different claim, and not one a process kill can test: the
+    operating system still holds what the dead process wrote.
+    """
     rng = random.Random(20260915)
-    survivors: list[int] = []
-    killed = 0
     for attempt in range(15):
         db = tmp_path / f"kill-{attempt}.db"
-        delay_ms = rng.uniform(0.2, window_ms * 0.9)
-        result = _run_appender(db, delay_ms=delay_ms)
-        if result.returncode != 0:
-            killed += 1
-        survivors.append(_assert_intact(db))
-
-    assert killed >= 5, (
-        f"only {killed}/15 subprocesses were actually killed mid-run; the test would be "
-        "green without exercising the property it exists to test"
-    )
-    assert any(0 < n < ENTRIES for n in survivors), (
-        "no kill landed inside the append loop, so no partial-write window was exercised"
-    )
+        # At least half the loop still to run when the killer is armed, and a delay of at
+        # most two mean appends, so the loop cannot finish first.
+        kill_after = rng.randint(1, ENTRIES // 2)
+        result = _run_appender(db, kill_after=kill_after, fraction=rng.uniform(0.0, 2.0))
+        assert result.returncode == 9, (
+            f"attempt {attempt}: the process was not killed (exit {result.returncode}), so "
+            f"this attempt exercised nothing: {result.stdout[-200:]} {result.stderr[-400:]}"
+        )
+        survived = _assert_intact(db)
+        assert kill_after <= survived < ENTRIES, (
+            f"attempt {attempt}: {kill_after} appends had returned before the kill, and "
+            f"{survived} entries survived it"
+        )
 
 
 @pytest.mark.slow
 def test_a_killed_journal_can_be_reopened_and_appended_to(tmp_path: Path) -> None:
     """Recovery is not just readable: the chain must continue from where it stopped."""
     db = tmp_path / "journal.db"
-    _run_appender(db, delay_ms=_kill_window_ms(tmp_path) * 0.4)  # kill roughly mid-loop
+    assert _run_appender(db, kill_after=ENTRIES // 2, fraction=0.5).returncode == 9
     before = _assert_intact(db)
+    assert ENTRIES // 2 <= before < ENTRIES
 
     journal = Journal(db)
     for index in range(10):

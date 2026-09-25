@@ -1045,6 +1045,9 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [9.1] DEFECT (fixed), found by the quickstart: recovery rebuilt committed state from the nodes' deltas alone, dropping the run's inputs from every resumed run -- a resumed node that read one failed -- and leaving a delta that changed an input key nothing to apply to. It starts from `run_started.inputs` now. — 2026-09-24
 [6.11] What the guarantees cost, measured: against the fastest loop a developer would write by hand -- stream the reply, then run every call it asked for at once, with no journal and nothing to resume from -- the runtime is 0.6% slower with instant tools and 3.3% with 300 ms tools on the alert, and a read-only fan-out 1.7% and 13.1%. The fan-out's figure was 35% before this change: each lane's witnessed reads were re-checked at its own retirement, and lanes retire in order, so the re-checks queued one tool latency per lane. They are now made together while every lane is at rest, and a lane is re-checked at its own retirement only if an earlier lane in the group sent an effect -- the one thing that can make the up-front verdict out of date. A test proves the re-checks overlap; the "read what a sibling changed" test proves the second rule is load-bearing. — 2026-09-24
 [6.6] DEFECT (fixed): the traceability check read only a results file's values, so the settings a file is keyed by -- latency rungs, accuracy levels -- could not be traced. Keys that are numbers outright count now; digits inside a key's name do not. — 2026-09-23
+[2.5, 0.3] The kill tests now kill at counted points rather than timed ones. `test_kill_resume` dies before each of the clean run's 27 durable journal writes and either side of each of its 2 world mutations -- 31 points, every one a real mid-run kill on every machine, run four at a time in about 11 s -- and resumes each with a model that would decide differently if asked. Each point's outcome is fixed by what the kill left on disk: 24 finish with exactly the effects of the run they continue, 6 stop for a human on a claim with no outcome, 1 (before the first entry) is refused with nothing to resume; 0 duplicate deliveries. Planted bugs -- a resume that sends nothing new, one that re-sends after a lost reply, one that asks the model again -- each fail it at the point that exposes them. The journal kill test arms its killer after a drawn number of appends and asserts every append that returned survived the kill. Fifteen random delays, calibrated three times over, had failed on CI on both sides of the window. — 2026-09-25
+[2.5] DEFECT (fixed), found by the sixth review: a resume asked the model again for a turn the journal already held, whenever the node's branch had not retired -- so a model that answered differently the second time could make a second, different call after a crash that fell after an effect was sent. A resumed node is now served the journaled answer when its question is identical (`RecordedTurns`), journaled again under the resumed branch with `recorded_from`. The condition left is a question that changed across the crash (docs/limitations.md). — 2026-09-25
+[3.3] Four tests settled a guess inside a 15–25 ms block delay, which a journal append on a slow CI disk could miss. Found all at once by running the suite with every append 40 ms slower (`tests/slow_journal.py`); each now holds the settling block until the event it needs has happened, and passes at 40, 100 and 250 ms of added latency. The `slow-disk` CI job runs the tests that guess that way on every push. — 2026-09-25
 ```
 
 ---
@@ -1054,15 +1057,16 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**889 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
+**897 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Five independent adversarial reviews have found 86 defects here, 13 of them critical, and
-all 86 are fixed.** The counts, in order, were **23, 17, 13, 24, 9.** That number is the most useful thing in this report, so it is at the top rather
+**Six independent adversarial reviews have found 92 defects here, 13 of them critical, and
+all 92 are fixed.** The counts, in order, were **23, 17, 13, 24, 9, 6.** That number is the most useful thing in this report, so it is at the top rather
 than buried: the version of this document written a day earlier described a finished project.
-The fifth review (2026-09-23) is summarised below; the fourth is in commit `c8802ec`.
+The sixth review (2026-09-25) and the fifth (2026-09-23) are summarised below; the fourth is in
+commit `c8802ec`.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
 were incomplete, and **two of its four criticals were inside those fixes** — one of them was two
@@ -1181,6 +1185,34 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (4 guesses forked, 4 squashed, 4 charges staged and discarded, the
 alpha gate closed once, 0 wasted tokens — a pattern-index guess costs no model tokens — and 0
 leaks) and 7.8 replay under model drift (both cases diverge at step 0).
+
+### What the sixth review found, in the changes made to get CI green
+
+One reviewer, given the day's fixes to timing-dependent tests and told to find what they got
+wrong. Six findings; the worst was not in the tests at all.
+
+- **A resume asked the model again for a turn the journal already held.** A node whose branch
+  had not retired was run again, and asked its question again, even when the answer was on
+  disk. So "never duplicated" rested on a real model answering the same way twice, over a
+  wider window than the documentation admitted -- `journal.py` said "Resume never re-asks".
+  A resumed node is now served the journaled answer when it asks the same question
+  (`RecordedTurns`), which makes the resumed run decide what the dead one decided. Found by
+  killing a run just after a turn was journaled; the demo had been adjusted to the old
+  behaviour the day before, by a fix that treated the symptom.
+- **The new kill/resume test passed with a resume that sent nothing.** It accepted any run that
+  fell short as long as something was dead-lettered. With the kill points now deterministic,
+  each has its exact expected outcome, worked out from what the kill left on disk; the
+  reviewer's planted resume, which treated every fresh claim as ambiguous, fails it.
+- **No kill point fell between a claim and the world.** Dying after the world applied an effect
+  was covered, and dying before the request arrived was not. Both sides of each mutation are
+  points now.
+- The test's summary line and this log miscounted its outcomes; a process kill cannot test that
+  an append reached the disk, which a docstring claimed; and the slow-journal plugin slowed only
+  one of the four kinds of durable write it was described as slowing. Corrected, and the plugin
+  slows all four.
+
+The three defects in code and tests each have a test that fails without the fix. The other
+three were claims in comments and in this log, and are corrected.
 
 ### What the fifth review found, in parallel nodes and crash recovery
 
@@ -1470,7 +1502,8 @@ accept that the clause holds only for clients that report node ids.
    25 ms. Rather than wait for the next, the whole suite was run with every journal append
    made 40 ms slower (`tests/slow_journal.py`), which found every test of that kind at once:
    four, each of which now waits on the event it needs instead of on the clock. The `slow-disk`
-   CI job keeps it that way.
+   CI job keeps it that way. The kill tests, which had been calibrated three times, now kill
+   at counted points in the run instead of after timed delays, so no runner can miss them.
 4. **Decide Phase Gate 4's ledger clause**, as above.
 
 Decision Gate D1 did **not** fire: the corpus was fetched from Hugging Face, so the opportunity
