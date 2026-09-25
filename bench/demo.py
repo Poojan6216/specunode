@@ -47,7 +47,7 @@ from specunode.core.scheduler import Scheduler
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
 from specunode.journal.ledger import build_ledger
-from specunode.journal.replay import ReplayDivergence, ReplayModel, recover
+from specunode.journal.replay import RecordedTurns, ReplayDivergence, ReplayModel, recover
 from specunode.testing.models import ScriptedModel, tool_turn
 from specunode.testing.world import World, standard_world
 from specunode.verify.equivalence import equivalence_digest, normalise_world_mutations
@@ -669,23 +669,23 @@ def _world_log(directory: Path) -> list[dict[str, JsonValue]]:
 
 
 def answered_turns(journal: Journal, run_id: str) -> int:
-    """How many scripted turns a resumed run must skip: every one a process was asked before.
+    """How many scripted turns a resumed run must skip: those it will not ask for again.
 
-    A resumed run is a new process, so its script starts over while the run does not. A turn
-    the journal holds is served to the resume rather than asked again (``RecordedTurns``), so
-    every recorded answer is one to skip, and a turn whose reply the kill cut off -- recorded
-    nowhere, and asked again -- is not. A served turn is journaled again under the resumed
-    branch, and marked ``recorded_from``; it was never asked, so it is not counted.
-
-    This used to count only the turns of retired branches, because a resume re-asked the rest.
-    That was the defect: a resume should not ask again what the journal already answers.
+    A resumed run is a new process, so its script starts over while the run does not. The
+    turns a resume will not ask for again are those of branches that retired, and those it is
+    served from the journal (``RecordedTurns``): the answers of an attempt that may already
+    have sent something. An answer whose attempt sent nothing is asked for again, so the script
+    must hand it over again. A served turn is journaled again under the resumed branch and
+    marked ``recorded_from``; it was never asked, so it is not counted twice.
     """
+    kept = recover(journal, run_id).retired_branches | RecordedTurns(journal, run_id).acted
     return sum(
         1
         for entry in journal.read(run_id, kinds=["model_response"])
         if entry.payload.get("role", "target") == "target"
         and not entry.payload.get("speculative")
         and "recorded_from" not in entry.payload
+        and entry.payload.get("branch_id") in kept
     )
 
 

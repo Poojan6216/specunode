@@ -46,7 +46,6 @@ from specunode.core.graph import END, GraphAdapter, NodeRef, Parallel, RunSessio
 from specunode.core.hazards import Hazard, analyse, keys_touched
 from specunode.core.model import (
     CallScope,
-    JournaledModel,
     ModelClient,
     ModelResponse,
     RequestEnvelope,
@@ -223,6 +222,17 @@ class BranchTools:
         scheduler = self._scheduler
         branch = self._branch
         spec = scheduler.registry.get(name)
+        if spec.effect is not EffectClass.READ and branch.unjournaled_turns:
+            # Refused before it takes a position or reaches the journal. Staged, it would be
+            # drained the moment the node parked on it -- before the turn that decided it was
+            # on disk, so a crash in between left a sent effect whose decision a resume could
+            # not find, and a model asked again could make a second, different call.
+            raise SchedulerError(
+                f"{name} was called while the model turn that decided it was not yet "
+                "journaled. A node that reads session.model.stream() must reach TurnComplete "
+                "before it writes -- or the write goes out on a decision that is not on disk. "
+                "Read the stream to its end, or use complete() or call_turn."
+            )
         call = ToolCall(name=name, args=dict(args))
         step = branch.advance_step() if step is None else branch.reserve_step(step)
 
@@ -482,9 +492,6 @@ class Scheduler:
         self._committed = CommittedState.initial(inputs if isinstance(inputs, Mapping) else {})
         self._cursor = StepCursor()
         self._reducers = resolve_reducers(dict(self.reducers))
-        if isinstance(self.target, JournaledModel):
-            # A fresh run has been told nothing yet; a previous resume's turns are not its own.
-            self.target.serve_recorded(None)
         await self._journal_run_started(inputs)
 
         if self.graph.capabilities().drives_itself:
@@ -612,8 +619,10 @@ class Scheduler:
         self.buffer.run_id = run_id
         self.buffer.scheduler_task = asyncio.current_task()
         recorded = RecordedTurns(self.journal, run_id)
-        if isinstance(self.target, JournaledModel):
-            self.target.serve_recorded(recorded)
+        # Any target that offers it: JournaledModel does, and a wrapper can pass it through.
+        # One that does not is asked every question again, and run_started says so.
+        serve = getattr(self.target, "serve_recorded", None)
+        serving = callable(serve)
         self._committed = CommittedState(recovery.state)
         self._cursor = recovery.cursor
         self._open_group = recovery.open_group
@@ -637,13 +646,19 @@ class Scheduler:
                     "confirmed_not_retired": list(recovery.confirmed_not_retired),
                     "unresolved_dispatches": len(recovery.unresolved_dispatches),
                     "step_index": recovery.step_index,
-                    # Turns the journal holds; a resumed node asking one again is served it.
+                    # Turns a resumed node asking the same question again will be served.
                     "recorded_turns": recorded.recorded,
-                    "served": isinstance(self.target, JournaledModel),
+                    "served": serving,
                 },
             },
         )
-        return await self._drive_from_state(run_id)
+        if not callable(serve):
+            return await self._drive_from_state(run_id)
+        serve(run_id, recorded)
+        try:
+            return await self._drive_from_state(run_id)
+        finally:
+            serve(run_id, None)
 
     async def _run_driven(self, run_id: str, inputs: JsonValue) -> RunResult:
         """The framework owns the loop; the runtime is reached from inside each node.
@@ -723,6 +738,7 @@ class Scheduler:
             step=branch.cursor.step_index,
             node_id=node_id,
             record_prompt=branch.record_prompt,
+            track_turn=branch.track_turn,
             # Whether this request is being sent on a guess. Always False before, which made
             # every ``model_request`` entry claim it was authorised work -- and a field that
             # never varies reads as a check while recording nothing. "On a guess" is the same
@@ -1101,6 +1117,7 @@ class Scheduler:
             step=branch.cursor.step_index,
             node_id=node_id,
             record_prompt=branch.record_prompt,
+            track_turn=branch.track_turn,
             # Whether this request is being sent on a guess. Always False before, which made
             # every ``model_request`` entry claim it was authorised work -- and a field that
             # never varies reads as a check while recording nothing. "On a guess" is the same

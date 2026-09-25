@@ -279,37 +279,44 @@ class ReplayModel:
 
 @dataclass
 class RecordedTurns:
-    """The model turns a resumed run has already been given, served rather than asked again.
+    """The model turns a resumed run is served rather than asked again.
 
     A resumed run re-runs every node whose branch never retired, from the same position and
-    under the same node id, so each such node asks the model what it asked before. Asking
-    again is what made "never duplicated" depend on the model answering the same way twice:
-    the dead process may already have sent effects of that turn, and a different answer is a
-    different call with a different idempotency key. The answer is in the journal whenever an
-    effect of the turn could have been sent, because nothing is sent before the turn is
-    durable; so a turn the journal holds is served, and only a turn it does not hold -- none of
-    whose effects can have left -- goes back to the model.
+    under the same node id, so each such node asks the model what it asked before. Where the
+    dead attempt's answer may already have sent something, asking again risks a different
+    answer: a different call, under a different idempotency key, which the dedupe table cannot
+    connect to what already went out. So those turns are served from the journal, and the node
+    decides what it decided before.
 
-    Only when the question is the same. A turn is served if the resumed request hashes to the
-    recorded one, and from the first request at a node and position that does not, or that
-    runs past what was recorded, that node and position ask the model. Speculative turns are
-    never served: they were guesses, not decisions.
+    Only an attempt that may have sent something is served. One whose effects all provably
+    never left -- nothing claimed, a claim marked unsent, a dead letter that never left the
+    process -- is asked again: there is nothing to protect, and serving its answer would pin a
+    run to a decision that already failed, such as a call to a tool that does not exist.
 
-    For each node and position the longest recorded attempt is kept, the latest on a tie. A
-    resumed attempt is served the recorded turns before it asks anything, and journals each
-    one again, so every attempt's turns begin with those of the attempt before it.
+    Only when the question is the same. At each node and position, the resumed node's requests
+    are matched turn by turn against each attempt's, and the latest attempt whose turns so far
+    are the same questions answers the next one. From the first question no attempt asked,
+    that node and position go back to the model. Speculative turns are never served: they were
+    guesses, not decisions.
+
+    "The latest" is not "the longest". Once a question has changed across one crash, an
+    earlier attempt's longer conversation answers questions the node no longer asks, and the
+    attempt that sent something under the current question is the newer, shorter one.
     """
 
     journal: Journal
     run_id: str
     role: str = "target"
-    _turns: dict[tuple[str, int], list[tuple[str, RecordedTurn]]] = field(
+    #: Per (node, position), each acting attempt's turns as (request hash, turn), oldest first.
+    _attempts: dict[tuple[str, int], list[list[tuple[str, RecordedTurn]]]] = field(
         default_factory=dict, init=False
     )
-    _next: dict[tuple[str, int], int] = field(default_factory=dict, init=False)
+    _acted: frozenset[str] = field(default=frozenset(), init=False)
+    _asked: dict[tuple[str, int], list[str]] = field(default_factory=dict, init=False)
     _asking: set[tuple[str, int]] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
+        self._acted = self._branches_that_may_have_sent()
         requests: dict[str, Mapping[str, JsonValue]] = {}
         attempts: dict[tuple[str, int], dict[str, list[tuple[str, RecordedTurn]]]] = {}
         for entry in self.journal.read(self.run_id, kinds=["model_request", "model_response"]):
@@ -322,11 +329,13 @@ class RecordedTurns:
             if entry.kind == "model_request":
                 requests[request_id] = payload
                 continue
+            branch = str(payload.get("branch_id", ""))
             request = requests.get(request_id)
             step = payload.get("step")
             response = payload.get("response")
             if (
-                request is None
+                branch not in self._acted
+                or request is None
                 or not isinstance(step, int)
                 or isinstance(step, bool)
                 or not isinstance(response, Mapping)
@@ -336,15 +345,25 @@ class RecordedTurns:
             origin = payload.get("recorded_from")
             offset = origin if isinstance(origin, int) else entry.offset
             key = (str(request.get("node_id") or ""), step)
-            attempt = attempts.setdefault(key, {}).setdefault(str(payload.get("branch_id")), [])
             turn = RecordedTurn(response=response_from_json(response), offset=offset)
+            attempt = attempts.setdefault(key, {}).setdefault(branch, [])
             attempt.append((str(payload.get("request_hash", "")), turn))
-        for key, by_attempt in attempts.items():
-            kept: list[tuple[str, RecordedTurn]] = []
-            for turns in by_attempt.values():
-                if len(turns) >= len(kept):
-                    kept = turns
-            self._turns[key] = kept
+        self._attempts = {key: list(by_branch.values()) for key, by_branch in attempts.items()}
+
+    def _branches_that_may_have_sent(self) -> frozenset[str]:
+        """Branches with an effect that reached the world, or may have."""
+        acted: set[str] = set()
+        for entry in self.journal.read(
+            self.run_id, kinds=["effect_dispatched", "effect_dead_lettered"]
+        ):
+            # A dead letter without ``sent`` was written before the field existed: assume the
+            # worst, as the claim table does.
+            if entry.kind == "effect_dispatched" or entry.payload.get("sent") != "no":
+                acted.add(str(entry.payload.get("branch_id", "")))
+        for claim in self.journal.unresolved_dispatches(self.run_id):
+            if claim.get("last_outcome") != "not_sent":
+                acted.add(str(claim.get("branch_id", "")))
+        return frozenset(acted)
 
     def take(self, digest: str, scope: CallScope) -> RecordedTurn | None:
         if scope.run_id != self.run_id:
@@ -352,18 +371,28 @@ class RecordedTurns:
         key = (scope.node_id, scope.step)
         if key in self._asking:
             return None
-        turns = self._turns.get(key, [])
-        index = self._next.get(key, 0)
-        if index >= len(turns) or turns[index][0] != digest:
-            self._asking.add(key)
-            return None
-        self._next[key] = index + 1
-        return turns[index][1]
+        asked = self._asked.setdefault(key, [])
+        index = len(asked)
+        for turns in reversed(self._attempts.get(key, [])):
+            if (
+                len(turns) > index
+                and turns[index][0] == digest
+                and all(turns[i][0] == asked[i] for i in range(index))
+            ):
+                asked.append(digest)
+                return turns[index][1]
+        self._asking.add(key)
+        return None
+
+    @property
+    def acted(self) -> frozenset[str]:
+        """Branch ids with an effect that reached the world, or may have."""
+        return self._acted
 
     @property
     def recorded(self) -> int:
-        """How many turns the journal holds for this run, over every node and position."""
-        return sum(len(turns) for turns in self._turns.values())
+        """How many turns a resume could be served, over every node and position."""
+        return sum(max(map(len, attempts)) for attempts in self._attempts.values())
 
 
 def _as_mapping(value: JsonValue) -> Mapping[str, JsonValue]:

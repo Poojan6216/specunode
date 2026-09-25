@@ -1,7 +1,7 @@
 """The journal: every model output and tool result, durable before the runtime acts on it.
 
-Hard Rule 5. Replay never calls a model; it reads this. Resume does not ask a model again what
-it already answered; it reads this.
+Hard Rule 5. Replay never calls a model; it reads this. Resume does not ask a model again for
+a decision that may already have sent something; it reads this.
 The ledger is rendered from this. So the properties that matter are unglamorous ones:
 
 **One entry is one commit is one fsync.** Not batched. ~100 fsyncs on a 30-step run costs

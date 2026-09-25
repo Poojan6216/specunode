@@ -513,6 +513,9 @@ class CallScope:
     #: Hard Rule 13: the branch records (step, request_hash) for every target request it
     #: sends, and retirement rebuilds each one from the canonical context and compares.
     record_prompt: Callable[[int, str], None] | None = None
+    #: Told +1 when a target turn is asked for and -1 once its response is journaled, so the
+    #: branch can refuse a write made while the decision behind it is not on disk (Hard Rule 5).
+    track_turn: Callable[[int], None] | None = None
 
 
 call_scope: ContextVar[CallScope | None] = ContextVar("specunode_call_scope", default=None)
@@ -578,25 +581,31 @@ class JournaledModel:
         self._journal = journal
         self._role = role
         self._provider = provider
-        self._recorded: RecordedTurnSource | None = None
+        self._recorded: dict[str, RecordedTurnSource] = {}
 
-    def serve_recorded(self, source: RecordedTurnSource | None) -> None:
-        """Answer from the journal what a resumed run was already told; ``None`` to stop.
+    def serve_recorded(self, run_id: str, source: RecordedTurnSource | None) -> None:
+        """Answer run ``run_id``'s questions from ``source`` where it can; ``None`` to stop.
 
-        The scheduler sets this when it resumes a run. A node whose branch never retired is run
-        again from the same position and asks the same question, and once any effect of that
-        turn was sent the journal holds the answer -- nothing is sent before the turn is
-        durable. Asking again was at best a wasted call. At worst the model decided differently,
-        and a different call derives a different idempotency key, which the dedupe table cannot
-        connect to what the dead process already sent. A served turn is journaled again under
-        the resumed branch, with ``recorded_from`` naming the entry it came from.
+        The scheduler sets this while it resumes a run. A node whose branch never retired is
+        run again from the same position and asks what it asked before. Where the dead
+        process's answer may already have sent something, asking again risked a different
+        answer -- a different call, under a different idempotency key, which the dedupe table
+        cannot connect to what already went out. A served turn is journaled again under the
+        resumed branch, with ``recorded_from`` naming the entry it came from.
+
+        Kept per run: this object is often shared, and a fresh run on another scheduler must
+        not switch off a resume in flight.
         """
-        self._recorded = source
+        if source is None:
+            self._recorded.pop(run_id, None)
+        else:
+            self._recorded[run_id] = source
 
     def _recorded_for(self, digest: str, scope: CallScope) -> RecordedTurn | None:
-        if self._recorded is None or self._role != "target" or scope.speculative:
+        source = self._recorded.get(scope.run_id)
+        if source is None or self._role != "target" or scope.speculative:
             return None
-        return self._recorded.take(digest, scope)
+        return source.take(digest, scope)
 
     async def _journal_request(
         self,
@@ -676,46 +685,83 @@ class JournaledModel:
         digest = request_hash(envelope)
         recorded = self._recorded_for(digest, scope)
         request_id = await self._journal_request(envelope, scope, digest, recorded)
-        if recorded is not None:
-            await self._journal_response(recorded.response, scope, request_id, digest, 0, recorded)
-            return recorded.response
-        started = time.monotonic()
-        response = await self._inner.complete(envelope)
-        latency_ms = int((time.monotonic() - started) * 1000)
-        await self._journal_response(response, scope, request_id, digest, latency_ms)
-        return response
+        track = scope.track_turn if self._role == "target" else None
+        if track is not None:
+            track(1)
+        try:
+            if recorded is not None:
+                await self._journal_response(
+                    recorded.response, scope, request_id, digest, 0, recorded
+                )
+                return recorded.response
+            started = time.monotonic()
+            response = await self._inner.complete(envelope)
+            latency_ms = int((time.monotonic() - started) * 1000)
+            await self._journal_response(response, scope, request_id, digest, latency_ms)
+            return response
+        finally:
+            # Nothing of the turn reaches the caller before its response is on disk.
+            if track is not None:
+                track(-1)
 
     async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
         """Stream, journaling the turn before ``TurnComplete`` is handed to the caller.
 
         Intermediate :class:`ToolUseComplete` events are forwarded as they parse, which is what
-        lets the tier-0 drafter issue a read before the turn ends. That is not a Hard Rule 5
-        violation: a branch forked on a partial turn is SPECULATIVE, and Hard Rule 3 forbids it
-        from dispatching anything until the confirming entry -- journaled here, before
-        ``TurnComplete`` escapes -- is durable.
+        lets the tier-0 drafter issue a read before the turn ends. A read is not an effect, so
+        that is not a Hard Rule 5 violation; a write is. ``call_turn`` stages a turn's writes
+        only after its stream ends, and a guessed branch's writes wait for the confirming entry
+        -- journaled here, before ``TurnComplete`` escapes. A node that reads this stream itself
+        and writes as a block parses would have its write dispatched first, on a decision not
+        yet on disk: nothing stops the drain once the node parks. So the turn is reported to
+        the branch as open until its response is journaled (``CallScope.track_turn``), and a
+        write made while it is open -- or after the node stopped reading before its end -- is
+        refused.
         """
         scope = current_scope()
         digest = request_hash(envelope)
         recorded = self._recorded_for(digest, scope)
         request_id = await self._journal_request(envelope, scope, digest, recorded)
-        if recorded is not None:
-            # The recorded turn's blocks, in order and with no delay, as a live stream would
-            # emit them -- so early issue sees a served turn exactly as it saw the original.
-            response = recorded.response
-            for index, block in enumerate(response.content):
-                if isinstance(block, ToolUseBlock):
-                    yield ToolUseComplete(index=index, block=block)
-                elif isinstance(block, TextBlock):
-                    yield TextDelta(index=index, text=block.text)
-            await self._journal_response(response, scope, request_id, digest, 0, recorded)
-            yield TurnComplete(response=response)
-            return
-        started = time.monotonic()
-        async for event in self._inner.stream(envelope):
-            if isinstance(event, TurnComplete):
-                latency_ms = int((time.monotonic() - started) * 1000)
-                await self._journal_response(event.response, scope, request_id, digest, latency_ms)
-            yield event
+        track = scope.track_turn if self._role == "target" else None
+        if track is not None:
+            track(1)
+        handed_over = False
+        try:
+            if recorded is not None:
+                # The recorded turn's blocks, in order and with no delay, as a live stream
+                # would emit them -- so early issue sees a served turn as it saw the original.
+                response = recorded.response
+                for index, block in enumerate(response.content):
+                    if isinstance(block, ToolUseBlock):
+                        handed_over = True
+                        yield ToolUseComplete(index=index, block=block)
+                    elif isinstance(block, TextBlock):
+                        handed_over = True
+                        yield TextDelta(index=index, text=block.text)
+                await self._journal_response(response, scope, request_id, digest, 0, recorded)
+                if track is not None:
+                    track(-1)
+                    track = None
+                yield TurnComplete(response=response)
+                return
+            started = time.monotonic()
+            async for event in self._inner.stream(envelope):
+                if isinstance(event, TurnComplete):
+                    latency_ms = int((time.monotonic() - started) * 1000)
+                    await self._journal_response(
+                        event.response, scope, request_id, digest, latency_ms
+                    )
+                    if track is not None:
+                        track(-1)
+                        track = None
+                handed_over = True
+                yield event
+        except BaseException:
+            # A turn that failed before the caller saw any of it left nothing to act on. One
+            # the caller stopped reading part-way stays open: it may act on what it saw.
+            if track is not None and not handed_over:
+                track(-1)
+            raise
 
 
 # -- building a request, and Hard Rule 13's structural check -------------------------------------

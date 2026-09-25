@@ -135,6 +135,16 @@ A node that stages a write and then reads the result retires in the middle of it
 branch is confirmed, the buffer drains, the node resumes with the real value. Do not assume a
 node body runs to completion before its effects are dispatched.
 
+### A write waits for the turn that decided it
+
+A node that reads `session.model.stream()` itself may make reads as blocks parse, but not
+writes. A write made before the stream reaches `TurnComplete` -- or after the node stopped
+reading part-way, which leaves the turn unjournaled for good -- is refused with a
+`SchedulerError`. Staged, it would go out as soon as the node parked on it, before the turn
+that decided it was on disk, and a crash in between would leave a sent effect whose decision a
+resume could not find. Read the stream to its end, or use `complete()`, or `call_turn`, which
+issues a turn's reads early and stages its writes once the turn is journaled.
+
 ## Speculation and node bodies
 
 **A speculative branch does not run your node bodies by default.** A node body is unbounded

@@ -26,15 +26,24 @@ from examples.support_agent.agent import build as build_support
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
 from specunode.canonical import JsonValue
+from specunode.core.decision import Decision, ToolCall
 from specunode.core.effects import ToolRegistry
-from specunode.core.model import JournaledModel
+from specunode.core.graph import RunSession
+from specunode.core.model import (
+    JournaledModel,
+    Message,
+    RequestEnvelope,
+    TextBlock,
+    decisions_of,
+)
 from specunode.core.policy import Policy
 from specunode.core.scheduler import Scheduler
 from specunode.ids import new_ulid
+from specunode.integrations.plain import PlainAdapter, node, registry_of, tool
 from specunode.journal.journal import Journal
 from specunode.journal.replay import ReplayModel, recover
 from specunode.testing.models import ScriptedModel, tool_turn
-from specunode.testing.world import standard_world
+from specunode.testing.world import World, standard_world
 
 
 class Crash(BaseException):
@@ -113,15 +122,12 @@ def charge(amount: float) -> object:
     return tool_turn(("charge_card", {"customer_id": "cus-1", "amount": amount}))
 
 
-async def test_a_resumed_node_is_served_the_decision_the_dead_process_made(
-    tmp_path: Path,
-) -> None:
-    """The model said 25; the process died before ``decide`` retired; asked again, it says 30.
+async def test_replay_of_a_resumed_run_reproduces_the_run_that_was_kept(tmp_path: Path) -> None:
+    """The model said 25; the process died before ``decide`` retired; resumed, it said 30.
 
-    The resume is served 25 from the journal rather than asking again, so it charges what the
-    dead process decided. It used to ask, and charged 30 -- a decision the dead process never
-    made, which a real model asked the same question twice may well make. And a replay of the
-    resumed run reproduces the run that was kept.
+    Nothing had gone out on the 25 -- ``decide`` only decides -- so the resume asks again rather
+    than being served it, and both answers sit in the journal under one node and one position.
+    Replay used to serve the dead attempt's, reproducing a charge the committed run never made.
     """
     db = tmp_path / "source.db"
     world = standard_world()
@@ -138,56 +144,12 @@ async def test_a_resumed_node_is_served_the_decision_the_dead_process_made(
     await bury_the_dead_process()
 
     adapter, registry = build_support(world)
-    changed_its_mind = ScriptedModel(turns=[charge(30.0)])  # type: ignore[list-item]
-    resumed = await scheduler(Journal(db), adapter, registry, changed_its_mind).resume(run_id)
-    assert resumed.ok, resumed.error
-    assert changed_its_mind.calls == 0, "the resume asked a question the journal had answered"
-    assert [row["amount"] for row in world.tables["charges"].values()] == [25.0]
-
-    adapter, registry = build_support(standard_world())
-    replayed = await scheduler(
-        Journal(tmp_path / "replay.db"), adapter, registry, replay_of(Journal(db), run_id)
-    ).run(new_ulid(), inputs)
-    assert replayed.ok, replayed.error
-    assert replayed.state["decided"] == resumed.state["decided"]
-
-
-async def test_replay_of_a_resumed_run_serves_the_attempt_that_was_kept(tmp_path: Path) -> None:
-    """Two answers under one node and one position: the dead attempt's 25 and the kept 30.
-
-    A resume asks again when the question changed across the crash, and then the journal holds
-    both. Replay used to serve the dead attempt's, reproducing a charge the committed run never
-    made. The resumed process here is made to ask again, as a changed question makes it, rather
-    than rebuilding the app around a changed prompt.
-    """
-
-    class AsksAgain(JournaledModel):
-        def serve_recorded(self, source: object) -> None:
-            """Nothing recorded answers a question that changed."""
-
-    db = tmp_path / "source.db"
-    world = standard_world()
-    adapter, registry = build_support(world)
-    run_id = new_ulid()
-    inputs = {"customer_id": "cus-1"}
-    with pytest.raises(Crash):
-        await scheduler(
-            CrashingJournal(db, before_commit_of("decide#0")),
-            adapter,
-            registry,
-            ScriptedModel(turns=[charge(25.0)]),  # type: ignore[list-item]
-        ).run(run_id, inputs)
-    await bury_the_dead_process()
-
-    adapter, registry = build_support(world)
-    journal = Journal(db)
-    resuming = scheduler(journal, adapter, registry, None)
-    resuming.target = AsksAgain(
+    resumed = await scheduler(
+        Journal(db),
+        adapter,
+        registry,
         ScriptedModel(turns=[charge(30.0)]),  # type: ignore[list-item]
-        journal,
-        provider="scripted",
-    )
-    resumed = await resuming.resume(run_id)
+    ).resume(run_id)
     assert resumed.ok, resumed.error
     assert [row["amount"] for row in world.tables["charges"].values()] == [30.0]
 
@@ -197,6 +159,62 @@ async def test_replay_of_a_resumed_run_serves_the_attempt_that_was_kept(tmp_path
     ).run(new_ulid(), inputs)
     assert replayed.ok, replayed.error
     assert replayed.state["decided"] == resumed.state["decided"]
+
+
+def build_billing(world: World) -> tuple[object, object]:
+    """One node that asks the model what to charge and charges it, in the same step."""
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        return await world.charge_card(customer_id=customer_id, amount=amount)
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        envelope = RequestEnvelope(
+            model="scripted",
+            messages=(Message(role="user", content=(TextBlock(text="bill cus-1"),)),),
+            max_tokens=64,
+        )
+        decision = decisions_of(await session.model.complete(envelope))[0]
+        assert isinstance(decision, ToolCall)
+        await session.call_tool(decision.name, dict(decision.args))
+        session.state["billed"] = True
+        return decision
+
+    def route(state: Mapping[str, JsonValue]) -> str | None:
+        return None if state.get("billed") else "bill"
+
+    return PlainAdapter.of([bill], route), registry_of([charge_card])
+
+
+async def test_a_decision_that_sent_something_is_served_to_the_resume(tmp_path: Path) -> None:
+    """The model said 25 and the charge went out; the process died before ``bill`` retired.
+
+    Asked again, the model would say 30. The resume is served the journaled 25 instead, derives
+    the charge's key again, and the dedupe table recognises the charge as sent: one charge. A
+    resume that asked again charged 30 on top of the 25 -- a second, different call, under a
+    key nothing could connect to the first.
+    """
+    db = tmp_path / "source.db"
+    world = standard_world()
+    adapter, registry = build_billing(world)
+    run_id = new_ulid()
+    with pytest.raises(Crash):
+        await scheduler(
+            CrashingJournal(db, before_commit_of("bill#0")),
+            adapter,
+            registry,
+            ScriptedModel(turns=[charge(25.0)]),  # type: ignore[list-item]
+        ).run(run_id, {})
+    await bury_the_dead_process()
+    assert [row["amount"] for row in world.tables["charges"].values()] == [25.0]
+
+    adapter, registry = build_billing(world)
+    changed_its_mind = ScriptedModel(turns=[charge(30.0)])  # type: ignore[list-item]
+    resumed = await scheduler(Journal(db), adapter, registry, changed_its_mind).resume(run_id)
+    assert resumed.ok, resumed.error
+    assert changed_its_mind.calls == 0, "the resume asked for a decision that had sent a charge"
+    assert [row["amount"] for row in world.tables["charges"].values()] == [25.0]
 
 
 async def test_replay_of_a_resumed_conversation_is_not_refused(tmp_path: Path) -> None:

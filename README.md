@@ -34,11 +34,14 @@ knows exactly which effects may already be out -- and then it asks the upstream 
 `reconcile`) or stops for a human. It never guesses. Details and caveats in
 [RESULTS.md](https://github.com/Poojan6216/specunode/blob/main/RESULTS.md#pull-the-plug-what-a-crash-sends-twice).
 
-Nor does a resumed step ask the model again what it already decided. The answer behind anything
-that may have gone out is in the journal, and the resume is served it from there -- so a model
-that would decide differently the second time cannot add a second, different charge, as long as
-the step asks the same question
-([limitations](https://github.com/Poojan6216/specunode/blob/main/docs/limitations.md#dispatch-is-at-least-once-and-the-ambiguous-window-is-real)).
+Nor does a resumed step ask the model again for a decision that may already have sent
+something. Nothing is sent before the answer that decided it is journaled, and a resume is
+served that answer from there -- so a model that would decide differently the second time
+cannot add a second, different charge, as long as the step asks the same question and builds
+the same call
+([limitations](https://github.com/Poojan6216/specunode/blob/main/docs/limitations.md#dispatch-is-at-least-once-and-the-ambiguous-window-is-real);
+this applies to runs continued with `resume`, not to a LangGraph graph re-run from its
+checkpointer).
 
 ## Quickstart
 

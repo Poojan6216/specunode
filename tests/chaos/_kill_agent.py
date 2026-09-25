@@ -1,6 +1,7 @@
 """Subprocess helper: run the support agent, optionally dying at an exact point in the run.
 
-``python _kill_agent.py <dir> <run_id> <kill> [resume] [changed-mind]``, where ``kill`` is one of
+``python _kill_agent.py <dir> <run_id> <kill> [resume] [changed-mind] [billing]``, where ``kill``
+is one of
 
 * ``-1`` -- run to the end, and print how many kill points the run has
 * ``op:N`` -- die just before the run's N-th durable journal write: an entry appended, a
@@ -12,7 +13,12 @@
 
 ``changed-mind`` scripts a model that decides differently -- charges 30 rather than 25 -- which
 is what a real model asked the same question twice may do. A resumed process is given it to
-show that a decision already in the journal is not asked for again.
+show that a decision which may already have sent something is served from the journal, and one
+that sent nothing is asked for again.
+
+``billing`` runs one node that asks the model what to charge and charges it in the same step,
+instead of the support agent, whose ``decide`` node asks and sends nothing and whose ``charge``
+node sends and asks nothing -- a shape in which no resume is ever served a turn.
 
 The process dies by ``os._exit``: no cleanup, no flush, no finally blocks, as if the machine
 lost power, except that what the OS already holds survives. The world writes to a durable log,
@@ -39,13 +45,23 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from examples.support_agent.agent import build
+from examples.support_agent.agent import build, build_tools
 
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
-from specunode.core.model import JournaledModel
+from specunode.canonical import JsonValue
+from specunode.core.decision import Decision, ToolCall
+from specunode.core.graph import RunSession
+from specunode.core.model import (
+    JournaledModel,
+    Message,
+    RequestEnvelope,
+    TextBlock,
+    decisions_of,
+)
 from specunode.core.policy import Policy
 from specunode.core.scheduler import Scheduler
+from specunode.integrations.plain import PlainAdapter, node, registry_of
 from specunode.journal import journal as journal_module
 from specunode.journal.journal import Journal
 from specunode.testing.models import ScriptedModel, tool_turn
@@ -79,6 +95,30 @@ class Counter:
             self.count += 1
             if self.count == self.die_at:
                 os._exit(9)
+
+
+def build_billing(world: World) -> tuple[PlainAdapter, object]:
+    """One node that asks the model what to charge, charges it, and sends the receipt."""
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        envelope = RequestEnvelope(
+            model="scripted",
+            messages=(Message(role="user", content=(TextBlock(text="Bill cus-1."),)),),
+            max_tokens=64,
+        )
+        decision = decisions_of(await session.model.complete(envelope))[0]
+        assert isinstance(decision, ToolCall)
+        ack = await session.call_tool(decision.name, dict(decision.args))
+        charge_id = str(ack.get("charge_id")) if isinstance(ack, dict) else "none"
+        await session.call_tool("send_receipt", {"customer_id": "cus-1", "charge_id": charge_id})
+        session.state["billed"] = True
+        return decision
+
+    def route(state: dict[str, JsonValue]) -> str | None:
+        return None if state.get("billed") else "bill"
+
+    return PlainAdapter.of([bill], route), registry_of(build_tools(world))  # type: ignore[arg-type]
 
 
 def count_journal_writes(counter: Counter) -> None:
@@ -125,7 +165,7 @@ async def main() -> None:
 
     world = seeded_world(directory)
     count_world_mutations(world, sends, mutations)
-    adapter, registry = build(world)
+    adapter, registry = build_billing(world) if "billing" in sys.argv[4:] else build(world)
     journal = Journal(directory / "journal.db")
     model = ScriptedModel(turns=[tool_turn(charge, turn=0), tool_turn(charge, turn=1)])
     scheduler = Scheduler(

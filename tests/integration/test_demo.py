@@ -298,15 +298,14 @@ def test_a_kill_at_any_point_of_the_demo_resumes_to_a_prefix_without_duplicates(
     assert killed >= 12, f"only {killed} of 24 kill points landed inside the run"
 
 
-async def test_a_resume_is_served_the_turn_the_journal_already_holds(tmp_path: Path) -> None:
+async def test_a_resume_asks_again_a_turn_whose_decision_sent_nothing(tmp_path: Path) -> None:
     """The window the sweep above can step over, hit exactly: the process dies after turn 1's
     reply is journaled and before turn 1's branch is confirmed, so nothing of turn 1 was sent.
 
-    The resume is served turn 1 from the journal rather than asking for it again, and the
-    script skips it. Two defects lived here. The resume re-asked turn 1 while the demo's script
-    counted it as answered, so the resume was handed turn 2 and posted a summary of a restart
-    it never made. The first fix had the script hand turn 1 over again, which hid the second:
-    the resume should never have asked a question the journal had already answered.
+    Nothing went out on turn 1's answer, so nothing needs protecting from a different one: the
+    resume asks turn 1 again rather than being served the journaled reply, and the script must
+    hand turn 1 over again. The demo's script once counted every recorded reply as answered, so
+    the resume was handed turn 2 instead -- and posted a summary of a restart it never made.
     """
     import asyncio
     from collections.abc import Mapping
@@ -352,7 +351,7 @@ async def test_a_resume_is_served_the_turn_the_journal_already_holds(tmp_path: P
     journal = Journal(tmp_path / "journal.db")
     assert len(list(journal.read(run_id, kinds=["model_response"]))) == 1
     skip = answered_turns(journal, run_id)
-    assert skip == 1, "turn 1's reply is in the journal, so the resume is served it"
+    assert skip == 0, "nothing of turn 1 was sent, so the resume asks it again"
     resumed_world = demo3_world(tmp_path)
     result = await demo3_scheduler(journal, resumed_world, skip).resume(run_id)
     resumed_world.close()
@@ -360,9 +359,8 @@ async def test_a_resume_is_served_the_turn_the_journal_already_holds(tmp_path: P
     assert [tool for tool, _ in _delivered(tmp_path)] == ["restart_job", "post_summary"]
 
     replies = [e.payload for e in journal.read(run_id, kinds=["model_response"])]
-    served = [reply for reply in replies if "recorded_from" in reply]
-    assert len(served) == 1, "turn 1 was asked again rather than served from the journal"
-    assert len(replies) == 3, "turn 1, turn 1 served, and turn 2 -- the only new question"
+    assert not any("recorded_from" in reply for reply in replies), "a turn was served"
+    assert len(replies) == 3, "turn 1, turn 1 asked again, and turn 2"
 
 
 async def test_a_lost_reply_to_an_idempotent_write_is_redelivered_and_applied_once(

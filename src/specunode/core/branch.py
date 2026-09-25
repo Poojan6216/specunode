@@ -199,6 +199,10 @@ class Branch:
     #: pre-read status afterwards and silently demoted a CONFIRMED branch back to SPECULATIVE.
     #: The same shape could have promoted a squashed branch, which Hard Rule 3 forbids.
     unjournaled_reads: int = 0
+    #: Target-model turns this branch has asked for whose response is not journaled: still
+    #: streaming, or abandoned before their end. A write staged while one is open would be
+    #: dispatched on a decision that is not on disk, so ``BranchTools.call`` refuses it.
+    unjournaled_turns: int = 0
     #: How many entries of ``read_set`` were copied from the parent at fork time. Everything
     #: after that index is a read *this* branch made, which is what adoption has to hand back:
     #: a confirmed speculation never retires, so a read it made on a guess would otherwise be
@@ -307,6 +311,10 @@ class Branch:
         """
         self.cursor = self.cursor.advance()
         return self.cursor.step_index
+
+    def track_turn(self, delta: int) -> None:
+        """+1 when a target turn is asked for, -1 once its response is journaled."""
+        self.unjournaled_turns += delta
 
     def record_prompt(self, step: int, request_hash: str) -> None:
         """Record a request this branch sent, and whether it was sent on a guess.

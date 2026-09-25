@@ -784,6 +784,7 @@ class StoreBuffer:
                 attempts=result.attempts,
                 error=result.error or "dispatch failed",
                 authorised_by_offset=authorised_by_offset,
+                sent=result.sent,
             )
             outcomes.append((effect.id, EffectOutcome.DEAD_LETTER))
             # Halt rather than skip: the effects after this one were staged on the assumption
@@ -842,6 +843,7 @@ class StoreBuffer:
         attempts: int,
         error: str,
         authorised_by_offset: int,
+        sent: str = "maybe",
     ) -> None:
         await self.journal.settle_dispatch(
             run_id=self.run_id,
@@ -860,6 +862,10 @@ class StoreBuffer:
                 "attempts": attempts,
                 "last_error": {"type": "ToolDispatchError", "message": error},
                 "authorised_by_offset": authorised_by_offset,
+                # "no" only when the request demonstrably never left this process. The claim
+                # table forgets it once the dead letter settles; a resume deciding whether the
+                # decision behind this effect still matters reads it here.
+                "sent": sent,
             },
         )
         self._fail_ack(effect.id, error)

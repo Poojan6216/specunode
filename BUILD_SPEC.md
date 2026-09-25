@@ -1047,6 +1047,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [6.6] DEFECT (fixed): the traceability check read only a results file's values, so the settings a file is keyed by -- latency rungs, accuracy levels -- could not be traced. Keys that are numbers outright count now; digits inside a key's name do not. — 2026-09-23
 [2.5, 0.3] The kill tests now kill at counted points rather than timed ones. `test_kill_resume` dies before each of the clean run's 27 durable journal writes and either side of each of its 2 world mutations -- 31 points, every one a real mid-run kill on every machine, run four at a time in about 11 s -- and resumes each with a model that would decide differently if asked. Each point's outcome is fixed by what the kill left on disk: 24 finish with exactly the effects of the run they continue, 6 stop for a human on a claim with no outcome, 1 (before the first entry) is refused with nothing to resume; 0 duplicate deliveries. Planted bugs -- a resume that sends nothing new, one that re-sends after a lost reply, one that asks the model again -- each fail it at the point that exposes them. The journal kill test arms its killer after a drawn number of appends and asserts every append that returned survived the kill. Fifteen random delays, calibrated three times over, had failed on CI on both sides of the window. — 2026-09-25
 [2.5] DEFECT (fixed), found by the sixth review: a resume asked the model again for a turn the journal already held, whenever the node's branch had not retired -- so a model that answered differently the second time could make a second, different call after a crash that fell after an effect was sent. A resumed node is now served the journaled answer when its question is identical (`RecordedTurns`), journaled again under the resumed branch with `recorded_from`. The condition left is a question that changed across the crash (docs/limitations.md). — 2026-09-25
+[2.5] DEFECTS (fixed), found by the seventh review: (1) a node reading `session.model.stream()` that wrote as a block parsed had the write dispatched before the turn was journaled -- a write on a branch with an unjournaled target turn is now refused (`Branch.unjournaled_turns`, `CallScope.track_turn`; tests/integration/test_writes_wait_for_the_turn.py); (2) serving kept the longest attempt, so after a question changed a second resume charged a third time -- it now matches turn by turn and serves the latest attempt that asked the same questions; (3) serving pinned answers that had sent nothing -- only an attempt that may have sent something is served, and `effect_dead_lettered` records `sent`; (4) serving was one slot on a shared model -- it is per run; (5) the docs overstated; (6) the kill/resume sweep could not see it -- it adds a billing node that asks and charges in one step: 20 points, 13 finish, 6 stop for a human, 1 refused, 11 resumes served the standing decision, 0 duplicates. — 2026-09-25
 [3.3] Four tests settled a guess inside a 15–25 ms block delay, which a journal append on a slow CI disk could miss. Found all at once by running the suite with every append 40 ms slower (`tests/slow_journal.py`); each now holds the settling block until the event it needs has happened, and passes at 40, 100 and 250 ms of added latency. The `slow-disk` CI job runs the tests that guess that way on every push. — 2026-09-25
 ```
 
@@ -1057,16 +1058,16 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**897 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
+**907 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Six independent adversarial reviews have found 92 defects here, 13 of them critical, and
-all 92 are fixed.** The counts, in order, were **23, 17, 13, 24, 9, 6.** That number is the most useful thing in this report, so it is at the top rather
+**Seven independent adversarial reviews have found 98 defects here, 13 of them critical, and
+all 98 are fixed.** The counts, in order, were **23, 17, 13, 24, 9, 6, 6.** That number is the most useful thing in this report, so it is at the top rather
 than buried: the version of this document written a day earlier described a finished project.
-The sixth review (2026-09-25) and the fifth (2026-09-23) are summarised below; the fourth is in
-commit `c8802ec`.
+The seventh and sixth reviews (2026-09-25) and the fifth (2026-09-23) are summarised below; the
+fourth is in commit `c8802ec`.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
 were incomplete, and **two of its four criticals were inside those fixes** — one of them was two
@@ -1185,6 +1186,36 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (4 guesses forked, 4 squashed, 4 charges staged and discarded, the
 alpha gate closed once, 0 wasted tokens — a pattern-index guess costs no model tokens — and 0
 leaks) and 7.8 replay under model drift (both cases diverge at step 0).
+
+### What the seventh review found, in the sixth review's fix and beneath it
+
+One reviewer, given the change that made a resume serve journaled turns, and told to break
+its claims. Six findings, every one reproduced here with the reviewer's script before it was
+fixed.
+
+- **A write could leave before the turn that decided it was journaled.** A node that read
+  `session.model.stream()` itself and wrote as a block parsed parked on the staged write, and
+  the scheduler drained it: the journal read `effect_dispatched` before `model_response`, and a
+  node that stopped reading early never journaled the turn at all. Older than the serving
+  change, and under it: the claim "nothing is dispatched before its turn is journaled" was
+  false on that path. A branch now counts the target turns it has asked for and not yet
+  journaled, and a write on a branch with one open is refused.
+- **After a question changed across one crash, a second crash's resume charged a third time.**
+  Serving kept each position's longest attempt, whose questions the node no longer asked. It now
+  matches the resumed node's questions turn by turn and serves the latest attempt that asked
+  the same ones.
+- **An answer that had sent nothing was pinned forever.** A model that named a tool that does not
+  exist dead-lettered the call, and every resume was served the same answer, the model never
+  asked. Only an attempt that may have sent something is served now; a dead letter records
+  whether its request left.
+- Serving lived in one slot on a model object that runs share, so a fresh run on another
+  scheduler switched off a resume in flight; it is kept per run.
+- The documentation overstated: serving does not apply on the LangGraph path, a call's arguments
+  can change without its question changing, and an idempotent tool may be handed the same call
+  twice.
+- The kill/resume sweep could not see any of it: in the support agent the node that asks sends
+  nothing and the node that sends asks nothing. It now also runs a node that asks and charges in
+  one step.
 
 ### What the sixth review found, in the changes made to get CI green
 
