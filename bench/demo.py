@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -737,15 +738,30 @@ async def demo_replay(as_json: bool = False) -> int:
         clean_dir = base / "clean"
         clean_dir.mkdir()
         clean_run = "01DEMO3CLEANAAAAAAAAAAAAAA"
-        work_ms = _work_ms(_helper(clean_dir, clean_run, -1)[1])
+        # The kill window is the fastest of a few runs, not the first: the first run on a cold
+        # machine is the slowest, and a delay drawn from it landed after the end of a faster
+        # run on CI, so the demo killed nothing and said so.
+        timings = [_work_ms(_helper(clean_dir, clean_run, -1)[1])]
+        for warm in range(2):
+            warm_dir = base / f"warm-{warm}"
+            warm_dir.mkdir()
+            timings.append(_work_ms(_helper(warm_dir, f"01DEMO3WARM{warm:015d}", -1)[1]))
+        work_ms = min(timings)
         clean = _delivered(clean_dir)
 
-        # 2. Killed mid-branch with SIGKILL, then resumed from the journal.
+        # 2. Killed mid-branch with SIGKILL, then resumed from the journal. A delay that still
+        # lands after the run has finished is drawn again, earlier, and the attempts are
+        # reported: a kill demo that killed nothing would mean none of what it prints.
         kill_dir = base / "killed"
-        kill_dir.mkdir()
-        kill_run = "01DEMO3KILLEDAAAAAAAAAAAAA"
-        delay_ms = random.Random(KILL_SEED).uniform(work_ms * 0.15, work_ms * 0.85)
-        was_killed = _helper(kill_dir, kill_run, delay_ms)[0] != 0
+        rng = random.Random(KILL_SEED)
+        was_killed, attempts, delay_ms = False, 0, 0.0
+        while not was_killed and attempts < 5:
+            attempts += 1
+            shutil.rmtree(kill_dir, ignore_errors=True)
+            kill_dir.mkdir()
+            kill_run = "01DEMO3KILLEDAAAAAAAAAAAAA"
+            delay_ms = rng.uniform(work_ms * 0.15, work_ms * 0.85) / attempts
+            was_killed = _helper(kill_dir, kill_run, delay_ms)[0] != 0
         _helper(kill_dir, kill_run, -1, resume=True)
         resumed = _delivered(kill_dir)
         chain_ok = Journal(kill_dir / "journal.db").verify_chain(kill_run).ok
@@ -771,6 +787,7 @@ async def demo_replay(as_json: bool = False) -> int:
                     "demo": "replay",
                     "work_ms": round(work_ms, 1),
                     "kill_delay_ms": round(delay_ms, 1),
+                    "kill_attempts": attempts,
                     "process_was_killed": was_killed,
                     "clean_effects": [tool for tool, _ in clean],
                     "resumed_effects": [tool for tool, _ in resumed],
@@ -790,7 +807,10 @@ async def demo_replay(as_json: bool = False) -> int:
 
     print()
     print("DEMO 3 — killed, resumed, and refused when the question changes")
-    print(f"  the run's work takes {work_ms:.0f}ms; SIGKILL sent {delay_ms:.0f}ms in.")
+    print(
+        f"  the run's work takes {work_ms:.0f}ms; SIGKILL sent {delay_ms:.0f}ms in"
+        + (f" (attempt {attempts})." if attempts > 1 else ".")
+    )
     print(f"  the process was actually killed: {was_killed}")
     print()
     print("  1. kill and resume")

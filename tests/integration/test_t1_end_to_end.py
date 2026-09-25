@@ -77,10 +77,12 @@ def build(tmp_path: Path, world: World, *, db: str) -> tuple[Scheduler, Journal,
     journal = Journal(tmp_path / db)
     # A delay between blocks so block 1's early-issued read has finished by the time the
     # drafter is asked after block 2. Without it the result the prediction needs may not exist
-    # yet, and the test would be measuring a race rather than the predictor.
+    # yet, and the test would be measuring a race rather than the predictor. 25 ms was enough
+    # on a laptop and is not on a CI runner, whose journal fsyncs are slower; the margin is for
+    # the machine, not the runtime.
     model = ScriptedModel(
         turns=[tool_turn(*[(c.name, dict(c.args)) for c in TRACE], turn=0)],
-        block_delay_ms=25.0,
+        block_delay_ms=250.0,
     )
     scheduler = Scheduler(
         graph=OneTurnGraph(),  # type: ignore[arg-type]
@@ -210,7 +212,12 @@ async def test_a_confirmed_prediction_of_a_write_reaches_the_world_exactly_once(
         target=JournaledModel(
             ScriptedModel(
                 turns=[tool_turn(*[(c.name, dict(c.args)) for c in write_trace], turn=0)],
-                block_delay_ms=25.0,
+                # The drafter asked after the second block fills ``job_id`` from the first
+                # read's result, so that read must be back by then. At 25 ms it was on a laptop
+                # and was not on a CI runner, whose journal fsyncs are slower: no restart_job
+                # was offered, and a later guess forked instead. The margin is for the
+                # machine, not the runtime.
+                block_delay_ms=250.0,
             ),
             journal,
             provider="scripted",
