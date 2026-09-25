@@ -13,14 +13,27 @@ leaving no trace in the world is the claim.
 
 from __future__ import annotations
 
+import asyncio
+import time
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
+from specunode.canonical import chash
 from specunode.core.decision import Decision, ToolCall
 from specunode.core.effects import EffectClass, ToolRegistry, ToolSpec
 from specunode.core.graph import END, AdapterCapabilities, NextNode, NodeRef, RunSession
-from specunode.core.model import JournaledModel, Message, RequestEnvelope, TextBlock
+from specunode.core.model import (
+    JournaledModel,
+    Message,
+    ModelClient,
+    ModelResponse,
+    RequestEnvelope,
+    StreamEvent,
+    TextBlock,
+    ToolUseComplete,
+)
 from specunode.core.policy import Policy
 from specunode.core.scheduler import Scheduler
 from specunode.drafters.base import DraftContext, Prediction
@@ -56,6 +69,44 @@ class FixedDrafter:
         if self.calls > self.limit:
             return []
         return [Prediction(decision=self._decision, tier=1, score=0.9)]
+
+
+class HeldSecondBlock:
+    """A model that holds its second block back until ``ready()`` says the test may go on.
+
+    A guess is made after one block and settled by the next, so what it had done by then --
+    staged its write, made its read -- was decided by a block delay of 15 or 25 ms. Each of
+    those steps waits on a journal append first, and on a CI runner with a slow disk one did
+    not land in time: the guess was squashed having done nothing, and a test that exists to
+    watch a staged write be thrown away found nothing thrown away. A model is allowed to be
+    slower than that, so holding the block is a real interleaving -- and now the one these
+    tests run on every machine rather than on a fast one.
+
+    It gives up after ``patience_s`` rather than hang, and leaves the test's own assertion to
+    say what never happened.
+    """
+
+    def __init__(
+        self, inner: ModelClient, ready: Callable[[], bool], *, patience_s: float = 10.0
+    ) -> None:
+        self.inner = inner
+        self.ready = ready
+        self.patience_s = patience_s
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        return await self.inner.complete(envelope)
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        blocks = 0
+        async for event in self.inner.stream(envelope):
+            if isinstance(event, ToolUseComplete):
+                blocks += 1
+                if blocks == 2:
+                    deadline = time.monotonic() + self.patience_s
+                    # Polled: ``ready`` reads scheduler and world state that no event announces.
+                    while not self.ready() and time.monotonic() < deadline:  # noqa: ASYNC110
+                        await asyncio.sleep(0.001)
+            yield event
 
 
 def registry_for(world: World) -> ToolRegistry:
@@ -110,13 +161,26 @@ class OneTurnGraph:
         raise NotImplementedError
 
 
+def guess_staged(scheduler: Scheduler, world: World) -> bool:
+    """The guess has staged its write, durably: ``stage`` returned. TURN's first block is a read."""
+    return scheduler.counters.effects_staged > 0
+
+
 def build(
-    tmp_path: Path, drafter: object | None, *, db: str = "journal.db"
+    tmp_path: Path,
+    drafter: object | None,
+    *,
+    db: str = "journal.db",
+    hold_until: Callable[[Scheduler, World], bool] | None = None,
 ) -> tuple[Scheduler, World, Journal, str]:
+    """``hold_until``: the model does not settle the guess until it holds (``HeldSecondBlock``)."""
     world = standard_world()
     registry = registry_for(world)
     journal = Journal(tmp_path / db)
-    model = ScriptedModel(turns=[tool_turn(*TURN, turn=0)], block_delay_ms=15.0)
+    model: ModelClient = ScriptedModel(turns=[tool_turn(*TURN, turn=0)], block_delay_ms=15.0)
+    if hold_until is not None:
+        wait_for = hold_until
+        model = HeldSecondBlock(model, lambda: wait_for(scheduler, world))
     scheduler = Scheduler(
         graph=OneTurnGraph(),  # type: ignore[arg-type]
         registry=registry,
@@ -147,12 +211,15 @@ async def test_a_correct_prediction_is_adopted_rather_than_run_twice(tmp_path: P
 async def test_a_wrong_prediction_leaves_nothing_in_the_world(tmp_path: Path) -> None:
     """The claim. A guessed write is staged, and a squashed branch's buffer is discarded unsent."""
     drafter = FixedDrafter(ToolCall("charge_card", {"customer_id": "cus-1", "amount": 99.0}))
-    scheduler, world, journal, run_id = build(tmp_path, drafter)
+    scheduler, world, journal, run_id = build(tmp_path, drafter, hold_until=guess_staged)
     result = await scheduler.run(run_id, {})
     assert result.ok, result.error
 
     turn = scheduler._turns[0]
     assert turn.squashed >= 1, "the drafter's wrong guess was never squashed"
+    # Staged and then thrown away, not squashed before it staged anything: the second half of
+    # the claim is only tested if there was something in the buffer to hold back.
+    assert scheduler.counters.effects_discarded == 1, scheduler.counters.effects_discarded
     assert world.mutations_by("charge_card") == [], (
         "a charge the model never asked for reached the world"
     )
@@ -171,7 +238,7 @@ async def test_a_squashed_branchs_staged_effects_are_journaled_as_discarded(
 ) -> None:
     """Discarded, and counted -- the ledger has to be able to say what was thrown away."""
     drafter = FixedDrafter(ToolCall("charge_card", {"customer_id": "cus-1", "amount": 99.0}))
-    scheduler, _world, journal, run_id = build(tmp_path, drafter)
+    scheduler, _world, journal, run_id = build(tmp_path, drafter, hold_until=guess_staged)
     await scheduler.run(run_id, {})
 
     discards = list(journal.read(run_id, kinds=["effect_discarded"]))
@@ -188,14 +255,26 @@ async def test_a_squashed_branchs_staged_effects_are_journaled_as_discarded(
 async def test_a_speculative_read_that_was_squashed_still_counts_as_spent(
     tmp_path: Path,
 ) -> None:
-    """Attack 7.2: a wrong guess costs whatever its reads cost, and the ledger says so."""
-    drafter = FixedDrafter(ToolCall("get_pipeline_status", {"pipeline_id": "etl-99"}))
-    scheduler, world, _journal, run_id = build(tmp_path, drafter)
-    await scheduler.run(run_id, {})
+    """Attack 7.2: a wrong guess costs whatever its reads cost, and the ledger says so.
 
-    squashed_reads = [r for r in world.reads if r.args_hash and r.speculative]
-    assert squashed_reads, "the speculation made no upstream read, so nothing was risked"
-    assert scheduler.counters.speculative_reads_upstream > 0
+    The guessed read is picked out by its arguments. This used to accept any speculative read
+    in the world, and the first block's early-issued read is one -- so it passed whether or
+    not the guess ever read anything, and on a slow disk the guess was squashed before it did.
+    """
+    from specunode.journal.ledger import build_ledger
+
+    drafter = FixedDrafter(ToolCall("get_pipeline_status", {"pipeline_id": "etl-99"}))
+    scheduler, world, journal, run_id = build(
+        tmp_path, drafter, hold_until=lambda s, _: s.budget.speculative_reads_used > 0
+    )
+    result = await scheduler.run(run_id, {})
+    assert result.ok, result.error
+
+    guessed = [r for r in world.reads if r.args_hash == chash({"pipeline_id": "etl-99"})]
+    assert len(guessed) == 1, "the guess made no upstream read, so nothing was risked"
+    assert guessed[0].speculative, "the world was not told the guessed read was speculative"
+    assert scheduler._turns[0].squashed == 1, "the guess was right, so nothing was wasted"
+    assert build_ledger(journal, run_id).speculative_reads_charged == 1
 
 
 async def test_speculation_is_off_when_the_policy_says_so(tmp_path: Path) -> None:

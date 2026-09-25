@@ -40,7 +40,7 @@ from bench.workloads import WORKLOADS, Workload
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
 from specunode.core.decision import ToolCall
-from specunode.core.model import JournaledModel
+from specunode.core.model import JournaledModel, ModelClient
 from specunode.core.policy import Policy
 from specunode.core.scheduler import RunResult, Scheduler
 from specunode.drafters.base import DraftContext, Drafter, Prediction
@@ -188,17 +188,28 @@ async def test_the_tier_1_arm_was_really_consulted(tmp_path: Path, workload: Wor
         Tier 1 genuinely predicting, being confirmed, and being squashed is covered by
         ``tests/integration/test_t1_end_to_end.py``, on a turn that emits several calls.
     """
+    from tests.integration.test_speculation import HeldSecondBlock
+
     world = standard_world()
     adapter, registry = workload.make(world)
     journal = Journal(tmp_path / f"{workload.name}-consulted.db")
     drafter = CountingDrafter(PatternDrafter(index=_index_for(workload)))
+    model: ModelClient = workload.model()
+    if workload.tier_1_can_predict:
+        # The drafter fills the guess after block 2 from block 1's result, so block 2 waits
+        # until that result is in hand. The workload's 25 ms block delay decided it before;
+        # on a slow CI disk the read's journal append lost, the drafter could not fill the
+        # argument, and it declined -- a run that never tried to guess right.
+        model = HeldSecondBlock(
+            model, lambda: bool(scheduler._turns) and bool(scheduler._turns[-1].completed_at)
+        )
     scheduler = Scheduler(
         graph=adapter,
         registry=registry,
         journal=journal,
         buffer=StoreBuffer(journal=journal, run_id=""),
         dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
-        target=JournaledModel(workload.model(), journal, provider="scripted"),
+        target=JournaledModel(model, journal, provider="scripted"),
         policy=Policy(speculation=True),
         predictor=drafter,  # type: ignore[arg-type]
     )
@@ -319,7 +330,13 @@ async def test_the_relation_holds_when_the_speculation_was_actually_wrong(
     a read, or offers nothing at all when it cannot fill the arguments, and in both cases the
     buffer is never asked to hold anything and the run is as vacuous as the ones above.
     """
-    from tests.integration.test_speculation import FixedDrafter, OneTurnGraph, registry_for
+    from tests.integration.test_speculation import (
+        FixedDrafter,
+        HeldSecondBlock,
+        OneTurnGraph,
+        guess_staged,
+        registry_for,
+    )
 
     turn = (
         ("fetch_runbook", {"section": "restart"}),
@@ -332,17 +349,18 @@ async def test_the_relation_holds_when_the_speculation_was_actually_wrong(
         world = standard_world()
         registry = registry_for(world)
         journal = Journal(tmp_path / db)
+        model: ModelClient = ScriptedModel(turns=[tool_turn(*turn, turn=0)], block_delay_ms=25.0)
+        if speculation:
+            # The model does not contradict the guess until the guess has staged its write. A
+            # 25 ms block delay decided that before, and on a slow CI disk it lost the race.
+            model = HeldSecondBlock(model, lambda: guess_staged(scheduler, world))
         scheduler = Scheduler(
             graph=OneTurnGraph(),  # type: ignore[arg-type]
             registry=registry,
             journal=journal,
             buffer=StoreBuffer(journal=journal, run_id=""),
             dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
-            target=JournaledModel(
-                ScriptedModel(turns=[tool_turn(*turn, turn=0)], block_delay_ms=25.0),
-                journal,
-                provider="scripted",
-            ),
+            target=JournaledModel(model, journal, provider="scripted"),
             policy=Policy(speculation=speculation),
             predictor=FixedDrafter(mispredicted) if speculation else None,
         )

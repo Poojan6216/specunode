@@ -74,6 +74,32 @@ jobs:
             exit 1
           fi
 
+  slow-disk:
+    # The tests that guess, with every journal append 40 ms slower, the way a loaded runner's
+    # disk is. A test that passes only because an append landed inside a block delay fails
+    # here on every run, instead of in the matrix above on one run in twenty.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --extra anthropic --extra langgraph --extra mcp --extra bench --dev --python 3.12
+      - name: pytest, with a slow journal
+        env:
+          SPECUNODE_SLOW_JOURNAL_MS: "40"
+        run: |
+          uv run --python 3.12 pytest -q --timeout=600 -p tests.slow_journal \
+            tests/integration/test_speculation.py \
+            tests/integration/test_budget.py \
+            tests/integration/test_adoption.py \
+            tests/integration/test_stale_read.py \
+            tests/integration/test_t1_end_to_end.py \
+            tests/test_equivalence.py \
+            tests/test_leak.py \
+            tests/test_context_equivalence.py
+
   honesty:
     # Hard Rule 12: no number that was not measured; no absolute claim without its condition.
     runs-on: ubuntu-latest

@@ -1054,7 +1054,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**887 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
+**889 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
@@ -1465,7 +1465,12 @@ accept that the clause holds only for clients that report node ids.
 3. **Done, 2026-09-25: CI runs.** The repository is public at
    https://github.com/Poojan6216/specunode. Its first run failed every test job on causes no
    local run could show -- a test reading a file that is never committed, and three kill tests
-   whose timing assumed a laptop -- all fixed; every job has passed since.
+   whose timing assumed a laptop -- all fixed. Later runs found two more one at a time: a demo
+   that handed a resumed run the wrong turn, and a guess that had to stage its write within
+   25 ms. Rather than wait for the next, the whole suite was run with every journal append
+   made 40 ms slower (`tests/slow_journal.py`), which found every test of that kind at once:
+   four, each of which now waits on the event it needs instead of on the clock. The `slow-disk`
+   CI job keeps it that way.
 4. **Decide Phase Gate 4's ledger clause**, as above.
 
 Decision Gate D1 did **not** fire: the corpus was fetched from Hugging Face, so the opportunity

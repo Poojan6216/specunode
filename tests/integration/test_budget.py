@@ -21,7 +21,13 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
-from tests.integration.test_speculation import TURN, FixedDrafter, OneTurnGraph, registry_for
+from tests.integration.test_speculation import (
+    TURN,
+    FixedDrafter,
+    HeldSecondBlock,
+    OneTurnGraph,
+    registry_for,
+)
 
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
@@ -318,7 +324,13 @@ async def test_an_open_guess_is_counted_in_flight_until_it_resolves(tmp_path: Pa
         buffer=StoreBuffer(journal=journal, run_id=""),
         dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
         target=JournaledModel(
-            ScriptedModel(turns=[tool_turn(*TURN, turn=0)], block_delay_ms=15.0),
+            # The block that confirms the guess waits for the release. A 15 ms block delay
+            # decided it before, and on a slow CI disk the guess was confirmed -- and no longer
+            # open -- before its read had even started.
+            HeldSecondBlock(
+                ScriptedModel(turns=[tool_turn(*TURN, turn=0)], block_delay_ms=15.0),
+                blocking.release.is_set,
+            ),
             journal,
             provider="scripted",
         ),
