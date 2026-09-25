@@ -120,6 +120,21 @@ async def test_an_exception_the_tool_did_not_classify_is_a_lost_reply_too(tmp_pa
     assert gateway.taken == ["cus-1 25.0"]
 
 
+async def test_a_failure_the_tool_described_oddly_is_not_retried(tmp_path: Path) -> None:
+    """Only a plain "no" makes a retry safe; anything else may have landed."""
+
+    class Odd(Gateway):
+        async def charge(self, customer_id: str, amount: float) -> JsonValue:
+            self.taken.append(f"{customer_id} {amount}")
+            raise ToolDispatchError("unclear", sent="yes")  # type: ignore[arg-type]
+
+    gateway = Odd()
+    result, journal = await run(tmp_path, gateway)
+    assert not result.ok
+    assert gateway.taken == ["cus-1 25.0"]
+    assert [letter["sent"] for letter in dead_letters(journal)] == ["maybe"]
+
+
 async def test_a_failure_before_anything_left_is_retried(tmp_path: Path) -> None:
     gateway = Gateway("down", "ok")
     result, _journal = await run(tmp_path, gateway)
@@ -182,13 +197,15 @@ async def test_an_operator_settles_a_dead_letter_and_the_resume_goes_on(tmp_path
     assert not again.ok, "a resume sent, or skipped, a charge nobody had checked"
     assert gateway.taken == ["cus-1 25.0"]
 
-    [row] = build_ledger(journal, RUN).rows[:1]
+    # Two dead letters, one from the run and one from the resume, and one effect.
+    [row] = build_ledger(journal, RUN).rows
+    assert row.status == "DEAD_LETTER"
     cli = CliRunner().invoke(
         app,
         [
             "resolve",
             RUN,
-            row.nkey[:12],
+            row.key[:8],  # the key as `specunode ledger` prints it
             "--landed",
             "--ack",
             '{"charge_id": "ch_1"}',
@@ -219,7 +236,7 @@ async def test_an_operator_who_finds_nothing_landed_has_the_resume_send_it(
 
     [row] = build_ledger(journal, RUN).rows
     cli = CliRunner().invoke(
-        app, ["resolve", RUN, row.nkey, "--not-sent", "--journal", str(tmp_path / "journal.db")]
+        app, ["resolve", RUN, row.key[:8], "--not-sent", "--journal", str(tmp_path / "journal.db")]
     )
     assert cli.exit_code == 0, cli.output
     finished = await scheduler(journal, gateway, idempotent=False, reconcile=False).resume(RUN)

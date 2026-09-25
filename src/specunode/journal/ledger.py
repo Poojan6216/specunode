@@ -671,9 +671,14 @@ def _rows(
     # is one effect with one outcome, the later one. Keyed by the dedupe key, not the effect id:
     # each resume stages the effect afresh under a new id, and the key is what makes it the
     # same effect.
+    # And a resume that dead-letters it again does not make it two effects: the latest dead
+    # letter for a key is the one that stands.
     sent = {_as_str(payload, "nkey") for _entry, payload in dispatched}
+    latest: dict[str, tuple[Entry, Mapping[str, JsonValue]]] = {}
     for entry, payload in dead_lettered:
-        if _as_str(payload, "nkey") in sent:
+        latest[_as_str(payload, "nkey") or _as_str(payload, "effect_id")] = (entry, payload)
+    for key, (entry, payload) in latest.items():
+        if key in sent:
             continue
         rows.append(_row(state, entry, payload, retire_seq, "DEAD_LETTER", None))
     # A compensated effect's own row says so: the original reached the world and was later

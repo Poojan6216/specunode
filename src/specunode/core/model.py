@@ -520,6 +520,20 @@ class CallScope:
 
 call_scope: ContextVar[CallScope | None] = ContextVar("specunode_call_scope", default=None)
 
+#: True while the runtime reads a stream on a node's behalf (``call_turn``): if it fails, the
+#: node is handed none of it, so the turn is closed rather than left open to refuse its writes.
+_partial_discarded: ContextVar[bool] = ContextVar("specunode_partial_discarded", default=False)
+
+
+@contextmanager
+def partial_turns_discarded() -> Iterator[None]:
+    """Streams read inside this block hand a failed turn's blocks to nobody."""
+    token = _partial_discarded.set(True)
+    try:
+        yield
+    finally:
+        _partial_discarded.reset(token)
+
 
 def current_scope() -> CallScope:
     scope = call_scope.get()
@@ -757,9 +771,11 @@ class JournaledModel:
                 handed_over = True
                 yield event
         except BaseException:
-            # A turn that failed before the caller saw any of it left nothing to act on. One
-            # the caller stopped reading part-way stays open: it may act on what it saw.
-            if track is not None and not handed_over:
+            # A turn that failed before the caller saw any of it left nothing to act on, and
+            # neither did one read by call_turn, which hands a failed turn to nobody. One a
+            # node read itself and stopped reading part-way stays open: it may act on what it
+            # saw.
+            if track is not None and (not handed_over or _partial_discarded.get()):
                 track(-1)
             raise
 

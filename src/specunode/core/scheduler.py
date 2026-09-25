@@ -53,6 +53,7 @@ from specunode.core.model import (
     TurnComplete,
     TurnResults,
     call_scope,
+    partial_turns_discarded,
 )
 from specunode.core.policy import Budget, Policy
 from specunode.core.state import (
@@ -1754,6 +1755,9 @@ class SpeculativeTurn:
         #: Slot tasks whose work was adopted from a confirmed speculation. They may be parked
         #: on an ack this branch has to drain, which an ordinary slot task never is.
         self._adopted_tasks: set[asyncio.Task[JsonValue]] = set()
+        #: Guesses the model confirmed during this turn. Their writes join this branch only once
+        #: the turn is journaled; a turn that fails discards them instead.
+        self._confirmed: list[Branch] = []
         self._history: list[ToolCall] = []
         self._results_so_far: list[JsonValue] = []
         self._predicted: ToolCall | None = None
@@ -1780,10 +1784,6 @@ class SpeculativeTurn:
         # structural: a result never appends on completion, because the order the model asked
         # for its calls is the order it must be shown them in (Hard Rule 13).
         slots: list[asyncio.Task[JsonValue] | None] = []
-        # What the branch held, and how many of its turns were open, before this one began:
-        # a failed turn gives back everything it added to either.
-        held_before = {effect.id for effect in scheduler.buffer.pending(branch.id)}
-        open_before = branch.unjournaled_turns
 
         try:
             await self._consume(envelope, tools, slots)
@@ -1796,23 +1796,17 @@ class SpeculativeTurn:
             # the three ways branch.py says every branch ends.
             await self._squash_open("turn_failed")
             await self._abandon(slots)
-            # A guess the model confirmed before the stream failed was adopted, and its write
-            # moved onto this branch. The turn that confirmed it never became durable, so that
-            # write is discarded: a node that caught the failure and finished drained it, and
-            # sent an effect whose decision was never on disk.
-            adopted = [
-                effect.id
-                for effect in scheduler.buffer.pending(branch.id)
-                if effect.id not in held_before
-            ]
-            scheduler.counters.effects_discarded += await scheduler.buffer.discard_effects(
-                branch, adopted, "turn_failed"
-            )
-            # Nothing of the failed turn reached the node -- call_turn raises instead of
-            # returning -- so it is not left open: a node that retries, or asks with complete(),
-            # and then writes on the answer it was given, is not refused for this one.
-            branch.unjournaled_turns = open_before
+            # A guess the model confirmed before the stream failed was confirmed by a turn that
+            # never became durable, so what it staged is discarded, unsent. It was adopted
+            # mid-stream once, and a node that caught the failure and finished sent it.
+            for child in self._confirmed:
+                scheduler.counters.effects_discarded += await scheduler.buffer.discard_and_journal(
+                    child, "turn_failed"
+                )
             raise
+        # The turn is journaled: what the guesses it confirmed staged becomes this branch's.
+        for child in self._confirmed:
+            await scheduler.buffer.adopt(child, branch)
 
         # Any speculation still open when the turn ended predicted a call the model never made.
         await self._squash_open("turn_ended")
@@ -1847,6 +1841,17 @@ class SpeculativeTurn:
             await asyncio.gather(*pending, return_exceptions=True)
 
     async def _consume(
+        self,
+        envelope: RequestEnvelope,
+        tools: BranchTools,
+        slots: list[asyncio.Task[JsonValue] | None],
+    ) -> None:
+        # call_turn reads the stream for the node and raises if it fails, so no part of a
+        # failed turn reaches the node: the turn is closed, not left open to refuse its writes.
+        with partial_turns_discarded():
+            await self._read(envelope, tools, slots)
+
+    async def _read(
         self,
         envelope: RequestEnvelope,
         tools: BranchTools,
@@ -1965,7 +1970,14 @@ class SpeculativeTurn:
             decision,
             spec,
             scheduler.policy,
-            staged_keys=scheduler.buffer.staged_keys(child),
+            # What is staged in the child's lineage, plus every write the model has already
+            # emitted in this turn: those are staged only once the turn is journaled -- a
+            # confirmed guess's included -- and a guess that reads after one of them would
+            # read the value from before it.
+            staged_keys=(
+                *scheduler.buffer.staged_keys(child),
+                *self._pending_write_keys,
+            ),
             budget=scheduler.budget,
         )
         if hazard is not None:
@@ -2037,7 +2049,12 @@ class SpeculativeTurn:
         it on -- and the effect would be delivered twice. Hard Rule 9 sees it as a ledger
         mismatch; Hard Rule 8 is what it actually breaks.
         """
-        return await tools.call(decision.name, decision.args, step=step)
+        return await tools.call(
+            decision.name,
+            decision.args,
+            step=step,
+            pending_writes=tuple(self._pending_write_keys),
+        )
 
     async def _resolve_prediction(self, actual: ToolCall) -> None:
         """The model just said what it actually wants. Compare, and keep or throw away."""
@@ -2069,7 +2086,13 @@ class SpeculativeTurn:
             # speculation ran, and the end of the turn sets the cursor past it. An advance here
             # used to compensate for the child taking two positions for one call, and the two
             # errors cancelled only by coincidence.
-            await scheduler.buffer.adopt(child, self._branch)
+            #
+            # Not now, though: when the turn is journaled (``run``). Moved here, mid-stream, the
+            # write sat on a branch any drain could send it from -- one woken by another task of
+            # the same node parking on its own write -- before the turn that confirmed it was on
+            # disk; and if the stream then failed, it had already gone. Until the turn ends it
+            # stays on the child, which nothing drains.
+            self._confirmed.append(child)
             # Deliberately no park signal here. Waking the scheduler at this point drains a
             # buffer that holds the adopted effect and nothing else -- the writes from blocks
             # the model emitted *earlier* are staged after the stream ends, so they are not

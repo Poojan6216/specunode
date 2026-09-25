@@ -134,7 +134,9 @@ class Dispatcher:
                 )
             except ToolDispatchError as exc:
                 last_error, retriable = str(exc), exc.retriable
-                maybe_sent = maybe_sent or exc.sent == "maybe"
+                # Anything but a plain "no" may have landed -- fail safe on a value the tool
+                # got wrong, rather than retrying a write because it did not say "maybe".
+                maybe_sent = maybe_sent or exc.sent != "no"
             except asyncio.CancelledError:
                 # A drain is never speculative, so a cancellation here is the process going
                 # away rather than a squash. Do not swallow it.

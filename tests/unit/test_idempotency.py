@@ -305,6 +305,57 @@ async def test_an_operator_who_says_it_landed_lets_a_resume_skip_it(tmp_path: Pa
         journal.resolve_dispatch("01RUN", "nk-1", landed=False)
 
 
+@pytest.mark.parametrize("how", ["dead_letter", "resolved", "w3"])
+async def test_a_retry_is_rearmed_before_it_is_sent(tmp_path: Path, how: str) -> None:
+    """A claim whose last attempt never left is retried -- and marked in flight again first.
+
+    Left marked "never sent", a crash after the upstream took the retry made the next resume
+    send it once more: a charge twice, reachable from the documented remedy (heal the upstream
+    and resume), from ``resolve --not-sent``, and from crash window W3."""
+    journal = Journal(tmp_path / "j.db")
+    if how == "w3":
+        await journal.claim_dispatch(pending())
+        await journal.mark_not_sent("01RUN", "nk-1", 1)
+    elif how == "resolved":
+        await dead_letter(journal, sent="maybe")
+        journal.resolve_dispatch("01RUN", "nk-1", landed=False)
+    else:
+        await dead_letter(journal, sent="no")
+
+    retry = await journal.claim_dispatch(pending(attempt=6))
+    assert retry.outcome is Claim.RETRY_SAFE
+    # The process sending the retry dies before it hears back. The next one cannot tell.
+    after_the_crash = await journal.claim_dispatch(pending(attempt=7))
+    assert after_the_crash.outcome is Claim.AMBIGUOUS
+
+
+async def test_a_claim_settled_as_sent_is_never_settled_again(tmp_path: Path) -> None:
+    """A second outcome would contradict the first -- an operator's, or the process that sent it."""
+    journal = Journal(tmp_path / "j.db")
+    await dead_letter(journal, sent="maybe")
+    journal.resolve_dispatch("01RUN", "nk-1", landed=True, ack={"charge_id": "ch_1"})
+    with pytest.raises(JournalWriteError, match="still open to settle"):
+        await journal.settle_dispatch(
+            run_id="01RUN",
+            nkey="nk-1",
+            status="dead_letter",
+            ack=None,
+            attempt=7,
+            kind="effect_dead_lettered",
+            payload={
+                "v": 1,
+                "effect_id": "ef-nk-1",
+                "branch_id": "br-1",
+                "nkey": "nk-1",
+                "attempts": 1,
+                "last_error": {"type": "Late", "message": "a process still running"},
+                "sent": "maybe",
+            },
+        )
+    [claim] = [e.payload for e in journal.read("01RUN", kinds=["effect_dispatched"])]
+    assert claim["resolved_by"] == "operator"
+
+
 async def test_unresolved_dispatches_are_the_resume_reconciliation_list(tmp_path: Path) -> None:
     journal = Journal(tmp_path / "j.db")
     await journal.claim_dispatch(pending(nkey="nk-1"))

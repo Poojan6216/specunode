@@ -19,6 +19,7 @@ from tests.integration.test_speculation import FixedDrafter, registry_for
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
 from specunode.core.decision import Decision, ToolCall
+from specunode.core.effects import EffectClass, ToolSpec
 from specunode.core.graph import END, AdapterCapabilities, NextNode, NodeRef, RunSession
 from specunode.core.model import (
     JournaledModel,
@@ -151,3 +152,67 @@ async def test_a_node_that_asks_again_after_a_failed_turn_can_write(tmp_path: ob
     result, world, _journal = await run(tmp_path, ask_again, guess=False)
     assert result.ok, result.error
     assert [m.tool for m in world.mutations] == ["restart_job"]
+
+
+async def test_another_tasks_drain_does_not_send_a_guess_whose_turn_is_streaming(
+    tmp_path: object,
+) -> None:
+    """The node sends a note from another task while a turn streams. The model confirms a guess,
+    and the note's drain -- which reads the branch's buffer live -- sent the guessed restart
+    too, before the turn was journaled; then the turn failed, and it was out. A confirmed
+    guess's write joins the branch only once the turn is journaled."""
+    world = standard_world()
+    registry = registry_for(world)
+    registry.register(ToolSpec(name="send_note", effect=EffectClass.WRITE, fn=world.post_summary))
+    journal = Journal(tmp_path / "journal.db")  # type: ignore[operator]
+    scheduler: Scheduler | None = None
+
+    class ConfirmsThenFails:
+        async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+            raise NotImplementedError
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            yield ToolUseComplete(
+                index=0,
+                block=ToolUseBlock(id="t0", name="fetch_runbook", args={"section": "restart"}),
+            )
+            deadline = time.monotonic() + 10.0
+            # The note and the guess are both staged before the model confirms the guess.
+            while (  # noqa: ASYNC110
+                scheduler is None or scheduler.counters.effects_staged < 2
+            ) and time.monotonic() < deadline:
+                await asyncio.sleep(0.001)
+            yield ToolUseComplete(
+                index=1, block=ToolUseBlock(id="t1", name=RESTART.name, args=dict(RESTART.args))
+            )
+            # Long enough for the note's drain to run, and send the guess if it can.
+            deadline = time.monotonic() + 0.3
+            while not world.mutations_by("post_summary") and time.monotonic() < deadline:  # noqa: ASYNC110
+                await asyncio.sleep(0.001)
+            await asyncio.sleep(0.05)
+            raise ModelError("overloaded_error (mid-stream)")
+
+    async def note_while_streaming(session: RunSession) -> None:
+        note = asyncio.create_task(
+            session.call_tool("send_note", {"channel": "ops", "text": "on it"})
+        )
+        await asyncio.sleep(0)
+        with contextlib.suppress(ModelError):
+            await session.call_turn(ASK)  # type: ignore[misc]
+        await note
+
+    scheduler = Scheduler(
+        graph=OneNode(note_while_streaming),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(ConfirmsThenFails(), journal),
+        policy=Policy(speculation=True),
+        predictor=FixedDrafter(RESTART),  # type: ignore[arg-type]
+    )
+    result = await scheduler.run(new_ulid(), {})
+    assert result.ok, result.error
+    assert [m.tool for m in world.mutations] == ["post_summary"], "the guessed restart went out"
+    reasons = [e.payload["reason"] for e in journal.read(result.run_id, kinds=["effect_discarded"])]
+    assert "turn_failed" in reasons

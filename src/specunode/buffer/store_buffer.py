@@ -26,7 +26,6 @@ a handle could never normalise equal to the sequential run's row showing the rea
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Collection
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TypeAlias
@@ -492,39 +491,6 @@ class StoreBuffer:
         """Discard, and return exactly the effects that were dropped."""
         self.discard(branch)
         return self._last_discarded
-
-    async def discard_effects(
-        self, branch: Branch, effect_ids: Collection[str], reason: str
-    ) -> int:
-        """Drop the named effects of one branch, unsent, and journal exactly which.
-
-        For a turn that failed after a guess it confirmed was adopted: the guessed write was
-        authorised by a turn that never became durable, so it must not go out, while the node
-        -- which may catch the failure and carry on -- keeps everything else it staged. Never
-        dispatches.
-        """
-        staged = self._staged.get(branch.id, [])
-        dropped = [effect for effect in staged if effect.id in effect_ids]
-        if not dropped:
-            return 0
-        self._staged[branch.id] = [effect for effect in staged if effect.id not in effect_ids]
-        for effect in dropped:
-            ack = self._acks.pop(effect.id, None)
-            if ack is not None and not ack.done():
-                ack.cancel()
-        await self.journal.append_async(
-            self.run_id,
-            "effect_discarded",
-            {
-                "v": 1,
-                "branch_id": branch.id,
-                "step": branch.cursor.step_index,
-                "effect_ids": [effect.id for effect in dropped],
-                "count": len(dropped),
-                "reason": reason,
-            },
-        )
-        return len(dropped)
 
     async def discard_and_journal(self, branch: Branch, reason: str) -> int:
         """Discard, and record in the journal exactly which effects were discarded.

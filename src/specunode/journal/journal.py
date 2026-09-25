@@ -95,6 +95,15 @@ _INSERT_CLAIM = (
     ":branch_id, :tool, 'in_flight', 'unknown', :attempt, :claimed_at) "
     "ON CONFLICT (run_id, nkey) DO NOTHING"
 )
+# Taking up a claim whose last attempt demonstrably never left. Conditional, so it is a
+# compare-and-set: two processes cannot both win it, and a row that changed in between is left
+# alone and reported as ambiguous.
+_REARM_NOT_SENT = (
+    "UPDATE effect_dispatch SET status = 'in_flight', last_outcome = 'unknown', "
+    "attempt = :attempt, effect_id = :effect_id, branch_id = :branch_id, idem_key = :idem_key, "
+    "claimed_at = :claimed_at WHERE run_id = :run_id AND nkey = :nkey "
+    "AND last_outcome = 'not_sent' AND status IN ('in_flight', 'dead_letter')"
+)
 _UPDATE_NOT_SENT = (
     "UPDATE effect_dispatch SET last_outcome = 'not_sent', attempt = :attempt "
     "WHERE run_id = :run_id AND nkey = :nkey"
@@ -102,7 +111,8 @@ _UPDATE_NOT_SENT = (
 _UPDATE_SETTLED = (
     "UPDATE effect_dispatch SET status = :status, last_outcome = :last_outcome, "
     "ack_json = :ack_json, entry_offset = :entry_offset, attempt = :attempt, "
-    "settled_at = :settled_at WHERE run_id = :run_id AND nkey = :nkey"
+    "settled_at = :settled_at WHERE run_id = :run_id AND nkey = :nkey "
+    "AND status <> 'dispatched'"
 )
 _SELECT_UNRESOLVED = (
     "SELECT nkey, idem_key, effect_id, branch_id, tool, status, last_outcome, attempt "
@@ -566,20 +576,23 @@ class _JournalWriter:
                 attempt=attempt,
                 ack=json.loads(ack) if ack else None,
             )
-        if status == "dead_letter":
-            # A dead letter whose request demonstrably never left is retried by a resume: the
-            # operator's remedy is to heal the upstream and resume (task 1.5). One that may have
-            # left is not -- a plain resume retried it, and applied a charge twice whenever the
-            # first had landed. It is ambiguous, as the lost reply that produced it was: the
-            # caller asks the upstream, or redelivers an idempotent tool, or stops again until
-            # an operator records what happened (``resolve_dispatch``).
-            if outcome == "not_sent":
-                return DispatchClaim(Claim.RETRY_SAFE, attempt=attempt)
+        if outcome == "not_sent" and status in ("dead_letter", "in_flight"):
+            # The last attempt demonstrably never left -- a dead letter the operator heals and
+            # resumes (task 1.5), one someone resolved as never sent, or crash window W3 -- so
+            # sending now is not a duplicate. But the row is re-armed before the send, in the
+            # same statement that wins it: left marked "never sent", a crash after the upstream
+            # took this retry made the next resume send it again, and a card was charged twice.
+            rearmed = self._backend.execute(_REARM_NOT_SENT, claim.as_params(_utc_now()))
+            if rearmed.rowcount == 1:
+                return DispatchClaim(Claim.RETRY_SAFE, attempt=claim.attempt)
             return DispatchClaim(Claim.AMBIGUOUS, attempt=attempt)
-        if outcome == "not_sent":
-            # The request demonstrably never left this process, so resending is not a
-            # duplicate. This downgrade is what keeps crash window W3 narrow.
-            return DispatchClaim(Claim.RETRY_SAFE, attempt=attempt)
+        if status == "dead_letter":
+            # One that may have left is not retried: a plain resume used to, and applied a
+            # charge twice whenever the first had landed. It is ambiguous, as the lost reply
+            # that produced it was: the caller asks the upstream, or redelivers an idempotent
+            # tool, or stops again until an operator records what happened
+            # (``resolve_dispatch``).
+            return DispatchClaim(Claim.AMBIGUOUS, attempt=attempt)
         # in_flight with an unknown outcome: the request may or may not have taken effect.
         # This is the two-generals boundary and nothing removes it; the caller decides using
         # the tool's declared idempotency.
@@ -629,7 +642,7 @@ class _JournalWriter:
             # A dead letter keeps whether its request provably never left, which is what lets
             # a resume retry it; everything else is settled.
             never_left = status == "dead_letter" and payload.get("sent") == "no"
-            self._backend.execute(
+            updated = self._backend.execute(
                 _UPDATE_SETTLED,
                 {
                     "run_id": run_id,
@@ -642,6 +655,13 @@ class _JournalWriter:
                     "settled_at": ts,
                 },
             )
+            if updated.rowcount != 1:
+                # No claim, or one already settled as sent -- by an operator's resolve, or by a
+                # process that finished it. Recording a second outcome would contradict the
+                # first, so neither the entry nor the row is written.
+                raise JournalWriteError(
+                    f"{nkey!r} has no claim in run {run_id!r} that is still open to settle"
+                )
             self._backend.commit()
         except Exception:
             self._backend.rollback()
@@ -664,9 +684,56 @@ class _JournalWriter:
         rows = self._backend.execute(_SELECT_UNRESOLVED, {"run_id": run_id}).fetchall()
         return [dict(row) for row in rows]
 
-    def _dispatch_row(self, run_id: str, nkey: str) -> Mapping[str, JsonValue] | None:
+    def _resolve(
+        self,
+        run_id: str,
+        nkey: str,
+        *,
+        landed: bool,
+        ack: JsonValue,
+        by: str,
+        dead: Mapping[str, JsonValue],
+    ) -> int:
+        """Read the claim and settle it on an operator's word -- one thread, and the settle
+        refuses a claim that was settled as sent in between."""
         row = self._backend.execute(_SELECT_CLAIM, {"run_id": run_id, "nkey": nkey}).fetchone()
-        return None if row is None else dict(row)
+        if row is None:
+            raise JournalError(f"run {run_id!r} has no dispatch claim under key {nkey!r}")
+        if row["status"] == "dispatched":
+            raise JournalError(f"{nkey!r} is already settled as dispatched; nothing to resolve")
+        attempt = int(row["attempt"])
+        if landed:
+            payload: dict[str, JsonValue] = {
+                "v": 1,
+                "effect_id": str(row["effect_id"]),
+                "branch_id": str(row["branch_id"]),
+                "nkey": nkey,
+                "key": str(row["idem_key"]),
+                "tool": str(row["tool"]),
+                "stage_index": -1,
+                "dispatch_index": -1,
+                "authorised_by_offset": dead.get("authorised_by_offset", -1),
+                "deduped": True,
+                "ack": ack,
+                "resolved_by": by,
+                "dry_run": False,
+                "compensation_for": None,
+            }
+            validate_payload("effect_dispatched", payload)
+            return self._settle(
+                run_id, nkey, "dispatched", ack, attempt, "effect_dispatched", payload
+            )
+        event: dict[str, JsonValue] = {
+            "v": 1,
+            "event": "effect_resolved",
+            "reason": f"{by}: {row['tool']} under {nkey} never took effect",
+            "nkey": nkey,
+            "effect_id": str(row["effect_id"]),
+            "sent": "no",
+            "resolved_by": by,
+        }
+        validate_payload("policy_event", event)
+        return self._settle(run_id, nkey, "dead_letter", None, attempt, "policy_event", event)
 
     def close(self) -> None:
         self._executor.shutdown(wait=True)
@@ -958,55 +1025,12 @@ class Journal:
 
         Each is one transaction, the entry and the claim together. Returns the entry's offset.
         """
-        row = self._writer.submit(lambda: self._writer._dispatch_row(run_id, nkey))
-        if row is None:
-            raise JournalError(f"run {run_id!r} has no dispatch claim under key {nkey!r}")
-        if row["status"] == "dispatched":
-            raise JournalError(
-                f"{nkey!r} is already settled as dispatched; there is nothing to resolve"
-            )
-        dead = None
+        dead: Mapping[str, JsonValue] = {}
         for entry in self.read(run_id, kinds=["effect_dead_lettered"]):
             if entry.payload.get("nkey") == nkey:
                 dead = entry.payload
-        attempt = int(str(row["attempt"]))
-        if landed:
-            payload: dict[str, JsonValue] = {
-                "v": 1,
-                "effect_id": str(row["effect_id"]),
-                "branch_id": str(row["branch_id"]),
-                "nkey": nkey,
-                "key": str(row["idem_key"]),
-                "tool": str(row["tool"]),
-                "stage_index": -1,
-                "dispatch_index": -1,
-                "authorised_by_offset": (dead or {}).get("authorised_by_offset", -1),
-                "deduped": True,
-                "ack": ack,
-                "resolved_by": by,
-                "dry_run": False,
-                "compensation_for": None,
-            }
-            validate_payload("effect_dispatched", payload)
-            return self._writer.submit(
-                lambda: self._writer._settle(
-                    run_id, nkey, "dispatched", ack, attempt, "effect_dispatched", payload
-                )
-            )
-        event: dict[str, JsonValue] = {
-            "v": 1,
-            "event": "effect_resolved",
-            "reason": f"{by}: {row['tool']} under {nkey} never took effect",
-            "nkey": nkey,
-            "effect_id": str(row["effect_id"]),
-            "sent": "no",
-            "resolved_by": by,
-        }
-        validate_payload("policy_event", event)
         return self._writer.submit(
-            lambda: self._writer._settle(
-                run_id, nkey, "dead_letter", None, attempt, "policy_event", event
-            )
+            lambda: self._writer._resolve(run_id, nkey, landed=landed, ack=ack, by=by, dead=dead)
         )
 
     def unresolved_dispatches(self, run_id: str) -> list[Mapping[str, JsonValue]]:

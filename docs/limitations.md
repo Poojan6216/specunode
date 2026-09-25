@@ -63,8 +63,10 @@ a resumed run can reach a *prefix* of the effects an uninterrupted run reached.
 
 Until 2026-09-25 the dispatcher retried every failure, whatever the tool declared, so a gateway
 that took a charge and timed out on the reply was charged again on the next attempt -- with the
-default settings and no crash at all; and a resume retried every dead letter, including one
-whose request had landed. An independent review found both.
+default settings and no crash at all; a resume retried every dead letter, including one whose
+request had landed; and a retry of one that had never left stayed marked "never sent" while it
+was out, so a crash during it made the next resume send it again. Independent reviews found all
+three.
 
 **The dedupe guarantee holds only while a resumed node makes the calls it made before.** An
 idempotency key is derived from the run, the node, the program position, the tool and the

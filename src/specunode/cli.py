@@ -226,13 +226,14 @@ def resolve(
         typer.echo("say which: --landed or --not-sent", err=True)
         raise typer.Exit(2)
     book = Journal(journal)
-    keys = [row.nkey for row in build_ledger(book, run_id).rows if row.nkey.startswith(key)]
-    keys += [
-        str(claim["nkey"])
-        for claim in book.unresolved_dispatches(run_id)
-        if str(claim["nkey"]).startswith(key)
-    ]
-    matches = sorted(set(keys))
+    # Either key names the effect: the ledger prints the idempotency key the tool was handed,
+    # and the dedupe key is what the claim is filed under. Both lead to the dedupe key.
+    names: dict[str, str] = {}
+    for row in build_ledger(book, run_id).rows:
+        names[row.key] = names[row.nkey] = row.nkey
+    for claim in book.unresolved_dispatches(run_id):
+        names[str(claim["idem_key"])] = names[str(claim["nkey"])] = str(claim["nkey"])
+    matches = sorted({nkey for name, nkey in names.items() if name and name.startswith(key)})
     if len(matches) != 1:
         if matches:
             problem = f"{len(matches)} effects in run {run_id} have a key starting {key!r}"

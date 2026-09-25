@@ -71,9 +71,11 @@ have acted: an idempotent tool is retried, and a non-idempotent one is not calle
 runtime asks its `reconcile`, if it has one, and otherwise dead-letters it and stops for a human.
 
 A dead letter whose request may have left is not retried by a resume either. Check the upstream,
-then record what you found -- `specunode resolve <run> <key> --landed` or `--not-sent` -- and
-the resume skips it or sends it once. A dead letter whose request demonstrably never left is
-retried by a plain resume: heal the upstream and resume.
+then record what you found -- `specunode resolve <run> <key> --landed` or `--not-sent`, with the
+key as `specunode ledger` prints it -- and the resume skips it or sends it once. A dead letter
+whose request demonstrably never left is retried by a plain resume: heal the upstream and
+resume. A retry is marked in flight again before it is sent, so a crash while it is out is the
+lost reply it may be, not another "never sent".
 
 ## Graph adapters
 
