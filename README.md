@@ -34,6 +34,12 @@ knows exactly which effects may already be out -- and then it asks the upstream 
 `reconcile`) or stops for a human. It never guesses. Details and caveats in
 [RESULTS.md](https://github.com/Poojan6216/specunode/blob/main/RESULTS.md#pull-the-plug-what-a-crash-sends-twice).
 
+Nor does a resumed step ask the model again what it already decided. The answer behind anything
+that may have gone out is in the journal, and the resume is served it from there -- so a model
+that would decide differently the second time cannot add a second, different charge, as long as
+the step asks the same question
+([limitations](https://github.com/Poojan6216/specunode/blob/main/docs/limitations.md#dispatch-is-at-least-once-and-the-ambiguous-window-is-real)).
+
 ## Quickstart
 
 ```
@@ -258,7 +264,8 @@ The demo asserts, and prints, that:
 
 - the resumed run's effects are a **prefix of the uninterrupted run's, in order** — it can fall
   short, and can never do something the clean run did not
-- **no idempotency key reached the world twice**
+- **no effect was applied twice** -- a tool declared idempotent may be handed its key again
+  when a crash lost the reply to its first delivery, and the demo says when it was
 - the **journal's hash chain still verifies** after a process died mid-append
 - replaying with a different system prompt is **refused at the first turn that would differ**,
   with the step index and a field-level diff of the request — not a silent re-run down a

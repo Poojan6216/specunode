@@ -669,19 +669,23 @@ def _world_log(directory: Path) -> list[dict[str, JsonValue]]:
 
 
 def answered_turns(journal: Journal, run_id: str) -> int:
-    """How many scripted turns a resumed run must skip: those of branches that retired.
+    """How many scripted turns a resumed run must skip: every one a process was asked before.
 
-    A resumed run is a new process, so its script starts over while the run does not. The
-    turns to skip are the ones a resume will not ask again -- those of retired branches -- and
-    not every recorded response: counting a turn whose branch the kill interrupted skipped the
-    script past it, and the resume, re-asking that turn, was handed the next one instead. At 2
-    of 40 kill points the demo "resumed" to a post_summary without the restart before it.
+    A resumed run is a new process, so its script starts over while the run does not. A turn
+    the journal holds is served to the resume rather than asked again (``RecordedTurns``), so
+    every recorded answer is one to skip, and a turn whose reply the kill cut off -- recorded
+    nowhere, and asked again -- is not. A served turn is journaled again under the resumed
+    branch, and marked ``recorded_from``; it was never asked, so it is not counted.
+
+    This used to count only the turns of retired branches, because a resume re-asked the rest.
+    That was the defect: a resume should not ask again what the journal already answers.
     """
-    retired = recover(journal, run_id).retired_branches
     return sum(
         1
         for entry in journal.read(run_id, kinds=["model_response"])
-        if not entry.payload.get("speculative") and entry.payload.get("branch_id") in retired
+        if entry.payload.get("role", "target") == "target"
+        and not entry.payload.get("speculative")
+        and "recorded_from" not in entry.payload
     )
 
 
@@ -706,14 +710,31 @@ def _delivered(directory: Path) -> list[tuple[str, str]]:
     return out
 
 
-def _duplicate_deliveries(directory: Path) -> int:
-    """Deliveries of one idempotency token, counted within a single directory's world log."""
+def _applied_twice(directory: Path) -> int:
+    """Effects the world applied more than once, by idempotency token, in one directory's log.
+
+    Not deliveries. A tool declared idempotent is handed its token again when a crash lost the
+    reply to its first delivery, and the world absorbs the repeat: that is at-least-once
+    dispatch working, and :func:`_absorbed` reports it. An effect applied twice is not, under
+    any contract.
+    """
     keys = [
         str(event.get("effect_key"))
         for event in _world_log(directory)
-        if event.get("kind") == "mutation" and event.get("effect_key")
+        if event.get("kind") == "mutation"
+        and event.get("effect_key")
+        and event.get("applied", True)
     ]
     return len(keys) - len(set(keys))
+
+
+def _absorbed(directory: Path) -> list[str]:
+    """Tools handed their token again after a lost reply, whose repeat the world absorbed."""
+    return [
+        str(event.get("tool"))
+        for event in _world_log(directory)
+        if event.get("kind") == "mutation" and not event.get("applied", True)
+    ]
 
 
 async def _replay(
@@ -791,7 +812,8 @@ async def demo_replay(as_json: bool = False) -> int:
             clean_dir, clean_run, system=SYSTEM_PROMPT, speculation=False
         )
 
-        duplicates = _duplicate_deliveries(kill_dir)
+        applied_twice = _applied_twice(kill_dir)
+        absorbed = _absorbed(kill_dir)
         prefix = resumed == clean[: len(resumed)]
         complete = resumed == clean
 
@@ -810,7 +832,8 @@ async def demo_replay(as_json: bool = False) -> int:
                     "resumed_effects": [tool for tool, _ in resumed],
                     "resumed_is_prefix_of_clean": prefix,
                     "resumed_is_complete": complete,
-                    "duplicate_deliveries": duplicates,
+                    "applied_twice": applied_twice,
+                    "absorbed_repeats": absorbed,
                     "journal_chain_verifies_after_kill": chain_ok,
                     "replay_with_changed_prompt_refused": not changed_ok,
                     "replay_refusal": changed_detail if not changed_ok else "",
@@ -833,7 +856,9 @@ async def demo_replay(as_json: bool = False) -> int:
     print("  1. kill and resume")
     print(f"     clean run delivered:   {[tool for tool, _ in clean]}")
     print(f"     resumed run delivered: {[tool for tool, _ in resumed]}")
-    print(f"     duplicate deliveries:  {duplicates}")
+    print(f"     effects applied twice: {applied_twice}")
+    if absorbed:
+        print(f"     handed again after a lost reply, and absorbed as idempotent: {absorbed}")
     print(f"     a prefix of the clean run, in order: {prefix}")
     print(f"     reached the clean run's last effect:  {complete}")
     print(f"     journal hash chain verifies after the kill: {chain_ok}")
@@ -859,7 +884,7 @@ async def demo_replay(as_json: bool = False) -> int:
             f"{row.node_id:<10} {row.step_index:>4}  {row.nkey[:16]}"
         )
     print()
-    ok = prefix and duplicates == 0 and chain_ok and not changed_ok and same_ok
+    ok = prefix and applied_twice == 0 and chain_ok and not changed_ok and same_ok
     return 0 if ok else 1
 
 

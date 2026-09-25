@@ -27,6 +27,7 @@ from specunode.core.model import (
     CallScope,
     Message,
     ModelResponse,
+    RecordedTurn,
     RequestEnvelope,
     StreamEvent,
     TextBlock,
@@ -43,6 +44,7 @@ from specunode.journal.journal import Journal
 
 __all__ = [
     "JournaledTurn",
+    "RecordedTurns",
     "Recovery",
     "ReplayDivergence",
     "ReplayExhausted",
@@ -273,6 +275,95 @@ class ReplayModel:
     @property
     def served(self) -> tuple[int, ...]:
         return tuple(self._served)
+
+
+@dataclass
+class RecordedTurns:
+    """The model turns a resumed run has already been given, served rather than asked again.
+
+    A resumed run re-runs every node whose branch never retired, from the same position and
+    under the same node id, so each such node asks the model what it asked before. Asking
+    again is what made "never duplicated" depend on the model answering the same way twice:
+    the dead process may already have sent effects of that turn, and a different answer is a
+    different call with a different idempotency key. The answer is in the journal whenever an
+    effect of the turn could have been sent, because nothing is sent before the turn is
+    durable; so a turn the journal holds is served, and only a turn it does not hold -- none of
+    whose effects can have left -- goes back to the model.
+
+    Only when the question is the same. A turn is served if the resumed request hashes to the
+    recorded one, and from the first request at a node and position that does not, or that
+    runs past what was recorded, that node and position ask the model. Speculative turns are
+    never served: they were guesses, not decisions.
+
+    For each node and position the longest recorded attempt is kept, the latest on a tie. A
+    resumed attempt is served the recorded turns before it asks anything, and journals each
+    one again, so every attempt's turns begin with those of the attempt before it.
+    """
+
+    journal: Journal
+    run_id: str
+    role: str = "target"
+    _turns: dict[tuple[str, int], list[tuple[str, RecordedTurn]]] = field(
+        default_factory=dict, init=False
+    )
+    _next: dict[tuple[str, int], int] = field(default_factory=dict, init=False)
+    _asking: set[tuple[str, int]] = field(default_factory=set, init=False)
+
+    def __post_init__(self) -> None:
+        requests: dict[str, Mapping[str, JsonValue]] = {}
+        attempts: dict[tuple[str, int], dict[str, list[tuple[str, RecordedTurn]]]] = {}
+        for entry in self.journal.read(self.run_id, kinds=["model_request", "model_response"]):
+            payload = entry.payload
+            if payload.get("role") != self.role or payload.get("speculative"):
+                continue
+            request_id = payload.get("request_id")
+            if not isinstance(request_id, str):
+                continue
+            if entry.kind == "model_request":
+                requests[request_id] = payload
+                continue
+            request = requests.get(request_id)
+            step = payload.get("step")
+            response = payload.get("response")
+            if (
+                request is None
+                or not isinstance(step, int)
+                or isinstance(step, bool)
+                or not isinstance(response, Mapping)
+            ):
+                continue
+            # The entry a turn was first recorded in, however many times it has been served.
+            origin = payload.get("recorded_from")
+            offset = origin if isinstance(origin, int) else entry.offset
+            key = (str(request.get("node_id") or ""), step)
+            attempt = attempts.setdefault(key, {}).setdefault(str(payload.get("branch_id")), [])
+            turn = RecordedTurn(response=response_from_json(response), offset=offset)
+            attempt.append((str(payload.get("request_hash", "")), turn))
+        for key, by_attempt in attempts.items():
+            kept: list[tuple[str, RecordedTurn]] = []
+            for turns in by_attempt.values():
+                if len(turns) >= len(kept):
+                    kept = turns
+            self._turns[key] = kept
+
+    def take(self, digest: str, scope: CallScope) -> RecordedTurn | None:
+        if scope.run_id != self.run_id:
+            return None
+        key = (scope.node_id, scope.step)
+        if key in self._asking:
+            return None
+        turns = self._turns.get(key, [])
+        index = self._next.get(key, 0)
+        if index >= len(turns) or turns[index][0] != digest:
+            self._asking.add(key)
+            return None
+        self._next[key] = index + 1
+        return turns[index][1]
+
+    @property
+    def recorded(self) -> int:
+        """How many turns the journal holds for this run, over every node and position."""
+        return sum(len(turns) for turns in self._turns.values())
 
 
 def _as_mapping(value: JsonValue) -> Mapping[str, JsonValue]:

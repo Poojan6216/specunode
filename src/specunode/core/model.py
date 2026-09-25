@@ -63,6 +63,8 @@ __all__ = [
     "ModelResponse",
     "OpaqueBlock",
     "PromptBuilder",
+    "RecordedTurn",
+    "RecordedTurnSource",
     "RequestEnvelope",
     "StreamEvent",
     "TextBlock",
@@ -536,6 +538,23 @@ def scoped(scope: CallScope) -> Iterator[None]:
         call_scope.reset(token)
 
 
+@dataclass(frozen=True, slots=True)
+class RecordedTurn:
+    """A model turn the journal already holds, served to a resumed run instead of asked again."""
+
+    response: ModelResponse
+    #: Offset of the ``model_response`` entry the turn was first recorded in.
+    offset: int
+
+
+class RecordedTurnSource(Protocol):
+    """Where a resumed run's recorded turns come from; see ``journal.replay.RecordedTurns``."""
+
+    def take(self, digest: str, scope: CallScope) -> RecordedTurn | None:
+        """The recorded answer to this request, or ``None`` if the model must be asked."""
+        ...
+
+
 class JournaledModel:
     """Wraps a :class:`ModelClient` so every request and response is durable before use.
 
@@ -559,11 +578,33 @@ class JournaledModel:
         self._journal = journal
         self._role = role
         self._provider = provider
+        self._recorded: RecordedTurnSource | None = None
+
+    def serve_recorded(self, source: RecordedTurnSource | None) -> None:
+        """Answer from the journal what a resumed run was already told; ``None`` to stop.
+
+        The scheduler sets this when it resumes a run. A node whose branch never retired is run
+        again from the same position and asks the same question, and once any effect of that
+        turn was sent the journal holds the answer -- nothing is sent before the turn is
+        durable. Asking again was at best a wasted call. At worst the model decided differently,
+        and a different call derives a different idempotency key, which the dedupe table cannot
+        connect to what the dead process already sent. A served turn is journaled again under
+        the resumed branch, with ``recorded_from`` naming the entry it came from.
+        """
+        self._recorded = source
+
+    def _recorded_for(self, digest: str, scope: CallScope) -> RecordedTurn | None:
+        if self._recorded is None or self._role != "target" or scope.speculative:
+            return None
+        return self._recorded.take(digest, scope)
 
     async def _journal_request(
-        self, envelope: RequestEnvelope, scope: CallScope
-    ) -> tuple[str, str]:
-        digest = request_hash(envelope)
+        self,
+        envelope: RequestEnvelope,
+        scope: CallScope,
+        digest: str,
+        recorded: RecordedTurn | None,
+    ) -> str:
         request_id = new_ulid()
         # Hard Rule 13 tracks target requests only. A draft request legitimately differs --
         # a different model, at minimum -- and folding it in would make every tier-2 run
@@ -589,9 +630,10 @@ class JournaledModel:
                 "request_id": request_id,
                 "request_hash": digest,
                 "request": project(envelope),
+                **({"recorded_from": recorded.offset} if recorded is not None else {}),
             },
         )
-        return request_id, digest
+        return request_id
 
     async def _journal_response(
         self,
@@ -600,6 +642,7 @@ class JournaledModel:
         request_id: str,
         digest: str,
         latency_ms: int,
+        recorded: RecordedTurn | None = None,
     ) -> None:
         decisions = decisions_of(response)
         await self._journal.append_async(
@@ -623,12 +666,19 @@ class JournaledModel:
                 "text": response.text or None,
                 "end_of_turn": True,
                 "latency_ms": latency_ms,
+                # Served from the journal, not asked: no model call was made for this entry.
+                **({"recorded_from": recorded.offset} if recorded is not None else {}),
             },
         )
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
         scope = current_scope()
-        request_id, digest = await self._journal_request(envelope, scope)
+        digest = request_hash(envelope)
+        recorded = self._recorded_for(digest, scope)
+        request_id = await self._journal_request(envelope, scope, digest, recorded)
+        if recorded is not None:
+            await self._journal_response(recorded.response, scope, request_id, digest, 0, recorded)
+            return recorded.response
         started = time.monotonic()
         response = await self._inner.complete(envelope)
         latency_ms = int((time.monotonic() - started) * 1000)
@@ -645,7 +695,21 @@ class JournaledModel:
         ``TurnComplete`` escapes -- is durable.
         """
         scope = current_scope()
-        request_id, digest = await self._journal_request(envelope, scope)
+        digest = request_hash(envelope)
+        recorded = self._recorded_for(digest, scope)
+        request_id = await self._journal_request(envelope, scope, digest, recorded)
+        if recorded is not None:
+            # The recorded turn's blocks, in order and with no delay, as a live stream would
+            # emit them -- so early issue sees a served turn exactly as it saw the original.
+            response = recorded.response
+            for index, block in enumerate(response.content):
+                if isinstance(block, ToolUseBlock):
+                    yield ToolUseComplete(index=index, block=block)
+                elif isinstance(block, TextBlock):
+                    yield TextDelta(index=index, text=block.text)
+            await self._journal_response(response, scope, request_id, digest, 0, recorded)
+            yield TurnComplete(response=response)
+            return
         started = time.monotonic()
         async for event in self._inner.stream(envelope):
             if isinstance(event, TurnComplete):

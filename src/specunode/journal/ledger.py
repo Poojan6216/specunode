@@ -516,7 +516,8 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
             if _as_bool(payload, "raced_drain"):
                 raced_from_results.add(_as_str(payload, "call_id") or str(entry.offset))
         elif kind == "model_request":
-            if _as_str(payload, "role", "target") == "target":
+            # A turn served from the journal on resume repeats one already counted.
+            if _as_str(payload, "role", "target") == "target" and "recorded_from" not in payload:
                 index = _as_seq(payload, "injected_index")
                 injected += len(index) if index else len(_as_seq(payload, "injected"))
         elif kind == "policy_event":

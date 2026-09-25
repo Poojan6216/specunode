@@ -12,6 +12,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -168,7 +169,9 @@ def test_the_demo_actually_kills_the_process() -> None:
 def test_the_resume_neither_duplicates_nor_invents() -> None:
     """The two properties that matter, stated the way the chaos suite states them."""
     report = run_replay_demo()
-    assert report["duplicate_deliveries"] == 0
+    assert report["applied_twice"] == 0
+    # Only a tool that declared a repeat harmless may be handed its token again.
+    assert set(report["absorbed_repeats"]) <= {"restart_job"}
     assert report["resumed_is_prefix_of_clean"] is True
     assert report["journal_chain_verifies_after_kill"] is True
 
@@ -229,14 +232,53 @@ def test_demo_ones_specunode_row_is_produced_by_the_real_runtime() -> None:
 
 
 @pytest.mark.slow
+def demo3_scheduler(journal: object, world: object, skip: int = 0) -> Any:
+    """Demo 3's run, in process, against ``journal`` -- so a test can kill it at an exact point."""
+    sys.path.insert(0, str(REPO))
+    from bench.demo import BLOCK_MS, TURN_1, TURN_2, TURN_MS, PastWriteGraph, demo3_registry
+
+    from specunode.buffer.dispatcher import Dispatcher
+    from specunode.buffer.store_buffer import StoreBuffer
+    from specunode.core.model import JournaledModel
+    from specunode.core.policy import Policy
+    from specunode.core.scheduler import Scheduler
+    from specunode.testing.models import ScriptedModel, tool_turn
+
+    registry = demo3_registry(world)  # type: ignore[arg-type]
+    return Scheduler(
+        graph=PastWriteGraph("specunode"),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,  # type: ignore[arg-type]
+        buffer=StoreBuffer(journal=journal, run_id=""),  # type: ignore[arg-type]
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=1.0),
+        target=JournaledModel(
+            ScriptedModel(
+                turns=[tool_turn(*TURN_1, turn=0), tool_turn(*TURN_2, turn=1)],
+                block_delay_ms=BLOCK_MS,
+                complete_delay_ms=TURN_MS,
+                consumed=skip,
+            ),
+            journal,  # type: ignore[arg-type]
+            provider="scripted",
+        ),
+        policy=Policy(speculation=True),
+    )
+
+
 def test_a_kill_at_any_point_of_the_demo_resumes_to_a_prefix_without_duplicates(
     tmp_path: Path,
 ) -> None:
     """The demo draws one kill point, so a narrow window can hide from it -- one did, and CI
     found it. Here the kill walks the whole run instead, and every resume is held to the two
-    properties that matter: nothing twice, and nothing the clean run did not do."""
+    properties that matter: nothing applied twice, and nothing the clean run did not do.
+
+    Applied, not delivered: a kill that lands after ``restart_job`` reached the world and before
+    its reply was recorded is resumed by handing it the same token again, because it declared a
+    repeat harmless, and the world absorbs it. This test counted that as a duplicate, and so
+    failed whenever a kill happened to land there -- rarely, which is how the claim it made
+    survived as long as it did."""
     sys.path.insert(0, str(REPO))
-    from bench.demo import _delivered, _duplicate_deliveries, _helper, _work_ms
+    from bench.demo import _absorbed, _applied_twice, _delivered, _helper, _work_ms
 
     clean_dir = tmp_path / "clean"
     clean_dir.mkdir()
@@ -251,41 +293,30 @@ def test_a_kill_at_any_point_of_the_demo_resumes_to_a_prefix_without_duplicates(
         _helper(directory, run_id, -1, resume=True)
         resumed = _delivered(directory)
         assert resumed == clean[: len(resumed)], (point, resumed, clean)
-        assert _duplicate_deliveries(directory) == 0, point
+        assert _applied_twice(directory) == 0, point
+        assert set(_absorbed(directory)) <= {"restart_job"}, (point, _absorbed(directory))
     assert killed >= 12, f"only {killed} of 24 kill points landed inside the run"
 
 
-async def test_a_resume_is_asked_again_the_turn_the_kill_interrupted(tmp_path: Path) -> None:
+async def test_a_resume_is_served_the_turn_the_journal_already_holds(tmp_path: Path) -> None:
     """The window the sweep above can step over, hit exactly: the process dies after turn 1's
     reply is journaled and before turn 1's branch is confirmed, so nothing of turn 1 was sent.
-    A resume must ask turn 1 again. The demo's script counted every recorded reply as answered,
-    so the resume was handed turn 2 instead -- and posted a summary of a restart it never made.
+
+    The resume is served turn 1 from the journal rather than asking for it again, and the
+    script skips it. Two defects lived here. The resume re-asked turn 1 while the demo's script
+    counted it as answered, so the resume was handed turn 2 and posted a summary of a restart
+    it never made. The first fix had the script hand turn 1 over again, which hid the second:
+    the resume should never have asked a question the journal had already answered.
     """
     import asyncio
     from collections.abc import Mapping
 
     sys.path.insert(0, str(REPO))
-    from bench.demo import (
-        BLOCK_MS,
-        TURN_1,
-        TURN_2,
-        TURN_MS,
-        PastWriteGraph,
-        _delivered,
-        answered_turns,
-        demo3_registry,
-        demo3_world,
-    )
+    from bench.demo import _delivered, answered_turns, demo3_world
 
-    from specunode.buffer.dispatcher import Dispatcher
-    from specunode.buffer.store_buffer import StoreBuffer
     from specunode.canonical import JsonValue
-    from specunode.core.model import JournaledModel
-    from specunode.core.policy import Policy
-    from specunode.core.scheduler import Scheduler
     from specunode.ids import new_ulid
     from specunode.journal.journal import Journal
-    from specunode.testing.models import ScriptedModel, tool_turn
 
     class Died(BaseException):
         pass
@@ -305,31 +336,10 @@ async def test_a_resume_is_asked_again_the_turn_the_kill_interrupted(tmp_path: P
                 raise Died("killed after turn 1's reply, before its branch was confirmed")
             return await super().append_async(run_id, kind, payload)
 
-    def scheduler(journal: Journal, world: object, skip: int) -> Scheduler:
-        registry = demo3_registry(world)  # type: ignore[arg-type]
-        return Scheduler(
-            graph=PastWriteGraph("specunode"),  # type: ignore[arg-type]
-            registry=registry,
-            journal=journal,
-            buffer=StoreBuffer(journal=journal, run_id=""),
-            dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=1.0),
-            target=JournaledModel(
-                ScriptedModel(
-                    turns=[tool_turn(*TURN_1, turn=0), tool_turn(*TURN_2, turn=1)],
-                    block_delay_ms=BLOCK_MS,
-                    complete_delay_ms=TURN_MS,
-                    consumed=skip,
-                ),
-                journal,
-                provider="scripted",
-            ),
-            policy=Policy(speculation=True),
-        )
-
     run_id = new_ulid()
     world = demo3_world(tmp_path)
     with pytest.raises(Died):
-        await scheduler(DiesBeforeTurnOneIsConfirmed(tmp_path / "journal.db"), world, 0).run(
+        await demo3_scheduler(DiesBeforeTurnOneIsConfirmed(tmp_path / "journal.db"), world).run(
             run_id, {}
         )
     leftovers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
@@ -342,9 +352,80 @@ async def test_a_resume_is_asked_again_the_turn_the_kill_interrupted(tmp_path: P
     journal = Journal(tmp_path / "journal.db")
     assert len(list(journal.read(run_id, kinds=["model_response"]))) == 1
     skip = answered_turns(journal, run_id)
-    assert skip == 0, "turn 1's branch never retired, so its reply is not an answer to skip"
+    assert skip == 1, "turn 1's reply is in the journal, so the resume is served it"
     resumed_world = demo3_world(tmp_path)
-    result = await scheduler(journal, resumed_world, skip).resume(run_id)
+    result = await demo3_scheduler(journal, resumed_world, skip).resume(run_id)
     resumed_world.close()
     assert result.ok, result.error
     assert [tool for tool, _ in _delivered(tmp_path)] == ["restart_job", "post_summary"]
+
+    replies = [e.payload for e in journal.read(run_id, kinds=["model_response"])]
+    served = [reply for reply in replies if "recorded_from" in reply]
+    assert len(served) == 1, "turn 1 was asked again rather than served from the journal"
+    assert len(replies) == 3, "turn 1, turn 1 served, and turn 2 -- the only new question"
+
+
+async def test_a_lost_reply_to_an_idempotent_write_is_redelivered_and_applied_once(
+    tmp_path: Path,
+) -> None:
+    """The window the sweep hit by chance on a loaded machine, hit exactly.
+
+    The process dies after ``restart_job`` reached the world and before its reply was recorded.
+    Nobody can tell whether it took effect, and ``restart_job`` declared a repeat harmless, so
+    the resume hands it the same token again -- the same token only because the resumed node is
+    served the decision the dead one made -- and the world absorbs the repeat. Delivered twice,
+    applied once: that is at-least-once dispatch doing what it says.
+    """
+    import asyncio
+    from collections.abc import Mapping
+
+    sys.path.insert(0, str(REPO))
+    from bench.demo import _absorbed, _applied_twice, _delivered, answered_turns, demo3_world
+
+    from specunode.canonical import JsonValue
+    from specunode.ids import new_ulid
+    from specunode.journal.journal import Journal
+
+    class Died(BaseException):
+        pass
+
+    class DiesBeforeTheRestartIsAcked(Journal):
+        dead = False
+
+        async def settle_dispatch(self, **settled: Any) -> int:
+            payload: Mapping[str, JsonValue] = settled["payload"]
+            if self.dead or payload.get("tool") == "restart_job":
+                self.dead = True
+                raise Died("killed after the restart reached the world, before its reply")
+            return await super().settle_dispatch(**settled)
+
+        async def append_async(
+            self, run_id: str, kind: str, payload: Mapping[str, JsonValue]
+        ) -> int:
+            if self.dead:
+                raise Died("a dead process writes nothing")
+            return await super().append_async(run_id, kind, payload)
+
+    run_id = new_ulid()
+    world = demo3_world(tmp_path)
+    with pytest.raises(Died):
+        await demo3_scheduler(DiesBeforeTheRestartIsAcked(tmp_path / "journal.db"), world).run(
+            run_id, {}
+        )
+    leftovers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for task in leftovers:
+        task.cancel()
+    await asyncio.gather(*leftovers, return_exceptions=True)
+    world.close()
+    assert [tool for tool, _ in _delivered(tmp_path)] == ["restart_job"]
+
+    journal = Journal(tmp_path / "journal.db")
+    resumed_world = demo3_world(tmp_path)
+    result = await demo3_scheduler(journal, resumed_world, answered_turns(journal, run_id)).resume(
+        run_id
+    )
+    resumed_world.close()
+    assert result.ok, result.error
+    assert [tool for tool, _ in _delivered(tmp_path)] == ["restart_job", "post_summary"]
+    assert _absorbed(tmp_path) == ["restart_job"], "the lost reply was not redelivered"
+    assert _applied_twice(tmp_path) == 0

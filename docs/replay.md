@@ -136,16 +136,21 @@ So a resumed run can reach a *prefix* of the effects an uninterrupted run reache
 never duplicated, never invented — is what the kill/resume tests assert, and the dead letter is
 required whenever the run falls short.
 
-**Both halves of that pair are conditional on the model answering the same way twice.** An
+**Both halves of that pair are conditional on a resumed node asking the same question.** An
 idempotency key is derived from the run, the node, the program position, the tool and the
-*arguments*. A resume re-asks the model for every turn the journal does not already hold; if it
-answers identically — which a recorded or scripted model always does — the key matches and the
-dedupe table catches the earlier attempt. If it answers differently, as a real model at non-zero
-temperature may, the resumed run makes a *different* call at the same position, derives a
-different key, and nothing connects the two. The world then receives both.
+*arguments*. Nothing is dispatched before the model turn that decided it is journaled, and a
+resumed node that asks a journaled turn's question again is served the journaled answer rather
+than asking the model -- so the resumed run makes the same calls, derives the same keys, and the
+dedupe table catches the earlier attempt, whatever the model would have said the second time. A
+turn the journal does not hold is asked again; none of its effects can have left. What a resume
+cannot keep the same is a question that changed: a read made again that returns something new,
+a timestamp in the prompt, code that changed. The journaled answer is then not served, and a
+model that decides differently makes a different call at the same position, under a different
+key, which the world receives as well.
 
-Every kill/resume test here uses a deterministic `ScriptedModel`, so none of them can see that.
-It is a property of the fixtures, not evidence about the runtime. See `docs/limitations.md`.
+The kill/resume test resumes every kill point with a model that would decide differently if it
+were asked, and checks that the resumed run's effects are the dead run's wherever the decision
+was journaled. See `docs/limitations.md`.
 
 ### On the LangGraph path
 

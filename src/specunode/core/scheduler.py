@@ -46,6 +46,7 @@ from specunode.core.graph import END, GraphAdapter, NodeRef, Parallel, RunSessio
 from specunode.core.hazards import Hazard, analyse, keys_touched
 from specunode.core.model import (
     CallScope,
+    JournaledModel,
     ModelClient,
     ModelResponse,
     RequestEnvelope,
@@ -66,7 +67,7 @@ from specunode.drafters.base import DraftContext, Drafter
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
 from specunode.journal.ledger import Ledger, build_ledger
-from specunode.journal.replay import OpenGroup, recover
+from specunode.journal.replay import OpenGroup, RecordedTurns, recover
 from specunode.verify.gate import resolve_decision
 from specunode.verify.witness import ReadValidation, validate_reads
 
@@ -481,6 +482,9 @@ class Scheduler:
         self._committed = CommittedState.initial(inputs if isinstance(inputs, Mapping) else {})
         self._cursor = StepCursor()
         self._reducers = resolve_reducers(dict(self.reducers))
+        if isinstance(self.target, JournaledModel):
+            # A fresh run has been told nothing yet; a previous resume's turns are not its own.
+            self.target.serve_recorded(None)
         await self._journal_run_started(inputs)
 
         if self.graph.capabilities().drives_itself:
@@ -587,6 +591,11 @@ class Scheduler:
         its drain in flight when the process died; its state delta is not applied and its
         cursor is not adopted, because resuming from it would dispatch effects that were never
         context-checked or witness-validated.
+
+        Its node runs again, and asks the model what it asked before. The answer is served
+        from the journal when it is there and the question is identical (``RecordedTurns``),
+        so the node decides again what it decided the first time -- which is what lets the
+        dedupe table recognise any effect of that decision that already went out.
         """
         recovery = recover(self.journal, run_id)
         if not recovery.exists:
@@ -602,6 +611,9 @@ class Scheduler:
         self.run_id = run_id
         self.buffer.run_id = run_id
         self.buffer.scheduler_task = asyncio.current_task()
+        recorded = RecordedTurns(self.journal, run_id)
+        if isinstance(self.target, JournaledModel):
+            self.target.serve_recorded(recorded)
         self._committed = CommittedState(recovery.state)
         self._cursor = recovery.cursor
         self._open_group = recovery.open_group
@@ -625,6 +637,9 @@ class Scheduler:
                     "confirmed_not_retired": list(recovery.confirmed_not_retired),
                     "unresolved_dispatches": len(recovery.unresolved_dispatches),
                     "step_index": recovery.step_index,
+                    # Turns the journal holds; a resumed node asking one again is served it.
+                    "recorded_turns": recorded.recorded,
+                    "served": isinstance(self.target, JournaledModel),
                 },
             },
         )

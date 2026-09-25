@@ -59,17 +59,40 @@ declared `idempotent=True` is redelivered, and a tool that did not is **dead-let
 run halts for a human. The consequence, visible in the kill/resume tests, is that a resumed run
 can reach a *prefix* of the effects an uninterrupted run reached.
 
-**The dedupe guarantee is conditional, and the condition is that the model answers the same
-way twice.** An idempotency key is derived from the run, the node, the program position, the
-tool and the *arguments*. A resume re-asks the model for every turn the journal does not
-already hold. If it answers identically — which a recorded or scripted model always does — the
-key matches, the dedupe table sees the earlier attempt, and nothing is sent twice. If it answers
-differently — and a real model may — the resumed run produces a different call at the same
-position, derives a different key, and the dedupe table has nothing to match it against. The
-world then receives both, and no bookkeeping in this design connects them.
+**The dedupe guarantee has one condition left: that a resumed node asks the model the same
+question it asked before the crash.** An idempotency key is derived from the run, the node, the
+program position, the tool and the *arguments*, so a call is recognised as already sent only if
+it is made again with the same arguments. For every decision that could have sent anything, a
+resume makes sure of that: nothing is dispatched before the model turn that decided it is in the
+journal, and a resumed node that asks that turn's question again is served the journaled answer
+rather than asking the model (`RecordedTurns`). A turn the journal does not hold is asked again,
+and none of its effects can have left.
+
+What a resume cannot keep the same is the question. Reads are made again on resume, not served,
+so a node that reads and then asks in the same step asks something new if the world changed in
+between; so does a node whose prompt carries a timestamp, or whose code changed. The journaled
+answer is then not served -- it answers a different question -- the model is asked, and if it
+decides differently the resumed run makes a different call at the same position, under a
+different key, and the dedupe table has nothing to match it against. The world then receives
+both, and no bookkeeping in this design connects them.
 
 So the honest statement is: **a resumed run never delivers the same call twice, and can deliver
-a second, different call the uninterrupted run would not have made.**
+a second, different call only when a node's question changed across the crash.**
+
+There is no setting that makes a model answer a changed question the same way, and on the
+current models there is not even one that narrows it: `temperature`, `top_p` and `top_k` are
+rejected outright by Claude Sonnet 5 and Claude Opus 5 (HTTP 400, "`temperature` is deprecated
+for this model"), so the advice this page used to give — pin the temperature to zero — is no
+longer available to take. Claude Haiku 4.5 still accepts them. Either way a model is free to
+answer differently, and the design does not assume otherwise.
+
+Until 2026-09-25 this section was wider. A resume re-asked every turn of a node that had not
+finished, even one whose answer was in the journal, so the dedupe guarantee depended on the
+model answering the same way twice however little had changed. An independent review found it
+by killing a run just after a turn was journaled; the kill/resume test now resumes every kill
+point with a model that would decide differently if asked, and the resumed run's effects are
+the dead run's wherever the decision was journaled. The case left over, a changed question, it
+does not exercise.
 
 The ambiguous window itself -- the upstream took the call, the reply never came back -- is
 closed only by the upstream. A tool that declares a `reconcile` is asked, on resume, whether the
@@ -77,16 +100,6 @@ call under its key took effect, and the runtime acts on the answer; one that doe
 dead-lettered. `reconcile` is only as good as the record it reads: it must be one the upstream
 writes atomically with the effect, or a request still in flight can be reported as absent and
 then land (`docs/adapters.md`).
-
-There is no setting that closes this window, and on the current models there is not even one
-that narrows it: `temperature`, `top_p` and `top_k` are rejected outright by Claude Sonnet 5 and
-Claude Opus 5 (HTTP 400, "`temperature` is deprecated for this model"), so the advice this page
-used to give — pin the temperature to zero — is no longer available to take. Claude Haiku 4.5
-still accepts them. Either way a model is free to answer differently, and the design does not
-assume otherwise.
-
-Every kill/resume test here uses a deterministic `ScriptedModel`, so none of them can see this.
-That is a property of the fixtures, not evidence about the runtime.
 
 The docs say "at-least-once dispatch with deterministic idempotency keys". They do not say
 "exactly-once", and a vocabulary test fails the build if they ever do.

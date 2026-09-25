@@ -77,6 +77,8 @@ class Mutation:
     row_id: str
     ts: float
     speculative: bool
+    #: False for a repeat a truly idempotent tool absorbed: the call arrived, nothing changed.
+    applied: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +257,7 @@ class World:
                 "row_id": record.row_id,
                 "ts": record.ts,
                 "speculative": record.speculative,
+                "applied": record.applied,
                 "row_after": row_after,
             }
         )
@@ -370,6 +373,7 @@ class World:
             row_id=row_id,
             ts=time.monotonic(),
             speculative=context.speculative,
+            applied=apply is not None,
         )
         self.mutations.append(record)
         self._persist_mutation(record, dict(row) if row is not None else None)

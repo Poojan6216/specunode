@@ -113,11 +113,15 @@ def charge(amount: float) -> object:
     return tool_turn(("charge_card", {"customer_id": "cus-1", "amount": amount}))
 
 
-async def test_replay_of_a_resumed_run_reproduces_the_run_that_was_kept(tmp_path: Path) -> None:
-    """The model said 25; the process died before ``decide`` retired; resumed, it said 30.
+async def test_a_resumed_node_is_served_the_decision_the_dead_process_made(
+    tmp_path: Path,
+) -> None:
+    """The model said 25; the process died before ``decide`` retired; asked again, it says 30.
 
-    Both answers sit in the journal under one node and one position. Replay used to serve the
-    dead attempt's, reproducing a charge the committed run never made.
+    The resume is served 25 from the journal rather than asking again, so it charges what the
+    dead process decided. It used to ask, and charged 30 -- a decision the dead process never
+    made, which a real model asked the same question twice may well make. And a replay of the
+    resumed run reproduces the run that was kept.
     """
     db = tmp_path / "source.db"
     world = standard_world()
@@ -134,12 +138,56 @@ async def test_replay_of_a_resumed_run_reproduces_the_run_that_was_kept(tmp_path
     await bury_the_dead_process()
 
     adapter, registry = build_support(world)
-    resumed = await scheduler(
-        Journal(db),
-        adapter,
-        registry,
+    changed_its_mind = ScriptedModel(turns=[charge(30.0)])  # type: ignore[list-item]
+    resumed = await scheduler(Journal(db), adapter, registry, changed_its_mind).resume(run_id)
+    assert resumed.ok, resumed.error
+    assert changed_its_mind.calls == 0, "the resume asked a question the journal had answered"
+    assert [row["amount"] for row in world.tables["charges"].values()] == [25.0]
+
+    adapter, registry = build_support(standard_world())
+    replayed = await scheduler(
+        Journal(tmp_path / "replay.db"), adapter, registry, replay_of(Journal(db), run_id)
+    ).run(new_ulid(), inputs)
+    assert replayed.ok, replayed.error
+    assert replayed.state["decided"] == resumed.state["decided"]
+
+
+async def test_replay_of_a_resumed_run_serves_the_attempt_that_was_kept(tmp_path: Path) -> None:
+    """Two answers under one node and one position: the dead attempt's 25 and the kept 30.
+
+    A resume asks again when the question changed across the crash, and then the journal holds
+    both. Replay used to serve the dead attempt's, reproducing a charge the committed run never
+    made. The resumed process here is made to ask again, as a changed question makes it, rather
+    than rebuilding the app around a changed prompt.
+    """
+
+    class AsksAgain(JournaledModel):
+        def serve_recorded(self, source: object) -> None:
+            """Nothing recorded answers a question that changed."""
+
+    db = tmp_path / "source.db"
+    world = standard_world()
+    adapter, registry = build_support(world)
+    run_id = new_ulid()
+    inputs = {"customer_id": "cus-1"}
+    with pytest.raises(Crash):
+        await scheduler(
+            CrashingJournal(db, before_commit_of("decide#0")),
+            adapter,
+            registry,
+            ScriptedModel(turns=[charge(25.0)]),  # type: ignore[list-item]
+        ).run(run_id, inputs)
+    await bury_the_dead_process()
+
+    adapter, registry = build_support(world)
+    journal = Journal(db)
+    resuming = scheduler(journal, adapter, registry, None)
+    resuming.target = AsksAgain(
         ScriptedModel(turns=[charge(30.0)]),  # type: ignore[list-item]
-    ).resume(run_id)
+        journal,
+        provider="scripted",
+    )
+    resumed = await resuming.resume(run_id)
     assert resumed.ok, resumed.error
     assert [row["amount"] for row in world.tables["charges"].values()] == [30.0]
 
