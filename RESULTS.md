@@ -175,6 +175,8 @@ Parallel nodes, with each check one real model reply: 4454 ms one after another,
 
 Every run of every configuration changed the world exactly as a correct run does, 15 of 15 in each. **Effects reaching the world from a branch that never retired: 0.**
 
+These runs predate a fix: a reply that asked for a write and then for a read of what the write changes used to issue the read early, before the write was sent, and now waits for the write. The runs did not record which calls each reply asked for, so whether any reply had that shape is not known. The stand-in's replies above have none.
+
 ---
 
 ### Pull the plug: what a crash sends twice

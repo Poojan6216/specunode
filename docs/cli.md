@@ -68,7 +68,8 @@ that may or may not have taken effect is asked about through its tool's `reconci
 redelivered if its tool declared a repeat harmless, or dead-lettered until someone records what
 happened with `specunode resolve`. A node that runs again is served any model answer that may
 already have sent something, rather than asked for it again. This needs a live target, because
-an answer the journal does not hold, or one that sent nothing, is asked for. Prints the ledger;
+an answer the journal does not hold, or one that sent nothing, is asked for. A run is driven by
+one process at a time: resuming one that another process is running exits 2. Prints the ledger;
 exits 1 if the run did not complete and 2 if the config is missing, unreadable, or cannot build
 the graph or the target. Options: `--journal`; `--config PATH`.
 
@@ -81,8 +82,8 @@ skips it and hands the node `--ack JSON`, the upstream's own result, if given. `
 records that it never took effect -- a resume sends it, once, under the same key. The claim and
 a journal entry naming who said so are written in one transaction. `KEY` is the effect's key,
 or a unique prefix of it, as `specunode ledger` prints it. Exits 2 if the key matches no
-effect or several, or if the effect is already settled. Options: `--landed`; `--not-sent`;
-`--ack JSON`; `--journal`.
+effect or several, if the effect is already settled, or if a process is running the run.
+Options: `--landed`; `--not-sent`; `--ack JSON`; `--journal`.
 
 ### `specunode replay RUN_ID`
 

@@ -216,3 +216,81 @@ async def test_another_tasks_drain_does_not_send_a_guess_whose_turn_is_streaming
     assert [m.tool for m in world.mutations] == ["post_summary"], "the guessed restart went out"
     reasons = [e.payload["reason"] for e in journal.read(result.run_id, kinds=["effect_discarded"])]
     assert "turn_failed" in reasons
+
+
+async def test_a_stream_that_just_stops_is_a_failed_turn(tmp_path: object) -> None:
+    """No TurnComplete -- a dropped connection the client did not report. The turn was read as
+    complete, and a guess it had confirmed went out with no decision on disk."""
+
+    class JustStops:
+        async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+            raise NotImplementedError
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            yield ToolUseComplete(
+                index=0,
+                block=ToolUseBlock(id="t0", name="fetch_runbook", args={"section": "restart"}),
+            )
+            deadline = time.monotonic() + 10.0
+            while (  # noqa: ASYNC110
+                scheduler is None or scheduler.counters.effects_staged < 1
+            ) and time.monotonic() < deadline:
+                await asyncio.sleep(0.001)
+            yield ToolUseComplete(
+                index=1, block=ToolUseBlock(id="t1", name=RESTART.name, args=dict(RESTART.args))
+            )
+
+    async def tolerant(session: RunSession) -> None:
+        with contextlib.suppress(ModelError):
+            await session.call_turn(ASK)  # type: ignore[misc]
+
+    world = standard_world()
+    registry = registry_for(world)
+    journal = Journal(tmp_path / "journal.db")  # type: ignore[operator]
+    scheduler: Scheduler | None = None
+    scheduler = Scheduler(
+        graph=OneNode(tolerant),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(JustStops(), journal),
+        policy=Policy(speculation=True),
+        predictor=FixedDrafter(RESTART),  # type: ignore[arg-type]
+    )
+    result = await scheduler.run(new_ulid(), {})
+    assert result.ok, result.error
+    assert world.mutations_by("restart_job") == [], "a guess went out on a turn never completed"
+    assert not list(journal.read(result.run_id, kinds=["model_response"]))
+
+
+async def test_a_turn_that_fails_on_the_runtimes_side_is_closed_at_once(tmp_path: object) -> None:
+    """The drafter raised mid-stream, not the model. The stream was left for the garbage
+    collector to close, and until it did, the node's next write was refused."""
+
+    class Broken:
+        async def predict(self, context: object) -> list[object]:
+            raise KeyError("pattern index corrupt")
+
+    async def write_after_failure(session: RunSession) -> None:
+        try:
+            await session.call_turn(ASK)  # type: ignore[misc]
+        except KeyError:
+            await session.call_tool("restart_job", {"job_id": "etl-1"})
+
+    world = standard_world()
+    registry = registry_for(world)
+    journal = Journal(tmp_path / "journal.db")  # type: ignore[operator]
+    scheduler = Scheduler(
+        graph=OneNode(write_after_failure),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(FailsPartWay(lambda: True), journal),
+        policy=Policy(speculation=True),
+        predictor=Broken(),  # type: ignore[arg-type]
+    )
+    result = await scheduler.run(new_ulid(), {})
+    assert result.ok, result.error
+    assert [m.tool for m in world.mutations] == ["restart_job"]

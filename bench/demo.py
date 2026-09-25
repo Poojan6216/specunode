@@ -39,7 +39,12 @@ from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
 from specunode.canonical import JsonValue, chash_bytes
 from specunode.core.decision import Decision, ToolCall
-from specunode.core.effects import EffectClass, ToolRegistry, ToolSpec
+from specunode.core.effects import (
+    EffectClass,
+    ToolRegistry,
+    ToolSpec,
+    forward_keys_from_template,
+)
 from specunode.core.graph import END, AdapterCapabilities, NextNode, NodeRef, RunSession
 from specunode.core.model import JournaledModel, Message, RequestEnvelope, TextBlock
 from specunode.core.policy import Policy
@@ -267,6 +272,10 @@ def past_write_registry(world: World, clock: float, calls: list[CallRecord]) -> 
 
         return wrapper
 
+    # What each call touches, declared, so the runtime can see the runbook read is independent
+    # of the restart before it runs it early. Undeclared, a read after a write in the same turn
+    # waits for the write -- it may read what the write changes -- and this demo's overlap is
+    # exactly a read issued past a write.
     registry = ToolRegistry()
     registry.register(
         ToolSpec(
@@ -274,6 +283,7 @@ def past_write_registry(world: World, clock: float, calls: list[CallRecord]) -> 
             effect=EffectClass.READ,
             fn=timed("get_pipeline_status", world.get_pipeline_status),
             witness=True,
+            forward_keys=forward_keys_from_template("job:{args.pipeline_id}"),
         )
     )
     registry.register(
@@ -281,6 +291,7 @@ def past_write_registry(world: World, clock: float, calls: list[CallRecord]) -> 
             name="fetch_runbook",
             effect=EffectClass.READ,
             fn=timed("fetch_runbook", world.fetch_runbook),
+            forward_keys=forward_keys_from_template("runbook:{args.section}"),
         )
     )
     registry.register(
@@ -289,6 +300,7 @@ def past_write_registry(world: World, clock: float, calls: list[CallRecord]) -> 
             effect=EffectClass.WRITE,
             fn=timed("restart_job", world.restart_job),
             idempotent=True,
+            forward_keys=forward_keys_from_template("job:{args.job_id}"),
         )
     )
     registry.register(
@@ -296,6 +308,7 @@ def past_write_registry(world: World, clock: float, calls: list[CallRecord]) -> 
             name="post_summary",
             effect=EffectClass.WRITE,
             fn=timed("post_summary", world.post_summary),
+            forward_keys=forward_keys_from_template("channel:{args.channel}"),
         )
     )
     return registry

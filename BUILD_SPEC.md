@@ -1050,6 +1050,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [2.5] DEFECTS (fixed), found by the seventh review: (1) a node reading `session.model.stream()` that wrote as a block parsed had the write dispatched before the turn was journaled -- a write on a branch with an unjournaled target turn is now refused (`Branch.unjournaled_turns`, `CallScope.track_turn`; tests/integration/test_writes_wait_for_the_turn.py); (2) serving kept the longest attempt, so after a question changed a second resume charged a third time -- it now matches turn by turn and serves the latest attempt that asked the same questions; (3) serving pinned answers that had sent nothing -- only an attempt that may have sent something is served, and `effect_dead_lettered` records `sent`; (4) serving was one slot on a shared model -- it is per run; (5) the docs overstated; (6) the kill/resume sweep could not see it -- it adds a billing node that asks and charges in one step: 20 points, 13 finish, 6 stop for a human, 1 refused, 11 resumes served the standing decision, 0 duplicates. — 2026-09-25
 [2.5] DEFECTS (fixed), found by the eighth review: (1, critical) the dispatcher retried a non-idempotent write after a failure that may have landed -- a lost reply was charged twice with default settings and no crash; now it is retried only if nothing left or the tool is idempotent, else asked about (reconcile) or dead-lettered; (2, critical) a dead letter's `sent` was its last attempt's -- it is now "maybe" if any attempt, here or in an earlier process, may have landed; (3) a resume retried every dead letter -- only one that never left is retried, and `specunode resolve` records an operator's word on the rest (Journal.resolve_dispatch; the ledger shows one row per key); (4) concurrent model calls were matched in answer order -- now in asking order; (5) a guess adopted before a stream failed was sent -- a failed turn discards what it adopted; (6) a failed call_turn blocked the node's later writes -- it no longer does; (7) serving pinned whole attempts -- now only the turns up to the last possible send; (8) the refusal's scope is the whole node run -- kept, documented, message corrected; (9) release notes and docs rewritten. tests/integration/test_lost_replies.py, test_failed_turns.py, unit/test_idempotency.py, unit/test_recorded_turns.py; each rule fails under its own planted bug. Pull the plug re-run: unchanged, 49/13/7/0/0. — 2026-09-25
 [2.5] DEFECTS (fixed), found by the ninth review: (1, critical) a claim taken up for a retry after it never left stayed marked not_sent, so a crash during the retry made the next resume send it again -- `_claim` now re-arms it to in_flight/unknown in one compare-and-set; (2) a failed call_turn restored the open-turn count from a snapshot -- the turn now closes itself (`partial_turns_discarded`); (3) it also discarded other tasks' writes, and a concurrent drain could send a confirmed guess mid-stream -- adoption now waits for the journaled turn, and a failed turn discards only its confirmed guesses; (4) resolve matched only the dedupe key; (5) two dead letters for one key showed as two rows; (6) resolve read and settled separately, and a settle could overwrite a claim settled as sent -- `_settle` now refuses it; (7) any `sent` but "no" counts as maybe. tests/integration/test_turns_at_once.py is new; each fix fails under its own planted bug. — 2026-09-25
+[2.5] DEFECTS (fixed), found by the tenth review: two resumes of one run at once sent a charge twice -- `Journal.hold_run` (in-process registry; flock, or a Postgres advisory lock, released when the holder dies) now holds a run for the length of `run`/`resume`/`resolve`, and a second driver gets RunBusy; a read after a write in the same reply was issued early and saw the pre-write value -- it now waits (`_reads_a_pending_write`); a stream without TurnComplete is a failed turn; call_turn closes its stream deterministically; adoption sits inside the failure cleanup; the ledger checks dispatch against program order; resolve accepts the printed key. tests/integration/test_one_driver_per_run.py is new; each fix fails under its own planted bug. — 2026-09-25
 [3.3] Four tests settled a guess inside a 15–25 ms block delay, which a journal append on a slow CI disk could miss. Found all at once by running the suite with every append 40 ms slower (`tests/slow_journal.py`); each now holds the settling block until the event it needs has happened, and passes at 40, 100 and 250 ms of added latency. The `slow-disk` CI job runs the tests that guess that way on every push. — 2026-09-25
 ```
 
@@ -1060,17 +1061,17 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**933 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
+**939 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Nine independent adversarial reviews have found 115 defects here, 16 of them critical.** The
-counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8.** All are fixed but one, kept on purpose
+**Ten independent adversarial reviews have found 122 defects here, 16 of them critical.** The
+counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7.** All are fixed but one, kept on purpose
 and documented: a node's writes are refused while any model turn it started is unjournaled, even
 one that did not decide the write. That number is the most useful thing in this report, so it
 is at the top rather than buried: the version of this document written a day earlier described
-a finished project. The ninth to sixth reviews (2026-09-25) and the fifth (2026-09-23) are
+a finished project. The tenth to sixth reviews (2026-09-25) and the fifth (2026-09-23) are
 summarised below; the fourth is in commit `c8802ec`.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
@@ -1190,6 +1191,26 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (4 guesses forked, 4 squashed, 4 charges staged and discarded, the
 alpha gate closed once, 0 wasted tokens — a pattern-index guess costs no model tokens — and 0
 leaks) and 7.8 replay under model drift (both cases diverge at step 0).
+
+### What the tenth review found
+
+No critical finding, for the first time; seven others, three major.
+
+- **Two resumes of one run at once sent a charge twice** -- one sent it, the other asked the
+  upstream while it was in flight and sent it again -- and the new refusal to overwrite a
+  settled claim then dropped the second send from the journal. A run is now driven by one
+  process, and one task in it, at a time (`Journal.hold_run`); the lock dies with its holder.
+- **A read after a write in the same reply was handed the value from before the write** when
+  reads were issued early, which is the default. The hazard was detected and counted, and the
+  read ran anyway. It now waits and runs after the write. A test that called its read
+  "independent" was reading the very row the write changed; it now reads something else.
+- **A stream that ended without completing its turn** was read as complete, and a guess it had
+  confirmed was sent with no decision on disk. It is a failed turn now.
+- A call_turn that failed on the runtime's side left its stream to the garbage collector, and
+  the turn open until then; the adoption loop sat outside the failure cleanup; the ledger
+  checked the order effects left against stage index, not position, and called a correct run
+  out of order; and `specunode resolve` rejected the key as printed, ellipsis included. All
+  fixed. The real-model results in RESULTS.md predate the read fix, and say so.
 
 ### What the ninth review found, in the eighth review's fixes
 

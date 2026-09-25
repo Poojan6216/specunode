@@ -715,6 +715,13 @@ def model_bound_online_section() -> str:
         "",
         f"{verdict} **Effects reaching the world from a branch that never retired: {leaks}.**",
         "",
+        # These runs were measured on the code of their day, and one fix since could change
+        # what such a run does; said here, where the numbers are, not only in the changelog.
+        "These runs predate a fix: a reply that asked for a write and then for a read of what "
+        "the write changes used to issue the read early, before the write was sent, and now "
+        "waits for the write. The runs did not record which calls each reply asked for, so "
+        "whether any reply had that shape is not known. The stand-in's replies above have none.",
+        "",
     ]
     if report.get("halted_at"):
         lines += [f"Halted at the spend cap: {report['halted_at']}.", ""]

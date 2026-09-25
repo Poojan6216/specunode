@@ -205,7 +205,7 @@ async def test_an_operator_settles_a_dead_letter_and_the_resume_goes_on(tmp_path
         [
             "resolve",
             RUN,
-            row.key[:8],  # the key as `specunode ledger` prints it
+            row.key[:8] + "…",  # the key exactly as `specunode ledger` prints it
             "--landed",
             "--ack",
             '{"charge_id": "ch_1"}',

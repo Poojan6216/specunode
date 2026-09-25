@@ -387,9 +387,12 @@ class StoreBuffer:
         the tool is handed, and an idempotency key that shifted when a guess turned out right
         would make a retry after adoption look like a different call.
 
-        ``stage_index`` is renumbered onto the end of the parent's list, preserving order: the
-        adoption happens mid-stream, before the parent stages anything the turn's later blocks
-        ask for, so appending is the order the sequential run would have produced.
+        ``stage_index`` is renumbered onto the end of the parent's list. That is not program
+        order: adoption happens once the turn is journaled, before the parent stages the writes
+        the model emitted in the turn, so a confirmed guess can take a lower stage index than a
+        write the model asked for ahead of it. The drain sends by position (``step``), which
+        is program order either way, and the ledger checks the order effects left against
+        position, not stage index.
         """
         # Recorded *before* the move, and never only after it. ``adopt`` is a point-in-time
         # transfer, but the child's task may not have reached :meth:`stage` yet -- the model can

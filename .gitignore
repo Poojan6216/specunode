@@ -25,3 +25,6 @@ bench/corpus/values_full_manifest.json
 # The project reports are for us, not for the public repository. bench/make_report_pdf.py
 # still writes SpecuNode-Report-generated.pdf here; it stays local.
 /SpecuNode-Report*.pdf
+
+# Per-run locks next to a SQLite journal (Journal.hold_run).
+*.db.locks/

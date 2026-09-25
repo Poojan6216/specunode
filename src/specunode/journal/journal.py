@@ -64,6 +64,7 @@ __all__ = [
     "JournalError",
     "JournalWriteError",
     "PendingClaim",
+    "RunBusy",
     "close_all_writers",
 ]
 
@@ -104,6 +105,9 @@ _REARM_NOT_SENT = (
     "claimed_at = :claimed_at WHERE run_id = :run_id AND nkey = :nkey "
     "AND last_outcome = 'not_sent' AND status IN ('in_flight', 'dead_letter')"
 )
+# Session-scoped, so a process that dies releases it with its connection.
+_TRY_RUN_LOCK = "SELECT pg_try_advisory_lock(hashtext(:key)) AS locked"
+_RUN_UNLOCK = "SELECT pg_advisory_unlock(hashtext(:key)) AS unlocked"
 _UPDATE_NOT_SENT = (
     "UPDATE effect_dispatch SET last_outcome = 'not_sent', attempt = :attempt "
     "WHERE run_id = :run_id AND nkey = :nkey"
@@ -143,6 +147,15 @@ class JournalConcurrencyError(JournalError):
 
 class JournalBusy(JournalError):
     """A cross-process lock could not be acquired within the busy timeout."""
+
+
+class RunBusy(JournalError):
+    """Another process, or another task in this one, is already driving this run."""
+
+
+#: Runs being driven in this process, by journal location. ``Journal.hold_run``.
+_held_runs: set[tuple[str, str]] = set()
+_held_runs_lock = threading.Lock()
 
 
 class Claim(Enum):
@@ -1001,6 +1014,65 @@ class Journal:
         return await self._writer.submit_async(
             lambda: self._writer._settle(run_id, nkey, status, ack, attempt, kind, payload)
         )
+
+    @contextlib.contextmanager
+    def hold_run(self, run_id: str) -> Iterator[None]:
+        """Drive ``run_id`` alone -- one process, and one task in it, at a time -- or raise.
+
+        Two resumes of one run at once -- a job queue that delivers the resume twice, a retried
+        HTTP handler -- each took up the same claim: one sent the charge, the other asked the
+        upstream while it was still in flight, heard "absent", and sent it again. So the run is
+        held for as long as it is driven: in this process by a registry, across processes by a
+        lock the operating system (or Postgres, for a Postgres journal) drops when the process
+        holding it dies -- a crashed run can always be resumed, and a running one cannot be
+        resumed twice.
+        """
+        key = (str(self.location), run_id)
+        with _held_runs_lock:
+            if key in _held_runs:
+                raise RunBusy(f"run {run_id!r} is already being driven in this process")
+            _held_runs.add(key)
+        try:
+            with self._run_lock(run_id):
+                yield
+        finally:
+            with _held_runs_lock:
+                _held_runs.discard(key)
+
+    @contextlib.contextmanager
+    def _run_lock(self, run_id: str) -> Iterator[None]:
+        if self.is_postgres:
+            lock = {"key": f"specunode-run:{run_id}"}
+            backend = self._writer._backend
+            row = self._writer.submit(lambda: backend.execute(_TRY_RUN_LOCK, lock).fetchone())
+            if not row or not row["locked"]:
+                raise RunBusy(f"run {run_id!r} is being driven by another process")
+            try:
+                yield
+            finally:
+                self._writer.submit(lambda: backend.execute(_RUN_UNLOCK, lock).fetchone())
+            return
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - not a platform CI runs on
+            yield
+            return
+        path = Path(self.location)
+        folder = path.with_name(path.name + ".locks")
+        folder.mkdir(exist_ok=True)
+        name = run_id if re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id) else chash(run_id)[:40]
+        handle = os.open(folder / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RunBusy(f"run {run_id!r} is being driven by another process") from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            os.close(handle)
 
     def resolve_dispatch(
         self,

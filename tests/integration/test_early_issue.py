@@ -17,7 +17,12 @@ from pathlib import Path
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import StoreBuffer
 from specunode.core.decision import Decision, ToolCall
-from specunode.core.effects import EffectClass, ToolRegistry, ToolSpec
+from specunode.core.effects import (
+    EffectClass,
+    ToolRegistry,
+    ToolSpec,
+    forward_keys_from_template,
+)
 from specunode.core.graph import END, AdapterCapabilities, NextNode, NodeRef, RunSession
 from specunode.core.model import (
     JournaledModel,
@@ -217,7 +222,27 @@ async def test_a_read_still_in_flight_at_retirement_does_not_demote_the_branch(
     """
     world = standard_world()
     world.slow("read", 300)
-    registry = registry_for(world)
+    # Declared, so the runtime can see the read does not touch what the write does. It used to
+    # read the pipeline status -- the very row the restart writes -- which an early read got
+    # wrong, and which now runs after the write instead of racing it.
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="restart_job",
+            effect=EffectClass.WRITE,
+            fn=world.restart_job,
+            idempotent=True,
+            forward_keys=forward_keys_from_template("job:{args.job_id}"),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="fetch_runbook",
+            effect=EffectClass.READ,
+            fn=world.fetch_runbook,
+            forward_keys=forward_keys_from_template("runbook:{args.section}"),
+        )
+    )
     journal = Journal(tmp_path / "in-flight-read.db")
     model = ScriptedModel(
         # Write first, independent read second: the read is issued as the stream's last block
@@ -225,7 +250,7 @@ async def test_a_read_still_in_flight_at_retirement_does_not_demote_the_branch(
         turns=[
             tool_turn(
                 ("restart_job", {"job_id": "etl-1"}),
-                ("get_pipeline_status", {"pipeline_id": "etl-1"}),
+                ("fetch_runbook", {"section": "restart"}),
                 turn=0,
             )
         ],
@@ -381,3 +406,57 @@ async def test_staleness_is_rechecked_for_every_read_not_only_the_unauthorised_o
     validated = [e.payload for e in journal.read(run_id, kinds=["read_validated"])]
     assert validated, "no read_validated entry was journaled"
     assert validated[-1]["total"] > 0
+
+
+async def test_a_read_after_a_write_in_the_same_reply_sees_the_write(tmp_path: Path) -> None:
+    """The reply asks to charge a customer and then to look them up. Issued early, as blocks
+    parse, the lookup ran before the charge -- which is staged when the turn ends -- and the
+    node was handed the balance from before it. The hazard check noticed, counted a stall, and
+    let the read go ahead anyway. A read of something a write earlier in the turn changes now
+    runs in program order, after the write is sent."""
+    from examples.support_agent.agent import build_tools
+    from tests.chaos._kill_agent import seeded_world
+
+    from specunode.integrations.plain import PlainAdapter, node, registry_of
+
+    seen: dict[str, object] = {}
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        ask = RequestEnvelope(
+            model="scripted",
+            messages=(Message(role="user", content=(TextBlock(text="charge, then show"),)),),
+            stream=True,
+        )
+        results = await session.call_turn(ask)  # type: ignore[misc]
+        seen["balance"] = results[1]["value"]["balance"]
+        session.state["billed"] = True
+        return ToolCall("lookup_customer", {"customer_id": "cus-1"})
+
+    world = seeded_world(tmp_path)
+    registry = registry_of(build_tools(world))
+    journal = Journal(tmp_path / "journal.db")
+    scheduler = Scheduler(
+        graph=PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill"),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(
+            ScriptedModel(
+                turns=[
+                    tool_turn(
+                        ("charge_card", {"customer_id": "cus-1", "amount": 25.0}),
+                        ("lookup_customer", {"customer_id": "cus-1"}),
+                    )
+                ],
+                block_delay_ms=5,
+            ),
+            journal,
+        ),
+        policy=Policy(speculation=False, early_issue=True),
+    )
+    result = await scheduler.run(new_ulid(), {})
+    world.close()
+    assert result.ok, result.error
+    assert seen["balance"] == 75.0, "the read ran before the write the model asked for first"

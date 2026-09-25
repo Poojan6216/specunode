@@ -96,6 +96,13 @@ a second, different call only when something that shapes it changed across the c
 tool declared idempotent may be handed the *same* call again, after a crash lost the reply to
 its first delivery; that is what declaring it idempotent permits.
 
+It also assumes one driver per run. `run` and `resume` hold the run for as long as they drive
+it -- within a process, and across processes through a lock the operating system (or, for a
+Postgres journal, the database) releases when the process holding it dies -- and a second
+attempt to drive it raises `RunBusy`. Two resumes of one run at once used to take up the same
+claim, and between them send it twice. The lock is not taken on Windows, where only the
+in-process half applies.
+
 There is no setting that makes a model answer a changed question the same way, and on the
 current models there is not even one that narrows it: `temperature`, `top_p` and `top_k` are
 rejected outright by Claude Sonnet 5 and Claude Opus 5 (HTTP 400, "`temperature` is deprecated

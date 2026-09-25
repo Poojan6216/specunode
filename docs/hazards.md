@@ -13,7 +13,7 @@ disjoint buckets and a run's stalls can be attributed rather than lumped togethe
 | `RETURN_VALUE_DEPENDENCY` | a placeholder appears anywhere in the call's arguments | before a call |
 | `IRREVERSIBLE_ON_PATH` | an `IRREVERSIBLE` effect would have to be staged, and `stage_irreversible` is off | before a call, on a speculative branch only |
 | `WRITE_ON_PATH` | a predicted call is not a `READ`, and `speculate_writes` is off — PASTE's rule | before a call, on a guess only |
-| `READ_AFTER_STAGED_WRITE` | a read touches a resource key a staged write touches | before a call |
+| `READ_AFTER_STAGED_WRITE` | a read touches a resource key a staged write -- or a write the model emitted earlier in the same turn -- touches | before a call, and before a read is issued early |
 | `BUDGET` | speculation depth or the in-flight limit is reached | before a call |
 | `FREE_TEXT_NODE` | the predicted decision is prose | when filtering a candidate |
 | `NODE_NOT_SPECULABLE` | a predicted route enters a node that did not opt in | when filtering a candidate |

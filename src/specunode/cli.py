@@ -191,7 +191,11 @@ def resume(
         policy=loaded.to_policy(),
         reducers=loaded.state.reducers,
     )
-    result = asyncio.run(scheduler.resume(run_id))
+    try:
+        result = asyncio.run(scheduler.resume(run_id))
+    except JournalError as exc:  # RunBusy: another process is driving this run
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from exc
     typer.echo(render_ledger(result.ledger))
     if not result.ok:
         typer.echo(f"run did not complete: {result.error}", err=True)
@@ -225,6 +229,8 @@ def resolve(
     if landed == not_sent:
         typer.echo("say which: --landed or --not-sent", err=True)
         raise typer.Exit(2)
+    # The ledger shortens keys with an ellipsis; a key pasted from it keeps one.
+    key = key.rstrip("…").rstrip(".")
     book = Journal(journal)
     # Either key names the effect: the ledger prints the idempotency key the tool was handed,
     # and the dedupe key is what the claim is filed under. Both lead to the dedupe key.
@@ -243,7 +249,9 @@ def resolve(
         raise typer.Exit(2)
     try:
         parsed = None if ack is None else json.loads(ack)
-        offset = book.resolve_dispatch(run_id, matches[0], landed=landed, ack=parsed)
+        # Never while the run is being driven: its own outcome could land in between.
+        with book.hold_run(run_id):
+            offset = book.resolve_dispatch(run_id, matches[0], landed=landed, ack=parsed)
     except (ValueError, JournalError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc

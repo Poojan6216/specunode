@@ -759,17 +759,25 @@ class JournaledModel:
                 yield TurnComplete(response=response)
                 return
             started = time.monotonic()
+            completed = False
             async for event in self._inner.stream(envelope):
                 if isinstance(event, TurnComplete):
                     latency_ms = int((time.monotonic() - started) * 1000)
                     await self._journal_response(
                         event.response, scope, request_id, digest, latency_ms
                     )
+                    completed = True
                     if track is not None:
                         track(-1)
                         track = None
                 handed_over = True
                 yield event
+            if not completed:
+                # A stream that simply stops -- a dropped connection the client did not report
+                # -- ended a turn that was never journaled. Treated as what it is, a failure:
+                # read as a complete turn, it let a confirmed guess's write go out with no
+                # decision on disk.
+                raise ModelError("the model's stream ended without completing its turn")
         except BaseException:
             # A turn that failed before the caller saw any of it left nothing to act on, and
             # neither did one read by call_turn, which hands a failed turn to nobody. One a

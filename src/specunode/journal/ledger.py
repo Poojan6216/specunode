@@ -589,7 +589,7 @@ def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
         alpha_samples=alpha_samples,
         alpha_by_tier=alpha_by_tier,
         alpha_gate_unmeasured=alpha_gate_unmeasured,
-        dispatch_order_anomalies=sum(1 for row in rows if row.dispatch_index != row.stage_index),
+        dispatch_order_anomalies=_order_anomalies(rows),
         args_hash_mismatches=sum(1 for row in rows if row.args_mismatch),
         post_write_span=_post_write_span(state),
         policy_events=tuple(policy_events),
@@ -741,6 +741,27 @@ def _row(
         args_mismatch=bool(staged_hash and dispatched_hash and staged_hash != dispatched_hash),
         dry_run=_as_bool(payload, "dry_run"),
     )
+
+
+def _order_anomalies(rows: Sequence[LedgerRow]) -> int:
+    """Effects each branch sent out of program order: by position, then by stage.
+
+    Program order, not stage order. A confirmed guess is staged when its turn is journaled,
+    before the writes the model emitted ahead of it in the same turn are staged -- so its stage
+    index is lower though its position is later -- and the drain, which sends by position,
+    sent a correct run in exactly the right order while this reported it out of order.
+    """
+    anomalies = 0
+    by_branch: dict[str, list[LedgerRow]] = {}
+    for row in rows:
+        by_branch.setdefault(row.branch_id, []).append(row)
+    for branch_rows in by_branch.values():
+        program = sorted(branch_rows, key=lambda row: (row.step_index, row.stage_index))
+        sent = sorted(branch_rows, key=lambda row: row.dispatch_index)
+        anomalies += sum(
+            1 for a, b in zip(program, sent, strict=True) if a.effect_id != b.effect_id
+        )
+    return anomalies
 
 
 def _authorised_by_step(state: _Build, payload: Mapping[str, JsonValue], branch_id: str) -> int:
@@ -1366,9 +1387,9 @@ def _summary(ledger: Ledger, *, ellipsis: str, equivalence_digest: str | None) -
         )
     gate = "  [gate inactive: unmeasured]" if ledger.alpha_gate_unmeasured else ""
     order = (
-        "stage-ordered"
+        "in program order"
         if ledger.dispatch_order_anomalies == 0
-        else f"{ledger.dispatch_order_anomalies} effect(s) dispatched out of stage order"
+        else f"{ledger.dispatch_order_anomalies} effect(s) dispatched out of program order"
     )
     lines = [
         f"squashed branches: {ledger.squashed_branches}   "

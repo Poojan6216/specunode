@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
@@ -41,14 +41,16 @@ from specunode.buffer.store_buffer import EffectOutcome, StoreBuffer
 from specunode.canonical import JsonValue, chash
 from specunode.core.branch import Branch, BranchStatus, ReadRecord, StepCursor
 from specunode.core.decision import Decision, ToolCall, decision_key, decision_payload, is_barrier
-from specunode.core.effects import EffectClass, ToolRegistry
+from specunode.core.effects import EffectClass, ToolRegistry, ToolSpec
 from specunode.core.graph import END, GraphAdapter, NodeRef, Parallel, RunSession, session_scope
-from specunode.core.hazards import Hazard, analyse, keys_touched
+from specunode.core.hazards import Hazard, analyse, keys_conflict, keys_touched
 from specunode.core.model import (
     CallScope,
     ModelClient,
+    ModelError,
     ModelResponse,
     RequestEnvelope,
+    StreamEvent,
     ToolUseComplete,
     TurnComplete,
     TurnResults,
@@ -484,7 +486,14 @@ class Scheduler:
         point has exactly one branch: the canonical one. It is confirmed by the model's own
         output rather than resolved against a prediction, and then retired. Phase 3 adds
         siblings beside it; the retirement sequence below does not change.
+
+        Held for its whole length (``Journal.hold_run``): a run is driven by one process, and
+        one task in it, at a time.
         """
+        with self.journal.hold_run(run_id):
+            return await self._run(run_id, inputs)
+
+    async def _run(self, run_id: str, inputs: JsonValue) -> RunResult:
         self.run_id = run_id
         # One source of truth for the run id. Letting the buffer carry its own lets the two
         # disagree, and the failure is silent and confident: effects are journaled under one
@@ -585,6 +594,15 @@ class Scheduler:
         )
 
     async def resume(self, run_id: str) -> RunResult:
+        """Continue a run that was interrupted; see :meth:`_resume`.
+
+        Held for its whole length, like :meth:`run`: two resumes of one run at once each took up
+        the same claim, and between them sent a charge twice.
+        """
+        with self.journal.hold_run(run_id):
+            return await self._resume(run_id)
+
+    async def _resume(self, run_id: str) -> RunResult:
         """Continue a run that was interrupted, without re-sending what already went out.
 
         Nothing is replayed and nothing is re-decided: committed state is rebuilt from the
@@ -1787,6 +1805,8 @@ class SpeculativeTurn:
 
         try:
             await self._consume(envelope, tools, slots)
+            if self.response is None:
+                raise ModelError("the model's stream ended without completing its turn")
         except BaseException:
             # A stream that raised, or a node task cancelled, with a guess still open: grade
             # it, discard what it staged, cancel its task and journal the resolution before
@@ -1804,15 +1824,21 @@ class SpeculativeTurn:
                     child, "turn_failed"
                 )
             raise
-        # The turn is journaled: what the guesses it confirmed staged becomes this branch's.
-        for child in self._confirmed:
-            await scheduler.buffer.adopt(child, branch)
 
         # Any speculation still open when the turn ended predicted a call the model never made.
         await self._squash_open("turn_ended")
         try:
+            # The turn is journaled: what the guesses it confirmed staged becomes this branch's.
+            while self._confirmed:
+                await scheduler.buffer.adopt(self._confirmed[0], branch)
+                self._confirmed.pop(0)
             results = await self._settle_turn(tools, slots)
         except BaseException:
+            # A guess not yet adopted when this failed stays where nothing drains it.
+            for child in self._confirmed:
+                scheduler.counters.effects_discarded += await scheduler.buffer.discard_and_journal(
+                    child, "turn_failed"
+                )
             # Settling is where a node parks on its own staged write, so it is where a node is
             # cancelled when a sibling in its group fails, and where a write whose ack fails
             # raises. The reads this turn issued early for later blocks were still running
@@ -1858,7 +1884,26 @@ class SpeculativeTurn:
         slots: list[asyncio.Task[JsonValue] | None],
     ) -> None:
         scheduler = self._scheduler
-        async for event in scheduler.target.stream(envelope):
+        stream = scheduler.target.stream(envelope)
+        try:
+            await self._read_events(stream, tools, slots)
+        finally:
+            # Closed here, inside partial_turns_discarded, when this loop fails for a reason of
+            # its own -- a drafter that raised, a journal error, a cancellation between blocks.
+            # Left to the garbage collector, the turn stayed open until it ran, and a node that
+            # caught the failure and wrote at once was refused.
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
+
+    async def _read_events(
+        self,
+        stream: AsyncIterator[StreamEvent],
+        tools: BranchTools,
+        slots: list[asyncio.Task[JsonValue] | None],
+    ) -> None:
+        scheduler = self._scheduler
+        async for event in stream:
             if isinstance(event, ToolUseComplete):
                 actual = ToolCall(name=event.block.name, args=event.block.args)
                 await self._resolve_prediction(actual)
@@ -1869,7 +1914,13 @@ class SpeculativeTurn:
                 ordinal = len(slots)
                 if spec.effect is not EffectClass.READ:
                     self._pending_write_keys.append(keys_touched(spec, actual.args))
-                early = scheduler.policy.early_issue
+                # Not a read of something a write earlier in this turn changes: issued now, it
+                # would return the value from before the write, which is staged only when the
+                # turn ends. It runs in program order instead, after the write is sent. The
+                # hazard check saw this and counted a stall -- and the read went ahead anyway.
+                early = scheduler.policy.early_issue and not self._reads_a_pending_write(
+                    spec, actual
+                )
                 if spec.effect is EffectClass.READ and self._adopted is None and early:
                     self.reads_issued_early += 1
                     slots.append(asyncio.create_task(self._timed_read(tools, actual, ordinal)))
@@ -1887,6 +1938,11 @@ class SpeculativeTurn:
             elif isinstance(event, TurnComplete):
                 self.stream_ended_at = time.monotonic()
                 self.response = event.response
+
+    def _reads_a_pending_write(self, spec: ToolSpec, call: ToolCall) -> bool:
+        """Whether ``call`` may read what a write the model emitted earlier this turn changes."""
+        touched = keys_touched(spec, call.args)
+        return any(keys_conflict(touched, written) for written in self._pending_write_keys)
 
     async def _settle_turn(
         self, tools: BranchTools, slots: list[asyncio.Task[JsonValue] | None]

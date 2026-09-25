@@ -300,3 +300,96 @@ async def test_two_writes_and_a_trailing_read_do_not_collide(tmp_path: Path) -> 
     )
     steps = sorted(r.step_index for r in result.ledger.rows)
     assert len(set(steps)) == len(steps), f"two effects share a program position: {steps}"
+
+
+async def test_a_guess_confirmed_after_an_emitted_write_is_reported_in_program_order(
+    tmp_path: Path,
+) -> None:
+    """The turn asks for a lookup, a charge, then the receipt a guess had already staged. The
+    guess joins the branch when the turn is journaled, before the charge is staged, so its
+    stage index is the lower one. The drain sends by position -- charge, then receipt -- and the
+    ledger, checking stage index instead, reported a correct run as out of order."""
+    import asyncio
+    import time
+    from collections.abc import AsyncIterator
+
+    from examples.support_agent.agent import build_tools
+    from tests.chaos._kill_agent import seeded_world
+
+    from specunode.core.decision import Decision
+    from specunode.core.graph import RunSession
+    from specunode.core.model import (
+        Message,
+        RequestEnvelope,
+        StreamEvent,
+        TextBlock,
+        ToolUseComplete,
+        TurnComplete,
+    )
+    from specunode.drafters.base import Prediction
+    from specunode.integrations.plain import PlainAdapter, node, registry_of
+    from specunode.journal.ledger import build_ledger, render_ledger
+
+    receipt = ("send_receipt", {"customer_id": "cus-1", "charge_id": "ch_known"})
+    scheduler: Scheduler | None = None
+
+    class GuessesTheReceipt:
+        async def predict(self, context: object) -> list[Prediction]:
+            history = getattr(context, "history", ())
+            if history and history[-1].name == "charge_card":
+                return [Prediction(decision=ToolCall(*receipt), tier=1, score=0.9)]
+            return []
+
+    class Model:
+        async def complete(self, envelope: RequestEnvelope) -> object:
+            raise NotImplementedError
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            reply = tool_turn(
+                ("lookup_customer", {"customer_id": "cus-1"}),
+                ("charge_card", {"customer_id": "cus-1", "amount": 25.0}),
+                receipt,
+            )
+            yield ToolUseComplete(index=0, block=reply.content[0])  # type: ignore[arg-type]
+            yield ToolUseComplete(index=1, block=reply.content[1])  # type: ignore[arg-type]
+            deadline = time.monotonic() + 10.0
+            while (  # noqa: ASYNC110
+                scheduler is None or scheduler.counters.effects_staged < 1
+            ) and time.monotonic() < deadline:
+                await asyncio.sleep(0.001)
+            yield ToolUseComplete(index=2, block=reply.content[2])  # type: ignore[arg-type]
+            yield TurnComplete(response=reply)
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        await session.call_turn(  # type: ignore[misc]
+            RequestEnvelope(
+                model="scripted",
+                messages=(Message(role="user", content=(TextBlock(text="bill"),)),),
+                stream=True,
+            )
+        )
+        session.state["billed"] = True
+        return ToolCall("send_receipt", {})
+
+    world = seeded_world(tmp_path)
+    registry = registry_of(build_tools(world))
+    journal = Journal(tmp_path / "journal.db")
+    scheduler = Scheduler(
+        graph=PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill"),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(Model(), journal),  # type: ignore[arg-type]
+        policy=Policy(speculation=True),
+        predictor=GuessesTheReceipt(),  # type: ignore[arg-type]
+    )
+    result = await scheduler.run(new_ulid(), {})
+    world.close()
+    assert result.ok, result.error
+    assert sum(turn.adopted for turn in scheduler._turns) == 1, "the guess was not confirmed"
+    assert [m.tool for m in world.mutations] == ["charge_card", "send_receipt"]
+    ledger = build_ledger(journal, result.run_id)
+    assert ledger.dispatch_order_anomalies == 0
+    assert "in program order" in render_ledger(ledger)
