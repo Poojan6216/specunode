@@ -1412,7 +1412,7 @@ The Progress Log has 130+ entries; these changed the shape of the build.
 
 | Item | Status |
 |---|---|
-| Wheel on 3.11/3.12/3.13, macOS **and Ubuntu** | Verified on macOS for all three. Ubuntu is CI-only and CI has not been run. |
+| Wheel on 3.11/3.12/3.13, macOS **and Ubuntu** | Verified by CI on all six, with the test suite and a Postgres 16 job, since the repository went public (2026-09-25). |
 | The three tests on every workload, every tier, **every CI job** | They run, are never skipped, and cover all three sample apps at tiers 0 and 1. Tier 2 is a draft *model* behind an optional extra — requiring it would make a mandatory test skippable, which is the one property these files may never have, so it has its own tests. The open clause is **every CI job**. |
 | Offline ✓, overhead ✓, adversarial ✓, **online latency** | The runner exists and CI exercises all of it on every push with `--model scripted`. A real measurement needs an API key; a scripted report is stamped `is_real_model: false`. |
 | Published to PyPI; demoed from the published wheel | Needs credentials. |
@@ -1462,8 +1462,10 @@ accept that the clause holds only for clients that report node ids.
    corrected.
 2. **PyPI credentials**, for task 9.3. `uv build` works and the wheel installs and runs on 3.11,
    3.12 and 3.13 locally.
-3. **Run CI once.** The Ubuntu matrix, the Postgres 16 job and the extras matrix have never
-   executed.
+3. **Done, 2026-09-25: CI runs.** The repository is public at
+   https://github.com/Poojan6216/specunode. Its first run failed every test job on causes no
+   local run could show -- a test reading a file that is never committed, and three kill tests
+   whose timing assumed a laptop -- all fixed; every job has passed since.
 4. **Decide Phase Gate 4's ledger clause**, as above.
 
 Decision Gate D1 did **not** fire: the corpus was fetched from Hugging Face, so the opportunity

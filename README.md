@@ -1,5 +1,7 @@
 # SpecuNode
 
+[![CI](https://github.com/Poojan6216/specunode/actions/workflows/ci.yml/badge.svg)](https://github.com/Poojan6216/specunode/actions/workflows/ci.yml)
+
 **Agents that take real actions, and never take one twice.**
 
 SpecuNode is a runtime for AI agents whose tools change the world: charging a card, restarting a
