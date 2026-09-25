@@ -25,6 +25,9 @@ def main() -> None:
         time.sleep(delay_ms / 1000.0)
         os._exit(9)
 
+    # Timed from where the killer's clock starts, so the test can calibrate its kill window
+    # against the same span -- not against interpreter start-up, which the killer never sees.
+    started = time.monotonic()
     if delay_ms >= 0:
         threading.Thread(target=killer, daemon=True).start()
 
@@ -33,7 +36,8 @@ def main() -> None:
         journal.append(
             run_id, "policy_event", {"v": 1, "event": "tick", "reason": "kill-test", "i": index}
         )
-    print(f"completed {count}", flush=True)
+    work_ms = (time.monotonic() - started) * 1000.0
+    print(f"completed {count} work_ms={work_ms:.3f}", flush=True)
 
 
 if __name__ == "__main__":

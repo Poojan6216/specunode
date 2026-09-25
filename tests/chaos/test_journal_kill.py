@@ -17,7 +17,6 @@ from __future__ import annotations
 import random
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -38,6 +37,25 @@ def _run_appender(
         text=True,
         timeout=180,
     )
+
+
+def _kill_window_ms(tmp_path: Path) -> float:
+    """How long the append loop takes on this machine: the span a kill must land inside.
+
+    Measured by the helper from where its killer's clock starts, and taken from the fastest of
+    three runs. Timing the whole subprocess counted interpreter start-up, which the killer never
+    sees, and a single warm-up is the slowest run on a cold machine; on CI the two together put
+    most delays past the end of the loop, and only 3 of 15 processes were killed.
+    """
+    windows = []
+    for warm in range(3):
+        result = _run_appender(tmp_path / f"warmup-{warm}.db", delay_ms=-1)
+        assert result.returncode == 0, result.stderr[-600:]
+        for token in result.stdout.split():
+            if token.startswith("work_ms="):
+                windows.append(float(token.split("=", 1)[1]))
+    assert len(windows) == 3, "the helper did not report how long its loop took"
+    return min(windows)
 
 
 def _assert_intact(db: Path, *, expect_at_most: int = ENTRIES) -> int:
@@ -71,18 +89,15 @@ def test_an_uninterrupted_run_writes_every_entry(tmp_path: Path) -> None:
 def test_killing_mid_append_never_leaves_a_partial_entry(tmp_path: Path) -> None:
     # Calibrate against this machine, so the kills land inside the write loop rather than
     # before it starts or after it finishes.
-    warmup = tmp_path / "warmup.db"
-    started = time.monotonic()
-    assert _run_appender(warmup, delay_ms=-1).returncode == 0
-    full_run_s = time.monotonic() - started
-    assert full_run_s > 0.05, "appends are too fast to land a kill inside one; raise ENTRIES"
+    window_ms = _kill_window_ms(tmp_path)
+    assert window_ms > 20, "appends are too fast to land a kill inside one; raise ENTRIES"
 
     rng = random.Random(20260915)
     survivors: list[int] = []
     killed = 0
     for attempt in range(15):
         db = tmp_path / f"kill-{attempt}.db"
-        delay_ms = rng.uniform(0.2, full_run_s * 0.95) * 1000
+        delay_ms = rng.uniform(0.2, window_ms * 0.9)
         result = _run_appender(db, delay_ms=delay_ms)
         if result.returncode != 0:
             killed += 1
@@ -101,11 +116,7 @@ def test_killing_mid_append_never_leaves_a_partial_entry(tmp_path: Path) -> None
 def test_a_killed_journal_can_be_reopened_and_appended_to(tmp_path: Path) -> None:
     """Recovery is not just readable: the chain must continue from where it stopped."""
     db = tmp_path / "journal.db"
-    started = time.monotonic()
-    _run_appender(tmp_path / "warmup.db", delay_ms=-1)
-    full_run_s = time.monotonic() - started
-
-    _run_appender(db, delay_ms=full_run_s * 400)  # kill roughly mid-run
+    _run_appender(db, delay_ms=_kill_window_ms(tmp_path) * 0.4)  # kill roughly mid-loop
     before = _assert_intact(db)
 
     journal = Journal(db)

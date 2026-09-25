@@ -244,6 +244,10 @@ def _tier2(tmp_path: Path, *extra: str) -> dict[str, object]:
             "40",
             "--out",
             str(out),
+            # The committed sidecar, not the runner's default undigested one: that one is
+            # rebuilt on demand and never committed, so a fresh checkout -- CI's -- lacks it.
+            "--values",
+            str(REPO / "bench" / "corpus" / "values.json"),
             *extra,
         ],
         capture_output=True,

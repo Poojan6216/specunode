@@ -128,9 +128,15 @@ def test_killing_and_resuming_never_duplicates_and_never_invents(tmp_path: Path)
     """
     _clean_dir, _clean_run, clean_effects, _clean_normalised = clean_run(tmp_path)
 
-    calibration = tmp_path / "calibrate"
-    calibration.mkdir()
-    work_ms = work_ms_of(run_agent(calibration, "01CALIBAAAAAAAAAAAAAAAAAAA", -1))
+    # The fastest of several runs, not one: the first run on a cold machine is the slowest,
+    # and a window taken from it put most delays past the end of every later, faster run --
+    # on CI only 2 of 15 processes were killed.
+    windows = []
+    for warm in range(3):
+        calibration = tmp_path / f"calibrate-{warm}"
+        calibration.mkdir()
+        windows.append(work_ms_of(run_agent(calibration, f"01CALIB{warm:019d}"[:26], -1)))
+    work_ms = min(windows)
     assert work_ms > 1.0, f"the run takes {work_ms:.2f}ms; too fast to land a kill inside it"
 
     rng = random.Random(20260916)
@@ -142,7 +148,7 @@ def test_killing_and_resuming_never_duplicates_and_never_invents(tmp_path: Path)
         directory = tmp_path / f"kill-{attempt}"
         directory.mkdir()
         run_id = f"01KILL{attempt:020d}"[:26]
-        delay_ms = rng.uniform(0.05, work_ms * 0.95)
+        delay_ms = rng.uniform(0.05, work_ms * 0.9)
         if run_agent(directory, run_id, delay_ms).returncode != 0:
             killed += 1
 
