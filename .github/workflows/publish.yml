@@ -45,3 +45,39 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  verify:
+    # Task 9.3: what was just published installs from PyPI into a clean 3.11 venv on both
+    # OSes, and Demo 1, the quickstart and the CLI run against it. The scripts are copied out of
+    # the checkout without src/, so the only specunode they can import is the published one.
+    needs: pypi
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: install the published version from PyPI into a clean venv
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          uv venv --python 3.11 "$RUNNER_TEMP/clean"
+          # A new upload can take a minute to reach the index; retry rather than fail.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if uv pip install --python "$RUNNER_TEMP/clean/bin/python" --no-cache "specunode==$version"; then
+              break
+            fi
+            if [ "$attempt" = 10 ]; then exit 1; fi
+            sleep 30
+          done
+      - name: Demo 1, the quickstart and the CLI, against the installed package only
+        run: |
+          mkdir "$RUNNER_TEMP/scripts"
+          cp -R bench examples "$RUNNER_TEMP/scripts/"
+          cd "$RUNNER_TEMP/scripts"
+          python="$RUNNER_TEMP/clean/bin/python"
+          "$python" -c "import specunode; assert 'site-packages' in specunode.__file__, specunode.__file__; print(specunode.__version__, specunode.__file__)"
+          "$python" bench/demo.py --demo leak
+          "$python" examples/quickstart.py
+          "$RUNNER_TEMP/clean/bin/specunode" --help
