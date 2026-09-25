@@ -1048,6 +1048,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [2.5, 0.3] The kill tests now kill at counted points rather than timed ones. `test_kill_resume` dies before each of the clean run's 27 durable journal writes and either side of each of its 2 world mutations -- 31 points, every one a real mid-run kill on every machine, run four at a time in about 11 s -- and resumes each with a model that would decide differently if asked. Each point's outcome is fixed by what the kill left on disk: 24 finish with exactly the effects of the run they continue, 6 stop for a human on a claim with no outcome, 1 (before the first entry) is refused with nothing to resume; 0 duplicate deliveries. Planted bugs -- a resume that sends nothing new, one that re-sends after a lost reply, one that asks the model again -- each fail it at the point that exposes them. The journal kill test arms its killer after a drawn number of appends and asserts every append that returned survived the kill. Fifteen random delays, calibrated three times over, had failed on CI on both sides of the window. — 2026-09-25
 [2.5] DEFECT (fixed), found by the sixth review: a resume asked the model again for a turn the journal already held, whenever the node's branch had not retired -- so a model that answered differently the second time could make a second, different call after a crash that fell after an effect was sent. A resumed node is now served the journaled answer when its question is identical (`RecordedTurns`), journaled again under the resumed branch with `recorded_from`. The condition left is a question that changed across the crash (docs/limitations.md). — 2026-09-25
 [2.5] DEFECTS (fixed), found by the seventh review: (1) a node reading `session.model.stream()` that wrote as a block parsed had the write dispatched before the turn was journaled -- a write on a branch with an unjournaled target turn is now refused (`Branch.unjournaled_turns`, `CallScope.track_turn`; tests/integration/test_writes_wait_for_the_turn.py); (2) serving kept the longest attempt, so after a question changed a second resume charged a third time -- it now matches turn by turn and serves the latest attempt that asked the same questions; (3) serving pinned answers that had sent nothing -- only an attempt that may have sent something is served, and `effect_dead_lettered` records `sent`; (4) serving was one slot on a shared model -- it is per run; (5) the docs overstated; (6) the kill/resume sweep could not see it -- it adds a billing node that asks and charges in one step: 20 points, 13 finish, 6 stop for a human, 1 refused, 11 resumes served the standing decision, 0 duplicates. — 2026-09-25
+[2.5] DEFECTS (fixed), found by the eighth review: (1, critical) the dispatcher retried a non-idempotent write after a failure that may have landed -- a lost reply was charged twice with default settings and no crash; now it is retried only if nothing left or the tool is idempotent, else asked about (reconcile) or dead-lettered; (2, critical) a dead letter's `sent` was its last attempt's -- it is now "maybe" if any attempt, here or in an earlier process, may have landed; (3) a resume retried every dead letter -- only one that never left is retried, and `specunode resolve` records an operator's word on the rest (Journal.resolve_dispatch; the ledger shows one row per key); (4) concurrent model calls were matched in answer order -- now in asking order; (5) a guess adopted before a stream failed was sent -- a failed turn discards what it adopted; (6) a failed call_turn blocked the node's later writes -- it no longer does; (7) serving pinned whole attempts -- now only the turns up to the last possible send; (8) the refusal's scope is the whole node run -- kept, documented, message corrected; (9) release notes and docs rewritten. tests/integration/test_lost_replies.py, test_failed_turns.py, unit/test_idempotency.py, unit/test_recorded_turns.py; each rule fails under its own planted bug. Pull the plug re-run: unchanged, 49/13/7/0/0. — 2026-09-25
 [3.3] Four tests settled a guess inside a 15–25 ms block delay, which a journal append on a slow CI disk could miss. Found all at once by running the suite with every append 40 ms slower (`tests/slow_journal.py`); each now holds the settling block until the event it needs has happened, and passes at 40, 100 and 250 ms of added latency. The `slow-disk` CI job runs the tests that guess that way on every push. — 2026-09-25
 ```
 
@@ -1058,16 +1059,18 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**907 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
+**924 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Seven independent adversarial reviews have found 98 defects here, 13 of them critical, and
-all 98 are fixed.** The counts, in order, were **23, 17, 13, 24, 9, 6, 6.** That number is the most useful thing in this report, so it is at the top rather
-than buried: the version of this document written a day earlier described a finished project.
-The seventh and sixth reviews (2026-09-25) and the fifth (2026-09-23) are summarised below; the
-fourth is in commit `c8802ec`.
+**Eight independent adversarial reviews have found 107 defects here, 15 of them critical.** The
+counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9.** All are fixed but one, kept on purpose and
+documented: a node's writes are refused while any model turn it started is unjournaled, even
+one that did not decide the write. That number is the most useful thing in this report, so it
+is at the top rather than buried: the version of this document written a day earlier described
+a finished project. The eighth, seventh and sixth reviews (2026-09-25) and the fifth
+(2026-09-23) are summarised below; the fourth is in commit `c8802ec`.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
 were incomplete, and **two of its four criticals were inside those fixes** — one of them was two
@@ -1186,6 +1189,38 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (4 guesses forked, 4 squashed, 4 charges staged and discarded, the
 alpha gate closed once, 0 wasted tokens — a pattern-index guess costs no model tokens — and 0
 leaks) and 7.8 replay under model drift (both cases diverge at step 0).
+
+### What the eighth review found, before the first release
+
+One reviewer, told this was the last look before a version that cannot be withdrawn, and to
+break the seventh review's fixes. Nine findings, two of them critical -- and the worst was
+older than any of this week's work.
+
+- **Critical: a charge whose reply was lost was sent again, with no crash.** The dispatcher
+  retried every failure, whatever the tool declared. A gateway that took a charge and then timed
+  out on the reply was charged a second time on the next attempt, under the default settings.
+  A retry now happens only when the failed attempt demonstrably sent nothing, or the tool
+  declared a repeat harmless; otherwise the runtime asks the tool's `reconcile`, and without
+  one dead-letters it.
+- **Critical: a dead letter recorded only its last attempt.** An attempt that may have landed,
+  followed by one that was refused, was written down as never sent, and a resume then asked the
+  model again. A dead letter is now "maybe" if any attempt, in this process or an earlier one,
+  may have landed.
+- A resume retried every dead letter, including one that may have landed, and applied it twice.
+  It now retries only one that provably never left; for the rest, someone who has checked the
+  upstream records what happened with the new `specunode resolve`, and the resume goes on.
+- Model calls made at once were matched against the journal in the order their answers came
+  back rather than the order they were asked, so none was served.
+- A guess the model confirmed just before its stream failed was adopted and then sent by a node
+  that caught the failure -- on a turn never journaled. A failed turn now discards what it
+  adopted.
+- A failed `call_turn` left its turn open, so a node that asked again and wrote on the new
+  answer was refused. It no longer does; a stream the node read itself still does, on purpose.
+- Serving was all or nothing per attempt, so a bad answer after a charge went out was pinned
+  forever. Only the turns up to the last thing that may have been sent are served now.
+- The refusal covers the whole node run, not the turn that decided the write -- kept, because
+  the runtime cannot tell which turn decided it, and now documented with an accurate message.
+- The release notes and the docs made claims the code did not keep. They were rewritten.
 
 ### What the seventh review found, in the sixth review's fix and beneath it
 

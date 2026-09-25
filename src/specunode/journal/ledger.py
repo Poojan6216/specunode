@@ -666,7 +666,15 @@ def _rows(
         if compensates:
             compensated.add(compensates)
         rows.append(_row(state, entry, payload, retire_seq, "DISPATCHED", compensates))
+    # A dead letter whose effect later went out -- sent by a resume under the same key once it
+    # was known never to have left, or resolved as landed by someone who checked the upstream --
+    # is one effect with one outcome, the later one. Keyed by the dedupe key, not the effect id:
+    # each resume stages the effect afresh under a new id, and the key is what makes it the
+    # same effect.
+    sent = {_as_str(payload, "nkey") for _entry, payload in dispatched}
     for entry, payload in dead_lettered:
+        if _as_str(payload, "nkey") in sent:
+            continue
         rows.append(_row(state, entry, payload, retire_seq, "DEAD_LETTER", None))
     # A compensated effect's own row says so: the original reached the world and was later
     # undone, and a reader who sees only DISPATCHED there would be reading a world state that

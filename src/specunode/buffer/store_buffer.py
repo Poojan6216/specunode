@@ -26,6 +26,7 @@ a handle could never normalise equal to the sequential run's row showing the rea
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Collection
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TypeAlias
@@ -492,6 +493,39 @@ class StoreBuffer:
         self.discard(branch)
         return self._last_discarded
 
+    async def discard_effects(
+        self, branch: Branch, effect_ids: Collection[str], reason: str
+    ) -> int:
+        """Drop the named effects of one branch, unsent, and journal exactly which.
+
+        For a turn that failed after a guess it confirmed was adopted: the guessed write was
+        authorised by a turn that never became durable, so it must not go out, while the node
+        -- which may catch the failure and carry on -- keeps everything else it staged. Never
+        dispatches.
+        """
+        staged = self._staged.get(branch.id, [])
+        dropped = [effect for effect in staged if effect.id in effect_ids]
+        if not dropped:
+            return 0
+        self._staged[branch.id] = [effect for effect in staged if effect.id not in effect_ids]
+        for effect in dropped:
+            ack = self._acks.pop(effect.id, None)
+            if ack is not None and not ack.done():
+                ack.cancel()
+        await self.journal.append_async(
+            self.run_id,
+            "effect_discarded",
+            {
+                "v": 1,
+                "branch_id": branch.id,
+                "step": branch.cursor.step_index,
+                "effect_ids": [effect.id for effect in dropped],
+                "count": len(dropped),
+                "reason": reason,
+            },
+        )
+        return len(dropped)
+
     async def discard_and_journal(self, branch: Branch, reason: str) -> int:
         """Discard, and record in the journal exactly which effects were discarded.
 
@@ -681,45 +715,26 @@ class StoreBuffer:
                 self._complete_ack(effect.id, claim.ack)
                 outcomes.append((effect.id, EffectOutcome.SKIPPED_DEDUPE))
                 continue
+            upstream_said_absent = False
             if claim.outcome is Claim.AMBIGUOUS and not effect.idempotent:
                 # A previous attempt may already have taken effect and the tool has not said a
                 # repeat is harmless. Guessing either way is worse than stopping -- unless the
                 # upstream can be asked.
                 verdict, why = await self._reconcile(dispatcher, effect)
                 if verdict == "landed":
+                    # Sent by a process that died before it heard back; the upstream says it
+                    # took effect, and its own result is the ack.
                     settled.add(effect.id)
                     self._dispatch_seq[branch.id] = dispatch_index + 1
-                    self._delivered[branch.id] = self._delivered.get(branch.id, 0) + 1
-                    await self.journal.settle_dispatch(
-                        run_id=self.run_id,
-                        nkey=effect.nkey,
-                        status="dispatched",
-                        ack=why,
-                        attempt=claim.attempt,
-                        kind="effect_dispatched",
-                        payload={
-                            "v": 1,
-                            "effect_id": effect.id,
-                            "branch_id": branch.id,
-                            "nkey": effect.nkey,
-                            "key": effect.key,
-                            "tool": effect.call.name,
-                            "args_hash": chash(dict(effect.call.args)),
-                            "stage_index": effect.stage_index,
-                            "dispatch_index": dispatch_index,
-                            "authorised_by_offset": authorised_by_offset,
-                            "confirmed_by_offset": confirmed_offset,
-                            "attempt": claim.attempt,
-                            "deduped": True,
-                            # Sent by a process that died before it heard back; the upstream
-                            # says it took effect, and its own result is the ack.
-                            "reconciled": True,
-                            "ack": why,
-                            "dry_run": False,
-                            "compensation_for": None,
-                        },
+                    await self._settle_landed(
+                        effect,
+                        branch,
+                        why,
+                        claim.attempt,
+                        dispatch_index,
+                        authorised_by_offset,
+                        confirmed_offset,
                     )
-                    self._complete_ack(effect.id, why)
                     outcomes.append((effect.id, EffectOutcome.SKIPPED_DEDUPE))
                     continue
                 if verdict == "unknown":
@@ -735,13 +750,47 @@ class StoreBuffer:
                     halted_at, ok = dispatch_index, False
                     continue
                 # "absent": the upstream has no record of it, so it is sent now -- once.
+                upstream_said_absent = True
 
+            # An earlier process may have sent this and not heard back. Whatever happens now,
+            # a dead letter must not claim nothing went out -- unless the upstream said so.
+            earlier_may_have_landed = claim.outcome is Claim.AMBIGUOUS and not upstream_said_absent
             result = await dispatcher.dispatch(
                 effect.call.name,
                 dict(effect.call.args),
                 idempotency_key=effect.nkey,
                 branch_id=branch.id,
             )
+            if not result.ok and result.sent == "maybe" and not effect.idempotent:
+                # This process sent it and did not hear back: the lost reply a crash leaves,
+                # without the crash. The dispatcher did not retry it, and neither does this --
+                # it asks, as a resume would, and stops for a human if it cannot.
+                verdict, why = await self._reconcile(dispatcher, effect)
+                if verdict == "landed":
+                    settled.add(effect.id)
+                    self._dispatch_seq[branch.id] = dispatch_index + 1
+                    await self._settle_landed(
+                        effect,
+                        branch,
+                        why,
+                        result.attempts,
+                        dispatch_index,
+                        authorised_by_offset,
+                        confirmed_offset,
+                    )
+                    outcomes.append((effect.id, EffectOutcome.DISPATCHED))
+                    continue
+                if verdict == "absent":
+                    # It did not take effect, so it is sent again -- once, and not asked about
+                    # a second time: a second lost reply is a dead letter.
+                    result = await dispatcher.dispatch(
+                        effect.call.name,
+                        dict(effect.call.args),
+                        idempotency_key=effect.nkey,
+                        branch_id=branch.id,
+                    )
+                else:
+                    result = replace(result, error=f"{result.error}; {why}")
             settled.add(effect.id)
             self._dispatch_seq[branch.id] = dispatch_index + 1
             if result.ok:
@@ -776,7 +825,8 @@ class StoreBuffer:
                 outcomes.append((effect.id, EffectOutcome.DISPATCHED))
                 continue
 
-            if result.sent == "no":
+            sent = "maybe" if earlier_may_have_landed or result.sent == "maybe" else "no"
+            if sent == "no":
                 await self.journal.mark_not_sent(self.run_id, effect.nkey, result.attempts)
             await self._dead_letter(
                 effect,
@@ -784,7 +834,7 @@ class StoreBuffer:
                 attempts=result.attempts,
                 error=result.error or "dispatch failed",
                 authorised_by_offset=authorised_by_offset,
-                sent=result.sent,
+                sent=sent,
             )
             outcomes.append((effect.id, EffectOutcome.DEAD_LETTER))
             # Halt rather than skip: the effects after this one were staged on the assumption
@@ -813,6 +863,47 @@ class StoreBuffer:
         future = self._acks.get(effect_id)
         if future is not None and not future.done():
             future.set_exception(ToolDispatchError(error, sent="maybe", retriable=False))
+
+    async def _settle_landed(
+        self,
+        effect: StagedEffect,
+        branch: Branch,
+        ack: JsonValue,
+        attempt: int,
+        dispatch_index: int,
+        authorised_by_offset: int,
+        confirmed_offset: int,
+    ) -> None:
+        """Record an effect whose reply was lost as dispatched, on the upstream's word."""
+        self._delivered[branch.id] = self._delivered.get(branch.id, 0) + 1
+        await self.journal.settle_dispatch(
+            run_id=self.run_id,
+            nkey=effect.nkey,
+            status="dispatched",
+            ack=ack,
+            attempt=attempt,
+            kind="effect_dispatched",
+            payload={
+                "v": 1,
+                "effect_id": effect.id,
+                "branch_id": branch.id,
+                "nkey": effect.nkey,
+                "key": effect.key,
+                "tool": effect.call.name,
+                "args_hash": chash(dict(effect.call.args)),
+                "stage_index": effect.stage_index,
+                "dispatch_index": dispatch_index,
+                "authorised_by_offset": authorised_by_offset,
+                "confirmed_by_offset": confirmed_offset,
+                "attempt": attempt,
+                "deduped": True,
+                "reconciled": True,
+                "ack": ack,
+                "dry_run": False,
+                "compensation_for": None,
+            },
+        )
+        self._complete_ack(effect.id, ack)
 
     async def _reconcile(
         self, dispatcher: Dispatcher, effect: StagedEffect

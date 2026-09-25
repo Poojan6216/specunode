@@ -84,7 +84,7 @@ async def test_a_write_made_as_its_block_parses_is_refused(tmp_path: object) -> 
 
     result, world, journal = await run_node(tmp_path, act_on_each_block)
     assert not result.ok
-    assert "not yet journaled" in (result.error or ""), result.error
+    assert "was not journaled" in (result.error or ""), result.error
     # The read as its block parsed is fine -- a read is not an effect. The charge is not.
     assert world == ["read cus-1"]
     assert not list(journal.read(result.run_id, kinds=["effect_dispatched"]))
@@ -106,7 +106,7 @@ async def test_a_write_after_the_node_stopped_reading_the_turn_is_refused(tmp_pa
 
     result, world, _journal = await run_node(tmp_path, take_the_first_write)
     assert not result.ok
-    assert "not yet journaled" in (result.error or ""), result.error
+    assert "was not journaled" in (result.error or ""), result.error
     assert world == []
 
 

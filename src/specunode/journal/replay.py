@@ -282,43 +282,47 @@ class RecordedTurns:
     """The model turns a resumed run is served rather than asked again.
 
     A resumed run re-runs every node whose branch never retired, from the same position and
-    under the same node id, so each such node asks the model what it asked before. Where the
-    dead attempt's answer may already have sent something, asking again risks a different
-    answer: a different call, under a different idempotency key, which the dedupe table cannot
-    connect to what already went out. So those turns are served from the journal, and the node
-    decides what it decided before.
+    under the same node id, so each such node asks the model what it asked before. Where an
+    earlier answer may already have sent something, asking again risks a different answer: a
+    different call, under a different idempotency key, which the dedupe table cannot connect to
+    what already went out. So those turns are served from the journal, and the node decides what
+    it decided before.
 
-    Only an attempt that may have sent something is served. One whose effects all provably
-    never left -- nothing claimed, a claim marked unsent, a dead letter that never left the
-    process -- is asked again: there is nothing to protect, and serving its answer would pin a
-    run to a decision that already failed, such as a call to a tool that does not exist.
+    **Which turns.** An attempt's turns are pinned up to the last one before an effect of that
+    attempt which may have been sent -- dispatched, claimed with no outcome, or dead-lettered
+    without proof it never left. The turns it asked after that sent nothing, and are asked
+    again: there is nothing to protect, and serving them would pin a run to a decision that
+    already failed, such as a call to a tool that does not exist. The turns before it are
+    pinned too, because the pinned turn's question was built on their answers.
 
-    Only when the question is the same. At each node and position, the resumed node's requests
-    are matched turn by turn against each attempt's, and the latest attempt whose turns so far
-    are the same questions answers the next one. From the first question no attempt asked,
-    that node and position go back to the model. Speculative turns are never served: they were
-    guesses, not decisions.
-
-    "The latest" is not "the longest". Once a question has changed across one crash, an
-    earlier attempt's longer conversation answers questions the node no longer asks, and the
-    attempt that sent something under the current question is the newer, shorter one.
+    **Only when the question is the same.** The resumed node's requests at each node and
+    position are matched turn by turn, in the order they were asked, against each attempt's
+    pinned turns; the latest attempt whose questions so far are the same answers the next one.
+    From the first question none of them asked, that node and position go back to the model.
+    "The latest", not "the longest": once a question has changed across one crash, an earlier
+    attempt's longer conversation answers questions the node no longer asks. And "the order
+    they were asked", not the order the answers came back, which differ for calls made at once.
+    Speculative turns are never served: they were guesses, not decisions.
     """
 
     journal: Journal
     run_id: str
     role: str = "target"
-    #: Per (node, position), each acting attempt's turns as (request hash, turn), oldest first.
+    #: Per (node, position), each attempt's pinned turns as (request hash, turn), in the order
+    #: they were asked; attempts oldest first.
     _attempts: dict[tuple[str, int], list[list[tuple[str, RecordedTurn]]]] = field(
         default_factory=dict, init=False
     )
-    _acted: frozenset[str] = field(default=frozenset(), init=False)
+    _pinned_requests: frozenset[str] = field(default=frozenset(), init=False)
+    _pinned_branches: frozenset[str] = field(default=frozenset(), init=False)
     _asked: dict[tuple[str, int], list[str]] = field(default_factory=dict, init=False)
     _asking: set[tuple[str, int]] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
-        self._acted = self._branches_that_may_have_sent()
-        requests: dict[str, Mapping[str, JsonValue]] = {}
-        attempts: dict[tuple[str, int], dict[str, list[tuple[str, RecordedTurn]]]] = {}
+        pinned_before = self._last_send_per_branch()
+        requests: dict[str, tuple[int, Mapping[str, JsonValue]]] = {}
+        # (node, position) -> branch -> [(asked at, request hash, request id, turn)]
+        attempts: dict[tuple[str, int], dict[str, list[tuple[int, str, str, RecordedTurn]]]] = {}
         for entry in self.journal.read(self.run_id, kinds=["model_request", "model_response"]):
             payload = entry.payload
             if payload.get("role") != self.role or payload.get("speculative"):
@@ -327,43 +331,69 @@ class RecordedTurns:
             if not isinstance(request_id, str):
                 continue
             if entry.kind == "model_request":
-                requests[request_id] = payload
+                requests[request_id] = (entry.offset, payload)
                 continue
             branch = str(payload.get("branch_id", ""))
-            request = requests.get(request_id)
+            asked = requests.get(request_id)
             step = payload.get("step")
             response = payload.get("response")
             if (
-                branch not in self._acted
-                or request is None
+                asked is None
+                or asked[0] >= pinned_before.get(branch, -1)
                 or not isinstance(step, int)
                 or isinstance(step, bool)
                 or not isinstance(response, Mapping)
             ):
                 continue
+            asked_at, request = asked
             # The entry a turn was first recorded in, however many times it has been served.
             origin = payload.get("recorded_from")
             offset = origin if isinstance(origin, int) else entry.offset
             key = (str(request.get("node_id") or ""), step)
             turn = RecordedTurn(response=response_from_json(response), offset=offset)
-            attempt = attempts.setdefault(key, {}).setdefault(branch, [])
-            attempt.append((str(payload.get("request_hash", "")), turn))
-        self._attempts = {key: list(by_branch.values()) for key, by_branch in attempts.items()}
+            attempts.setdefault(key, {}).setdefault(branch, []).append(
+                (asked_at, str(payload.get("request_hash", "")), request_id, turn)
+            )
+        pinned: set[str] = set()
+        branches: set[str] = set()
+        for key, by_branch in attempts.items():
+            ordered: list[list[tuple[str, RecordedTurn]]] = []
+            for branch, turns in by_branch.items():
+                turns.sort(key=lambda asked: asked[0])
+                ordered.append([(digest, turn) for _at, digest, _id, turn in turns])
+                pinned.update(request_id for _at, _digest, request_id, _turn in turns)
+                branches.add(branch)
+            self._attempts[key] = ordered
+        self._pinned_requests = frozenset(pinned)
+        self._pinned_branches = frozenset(branches)
 
-    def _branches_that_may_have_sent(self) -> frozenset[str]:
-        """Branches with an effect that reached the world, or may have."""
-        acted: set[str] = set()
+    def _last_send_per_branch(self) -> dict[str, float]:
+        """Per branch, the journal offset of its last effect that may have been sent.
+
+        Keyed by where that effect was *staged*, which is after the question that decided it
+        was asked -- a guessed write is staged mid-stream, a model-emitted one after the turn.
+        An effect whose staging cannot be found pins the whole attempt.
+        """
+        staged: dict[str, int] = {}
+        sent: list[tuple[str, str]] = []
         for entry in self.journal.read(
-            self.run_id, kinds=["effect_dispatched", "effect_dead_lettered"]
+            self.run_id, kinds=["effect_staged", "effect_dispatched", "effect_dead_lettered"]
         ):
-            # A dead letter without ``sent`` was written before the field existed: assume the
-            # worst, as the claim table does.
-            if entry.kind == "effect_dispatched" or entry.payload.get("sent") != "no":
-                acted.add(str(entry.payload.get("branch_id", "")))
+            payload = entry.payload
+            effect_id = str(payload.get("effect_id", ""))
+            if entry.kind == "effect_staged":
+                staged[effect_id] = entry.offset
+            elif entry.kind == "effect_dispatched" or payload.get("sent") != "no":
+                # A dead letter without ``sent`` predates the field: assume the worst.
+                sent.append((str(payload.get("branch_id", "")), effect_id))
         for claim in self.journal.unresolved_dispatches(self.run_id):
             if claim.get("last_outcome") != "not_sent":
-                acted.add(str(claim.get("branch_id", "")))
-        return frozenset(acted)
+                sent.append((str(claim.get("branch_id", "")), str(claim.get("effect_id", ""))))
+        last: dict[str, float] = {}
+        for branch, effect_id in sent:
+            at = float(staged[effect_id]) if effect_id in staged else float("inf")
+            last[branch] = max(last.get(branch, -1.0), at)
+        return last
 
     def take(self, digest: str, scope: CallScope) -> RecordedTurn | None:
         if scope.run_id != self.run_id:
@@ -385,9 +415,14 @@ class RecordedTurns:
         return None
 
     @property
-    def acted(self) -> frozenset[str]:
-        """Branch ids with an effect that reached the world, or may have."""
-        return self._acted
+    def pinned_requests(self) -> frozenset[str]:
+        """Request ids of the turns a resume would be served, rather than asked for again."""
+        return self._pinned_requests
+
+    @property
+    def pinned_branches(self) -> frozenset[str]:
+        """Branch ids with at least one turn a resume would be served."""
+        return self._pinned_branches
 
     @property
     def recorded(self) -> int:

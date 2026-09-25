@@ -21,7 +21,7 @@ import typer
 
 from specunode import __version__
 from specunode.config import DEFAULT_CONFIG_NAME, Config, ConfigError, load_config
-from specunode.journal.journal import Journal
+from specunode.journal.journal import Journal, JournalError
 from specunode.journal.ledger import (
     build_ledger,
     load_or_create_key,
@@ -154,13 +154,16 @@ def resume(
 ) -> None:
     """Continue a run that was interrupted, without re-sending what already went out.
 
-    Nothing is replayed and nothing is re-decided. Committed state is rebuilt from the branches
-    the journal records as retired, the step counter continues above the position they consumed,
-    and the graph is driven on from there. An effect that was acked before the crash is claimed
-    and skipped; one whose request demonstrably never left is re-sent; one that may or may not
-    have taken effect is dead-lettered unless its tool declared a repeat harmless.
+    Committed state is rebuilt from the branches the journal records as retired, the step
+    counter continues above the position they consumed, and the graph is driven on from there.
+    An effect that was acked before the crash is claimed and skipped; one whose request
+    demonstrably never left is re-sent; one that may or may not have taken effect is asked about
+    (the tool's reconcile), redelivered if its tool declared a repeat harmless, or dead-lettered
+    until someone records what happened (`specunode resolve`). A node that runs again is served
+    any model answer that may already have sent something, rather than asked for it again.
 
-    This needs a live target: the turns the journal does not already hold have to be asked for.
+    This needs a live target: an answer the journal does not hold, or one that sent nothing,
+    is asked for.
     """
     import asyncio
 
@@ -193,6 +196,59 @@ def resume(
     if not result.ok:
         typer.echo(f"run did not complete: {result.error}", err=True)
         raise typer.Exit(1)
+
+
+@app.command()
+def resolve(
+    run_id: str = typer.Argument(..., help="The run the effect belongs to."),
+    key: str = typer.Argument(
+        ..., help="The effect's key, or a unique prefix of it, as `specunode ledger` prints it."
+    ),
+    landed: bool = typer.Option(
+        False, "--landed", help="It took effect upstream: settle it, and a resume skips it."
+    ),
+    not_sent: bool = typer.Option(
+        False, "--not-sent", help="It never took effect: a resume sends it, once."
+    ),
+    ack: str = typer.Option(
+        None, "--ack", help="With --landed: the upstream's result, as JSON, handed to the node."
+    ),
+    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+) -> None:
+    """Record what happened to an effect the runtime could not settle on its own.
+
+    A write that may have reached the upstream before its reply was lost -- a dead letter, or a
+    claim a crash left open -- is not retried by a resume, because nobody knows whether it took
+    effect. Check the upstream, then say which. The claim and a journal entry naming who said
+    so are written in one transaction; `specunode resume` then continues past the effect.
+    """
+    if landed == not_sent:
+        typer.echo("say which: --landed or --not-sent", err=True)
+        raise typer.Exit(2)
+    book = Journal(journal)
+    keys = [row.nkey for row in build_ledger(book, run_id).rows if row.nkey.startswith(key)]
+    keys += [
+        str(claim["nkey"])
+        for claim in book.unresolved_dispatches(run_id)
+        if str(claim["nkey"]).startswith(key)
+    ]
+    matches = sorted(set(keys))
+    if len(matches) != 1:
+        if matches:
+            problem = f"{len(matches)} effects in run {run_id} have a key starting {key!r}"
+        else:
+            problem = f"no effect in run {run_id} has a key starting {key!r}"
+        typer.echo(problem, err=True)
+        raise typer.Exit(2)
+    try:
+        parsed = None if ack is None else json.loads(ack)
+        offset = book.resolve_dispatch(run_id, matches[0], landed=landed, ack=parsed)
+    except (ValueError, JournalError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(
+        f"{matches[0]}: recorded as {'landed' if landed else 'never sent'} at offset {offset}"
+    )
 
 
 @app.command()

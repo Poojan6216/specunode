@@ -673,19 +673,20 @@ def answered_turns(journal: Journal, run_id: str) -> int:
 
     A resumed run is a new process, so its script starts over while the run does not. The
     turns a resume will not ask for again are those of branches that retired, and those it is
-    served from the journal (``RecordedTurns``): the answers of an attempt that may already
-    have sent something. An answer whose attempt sent nothing is asked for again, so the script
-    must hand it over again. A served turn is journaled again under the resumed branch and
+    served from the journal (``RecordedTurns``): the answers that may already have sent
+    something, and the ones before them. An answer that sent nothing is asked for again, so the
+    script must hand it over again. A served turn is journaled again under the resumed branch and
     marked ``recorded_from``; it was never asked, so it is not counted twice.
     """
-    kept = recover(journal, run_id).retired_branches | RecordedTurns(journal, run_id).acted
+    retired = recover(journal, run_id).retired_branches
+    pinned = RecordedTurns(journal, run_id).pinned_requests
     return sum(
         1
         for entry in journal.read(run_id, kinds=["model_response"])
         if entry.payload.get("role", "target") == "target"
         and not entry.payload.get("speculative")
         and "recorded_from" not in entry.payload
-        and entry.payload.get("branch_id") in kept
+        and (entry.payload.get("branch_id") in retired or entry.payload.get("request_id") in pinned)
     )
 
 

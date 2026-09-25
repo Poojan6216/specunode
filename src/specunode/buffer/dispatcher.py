@@ -91,6 +91,18 @@ class Dispatcher:
     ) -> DispatchOutcome:
         """Call ``tool``, retrying until it acks or the attempts run out.
 
+        A retry is only ever safe for one of two reasons: the attempt that failed demonstrably
+        sent nothing (``sent="no"``), or the tool declared a repeat harmless (``idempotent``).
+        After a failure that may have taken effect, a tool that did not declare it is not
+        called again -- the outcome is reported as ``sent="maybe"``, and the store buffer asks
+        the upstream (the tool's ``reconcile``) or dead-letters it. Retrying anyway charged a
+        card twice whenever a gateway took the charge and timed out on the reply, with the
+        default settings and no crash at all.
+
+        ``sent`` on a failed outcome is ``"maybe"`` if *any* attempt may have taken effect, not
+        whatever the last one said: an attempt that landed followed by one that was refused is
+        still an effect that may be out.
+
         The call runs under a :class:`CallScope` carrying the branch and the key, which is how
         the fake world attributes every mutation -- and therefore how the leak test can state
         its invariant as a set comparison.
@@ -103,33 +115,48 @@ class Dispatcher:
                 ok=True, ack={"dry_run": True}, attempts=0, sent="no", dry_run=True
             )
         last_error: str | None = None
-        last_sent: Sent = "no"
+        maybe_sent = False
 
         for attempt in range(1, self.max_attempts + 1):
             scope = CallScope(branch_id=branch_id, effect_key=idempotency_key, speculative=False)
             token = call_scope.set(scope)
+            retriable = True
             try:
                 ack = await spec.fn(**args)
                 return DispatchOutcome(ok=True, ack=ack, attempts=attempt, sent="maybe")
             except UnknownTool as exc:
                 # Not retriable and not ambiguous: there was nothing to call.
-                return DispatchOutcome(ok=False, attempts=attempt, error=str(exc), sent="no")
+                return DispatchOutcome(
+                    ok=False,
+                    attempts=attempt,
+                    error=str(exc),
+                    sent="maybe" if maybe_sent else "no",
+                )
             except ToolDispatchError as exc:
-                last_error, last_sent = str(exc), exc.sent
-                if not exc.retriable:
-                    break
+                last_error, retriable = str(exc), exc.retriable
+                maybe_sent = maybe_sent or exc.sent == "maybe"
             except asyncio.CancelledError:
                 # A drain is never speculative, so a cancellation here is the process going
                 # away rather than a squash. Do not swallow it.
                 raise
             except Exception as exc:  # an adapter that raised something of its own
-                last_error, last_sent = f"{type(exc).__name__}: {exc}", "maybe"
+                last_error, maybe_sent = f"{type(exc).__name__}: {exc}", True
             finally:
                 call_scope.reset(token)
 
+            if not retriable or (maybe_sent and not spec.idempotent):
+                return DispatchOutcome(
+                    ok=False,
+                    attempts=attempt,
+                    error=last_error,
+                    sent="maybe" if maybe_sent else "no",
+                )
             if attempt < self.max_attempts:
                 await asyncio.sleep(self._delay_ms(attempt) / 1000.0)
 
         return DispatchOutcome(
-            ok=False, attempts=self.max_attempts, error=last_error, sent=last_sent
+            ok=False,
+            attempts=self.max_attempts,
+            error=last_error,
+            sent="maybe" if maybe_sent else "no",
         )

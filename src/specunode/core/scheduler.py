@@ -228,10 +228,12 @@ class BranchTools:
             # on disk, so a crash in between left a sent effect whose decision a resume could
             # not find, and a model asked again could make a second, different call.
             raise SchedulerError(
-                f"{name} was called while the model turn that decided it was not yet "
-                "journaled. A node that reads session.model.stream() must reach TurnComplete "
-                "before it writes -- or the write goes out on a decision that is not on disk. "
-                "Read the stream to its end, or use complete() or call_turn."
+                f"{name} was called while a model turn this node started was not journaled: "
+                "still streaming, or one it read from session.model.stream() and stopped "
+                "reading, or that failed, after blocks had reached it. A write then could go "
+                "out on a decision that is not on disk, so this node writes nothing more. Read "
+                "each stream to its end before writing, or use complete() or call_turn, which "
+                "never hand a node part of a turn."
             )
         call = ToolCall(name=name, args=dict(args))
         step = branch.advance_step() if step is None else branch.reserve_step(step)
@@ -1391,7 +1393,10 @@ class Scheduler:
             if not ok:
                 raise SchedulerError(
                     f"a write from node {node_id} was dead-lettered, so the run halts here "
-                    "for a human; a resume retries it under the same key"
+                    "for a human. If its request never left, a resume retries it under the "
+                    "same key. If it may have reached the upstream, a resume stops on it again "
+                    "until someone who has checked records what happened: `specunode resolve "
+                    "<run> <key> --landed` or `--not-sent`"
                 )
             raise SchedulerError(
                 f"node {node_id} did not finish after its writes were dispatched; it is "
@@ -1775,6 +1780,10 @@ class SpeculativeTurn:
         # structural: a result never appends on completion, because the order the model asked
         # for its calls is the order it must be shown them in (Hard Rule 13).
         slots: list[asyncio.Task[JsonValue] | None] = []
+        # What the branch held, and how many of its turns were open, before this one began:
+        # a failed turn gives back everything it added to either.
+        held_before = {effect.id for effect in scheduler.buffer.pending(branch.id)}
+        open_before = branch.unjournaled_turns
 
         try:
             await self._consume(envelope, tools, slots)
@@ -1787,6 +1796,22 @@ class SpeculativeTurn:
             # the three ways branch.py says every branch ends.
             await self._squash_open("turn_failed")
             await self._abandon(slots)
+            # A guess the model confirmed before the stream failed was adopted, and its write
+            # moved onto this branch. The turn that confirmed it never became durable, so that
+            # write is discarded: a node that caught the failure and finished drained it, and
+            # sent an effect whose decision was never on disk.
+            adopted = [
+                effect.id
+                for effect in scheduler.buffer.pending(branch.id)
+                if effect.id not in held_before
+            ]
+            scheduler.counters.effects_discarded += await scheduler.buffer.discard_effects(
+                branch, adopted, "turn_failed"
+            )
+            # Nothing of the failed turn reached the node -- call_turn raises instead of
+            # returning -- so it is not left open: a node that retries, or asks with complete(),
+            # and then writes on the answer it was given, is not refused for this one.
+            branch.unjournaled_turns = open_before
             raise
 
         # Any speculation still open when the turn ended predicted a call the model never made.

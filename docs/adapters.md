@@ -28,11 +28,12 @@ than fresh.
 **Honest about what it does.** See [effect-classes.md](effect-classes.md). A `READ` that writes
 defeats the store buffer, and nothing in the runtime can notice.
 
-**A way to be asked, if you want a crash answered rather than escalated.** A crash can land after
-the upstream took a write and before its reply came back. On resume the runtime knows that write
-may be out -- it was claimed in the journal under its key before it was sent -- but not whether it
-is. An idempotent tool is simply sent again under the same key. A non-idempotent one is
-dead-lettered for a human, unless it says how to find out:
+**A way to be asked, if you want a lost reply answered rather than escalated.** A crash, or a
+reply that times out, can land after the upstream took a write and before its reply came back.
+The runtime knows that write may be out -- it was claimed in the journal under its key before it
+was sent -- but not whether it is. An idempotent tool is simply sent again under the same key. A
+non-idempotent one is never sent again on a guess: it is dead-lettered for a human, unless it
+says how to find out:
 
 ```python
 async def charge_was_taken(key: str, args: dict) -> dict | None:
@@ -63,10 +64,16 @@ raise ToolDispatchError("connection refused", sent="no")     # safe to retry
 raise ToolDispatchError("gateway timeout", sent="maybe")     # may already have happened
 ```
 
-That single bit is what keeps the ambiguous crash window narrow. `sent="no"` means a retry
-cannot duplicate anything; `sent="maybe"` — the default, because it is the safe assumption —
-means the upstream may already have acted, and a non-idempotent tool is dead-lettered instead
-of guessed at.
+That single bit is what keeps the ambiguous window narrow. `sent="no"` means a retry cannot
+duplicate anything, and the dispatcher retries it. `sent="maybe"` — the default, because it is
+the safe assumption, and what any other exception counts as — means the upstream may already
+have acted: an idempotent tool is retried, and a non-idempotent one is not called again. The
+runtime asks its `reconcile`, if it has one, and otherwise dead-letters it and stops for a human.
+
+A dead letter whose request may have left is not retried by a resume either. Check the upstream,
+then record what you found -- `specunode resolve <run> <key> --landed` or `--not-sent` -- and
+the resume skips it or sends it once. A dead letter whose request demonstrably never left is
+retried by a plain resume: heal the upstream and resume.
 
 ## Graph adapters
 
@@ -138,12 +145,18 @@ node body runs to completion before its effects are dispatched.
 ### A write waits for the turn that decided it
 
 A node that reads `session.model.stream()` itself may make reads as blocks parse, but not
-writes. A write made before the stream reaches `TurnComplete` -- or after the node stopped
-reading part-way, which leaves the turn unjournaled for good -- is refused with a
-`SchedulerError`. Staged, it would go out as soon as the node parked on it, before the turn
+writes. A write made before the stream reaches `TurnComplete` is refused with a
+`SchedulerError`: staged, it would go out as soon as the node parked on it, before the turn
 that decided it was on disk, and a crash in between would leave a sent effect whose decision a
 resume could not find. Read the stream to its end, or use `complete()`, or `call_turn`, which
 issues a turn's reads early and stages its writes once the turn is journaled.
+
+The runtime cannot tell which turn decided a write, so the rule covers the whole node run: a
+write is refused while *any* model turn the node started is unjournaled. That includes a turn
+still in flight in a background task, and one the node read from `stream()` and stopped
+reading, or that failed, after blocks had reached it -- those stay unjournaled for good, so
+that node writes nothing more; let it fail and resume. A `complete()` or `call_turn` that fails
+hands the node nothing of the turn, and does not block it.
 
 ## Speculation and node bodies
 

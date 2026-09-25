@@ -52,12 +52,19 @@ fraction of stale reads that were undetectable rather than only the fraction it 
 An effect is dispatched with a deterministic idempotency key, and the dispatcher deduplicates
 its own retries. It cannot deduplicate the network beyond itself.
 
-If the process dies between a request leaving it and the acknowledgement being recorded, nobody
-can tell afterwards whether the effect took place. That is the two-generals problem and no
-amount of bookkeeping removes it. What the runtime does instead is refuse to guess: a tool that
-declared `idempotent=True` is redelivered, and a tool that did not is **dead-lettered** and the
-run halts for a human. The consequence, visible in the kill/resume tests, is that a resumed run
-can reach a *prefix* of the effects an uninterrupted run reached.
+If the process dies between a request leaving it and the acknowledgement being recorded -- or
+the reply times out without a crash -- nobody can tell whether the effect took place. That is the
+two-generals problem and no amount of bookkeeping removes it. What the runtime does instead is
+refuse to guess: a tool that declared `idempotent=True` is redelivered, and a tool that did not
+is asked about through its `reconcile` or **dead-lettered**, and the run halts for a human. A
+resume does not retry that dead letter either, until someone who has checked the upstream says
+what happened (`specunode resolve`). The consequence, visible in the kill/resume tests, is that
+a resumed run can reach a *prefix* of the effects an uninterrupted run reached.
+
+Until 2026-09-25 the dispatcher retried every failure, whatever the tool declared, so a gateway
+that took a charge and timed out on the reply was charged again on the next attempt -- with the
+default settings and no crash at all; and a resume retried every dead letter, including one
+whose request had landed. An independent review found both.
 
 **The dedupe guarantee holds only while a resumed node makes the calls it made before.** An
 idempotency key is derived from the run, the node, the program position, the tool and the
@@ -65,11 +72,13 @@ idempotency key is derived from the run, the node, the program position, the too
 arguments. A resume keeps the model's side of that: a node whose earlier answer may already
 have sent something -- an effect dispatched, a claim with no outcome, a dead letter that may
 have left -- is served that answer from the journal when it asks the same question again,
-rather than asking the model (`RecordedTurns`). An answer that sent nothing is asked for again:
-there is nothing to protect, and a resume can then recover from an answer that failed, such as
-a call to a tool that does not exist. And nothing is sent before the model turn that decided it
-is journaled: a node that reads `session.model.stream()` itself and writes before the turn ends
-is refused (docs/adapters.md), because its write would go out on a decision not yet on disk.
+rather than asking the model (`RecordedTurns`), and so are the answers before it in the same
+conversation, which its question was built on. An answer after the last thing that may have
+been sent is asked for again: there is nothing to protect, and a resume can then recover from
+an answer that failed, such as a call to a tool that does not exist. And nothing is sent before
+the model turn that decided it is journaled: a node that reads `session.model.stream()` itself
+and writes before the turn ends is refused (docs/adapters.md), because its write would go out on
+a decision not yet on disk.
 
 What a resume cannot keep the same is everything else that shapes a call. Reads are made again
 on resume, not served, so a node that reads and then asks in the same step asks something new if
@@ -95,8 +104,8 @@ answer differently, and the design does not assume otherwise.
 Until 2026-09-25 this section was wider. A resume asked the model again for every turn of a
 node that had not finished, even one whose answer had already sent something, so the dedupe
 guarantee depended on the model answering the same way twice however little had changed; and a
-node that wrote as a streamed block parsed sent its write before the turn was journaled. Two
-independent reviews found them. The kill/resume test now resumes every kill point with a model
+node that wrote as a streamed block parsed sent its write before the turn was journaled. Three
+independent reviews found them and what was wrong with the first fixes. The kill/resume test now resumes every kill point with a model
 that would decide differently if asked -- including a node that asks and charges in one step --
 and holds each to the outcome what the kill left on disk requires. The case left over, a call
 shaped by something that changed, it does not exercise.

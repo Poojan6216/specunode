@@ -64,11 +64,25 @@ Continue an interrupted run without re-sending what already went out. Committed 
 rebuilt from the branches the journal records as retired, the step counter continues above the
 position they consumed, and the graph is driven on from there. An effect that was acked before
 the crash is claimed and skipped; one whose request demonstrably never left is re-sent; one
-that may or may not have taken effect is dead-lettered unless its tool declared a repeat
-harmless. This needs a live target, because the turns the journal does not already hold have
-to be asked for. Prints the ledger; exits 1 if the run did not complete and 2 if the config is
-missing, unreadable, or cannot build the graph or the target. Options: `--journal`;
-`--config PATH`.
+that may or may not have taken effect is asked about through its tool's `reconcile`,
+redelivered if its tool declared a repeat harmless, or dead-lettered until someone records what
+happened with `specunode resolve`. A node that runs again is served any model answer that may
+already have sent something, rather than asked for it again. This needs a live target, because
+an answer the journal does not hold, or one that sent nothing, is asked for. Prints the ledger;
+exits 1 if the run did not complete and 2 if the config is missing, unreadable, or cannot build
+the graph or the target. Options: `--journal`; `--config PATH`.
+
+### `specunode resolve RUN_ID KEY`
+
+Record what happened to an effect the runtime could not settle on its own: a write that may
+have reached the upstream before its reply was lost, and that a resume therefore will not send
+again. Check the upstream first, then say which. `--landed` settles it as sent -- a resume
+skips it and hands the node `--ack JSON`, the upstream's own result, if given. `--not-sent`
+records that it never took effect -- a resume sends it, once, under the same key. The claim and
+a journal entry naming who said so are written in one transaction. `KEY` is the effect's key,
+or a unique prefix of it, as `specunode ledger` prints it. Exits 2 if the key matches no
+effect or several, or if the effect is already settled. Options: `--landed`; `--not-sent`;
+`--ack JSON`; `--journal`.
 
 ### `specunode replay RUN_ID`
 

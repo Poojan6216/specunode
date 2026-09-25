@@ -140,7 +140,9 @@ def on_disk(directory: Path, run_id: str, deciding_node: str) -> OnDisk:
         for entry in entries
         if entry.kind == "branch_forked" and entry.payload.get("node_id") == deciding_node
     }
-    kept = recover(journal, run_id).retired_branches | RecordedTurns(journal, run_id).acted
+    kept = (
+        recover(journal, run_id).retired_branches | RecordedTurns(journal, run_id).pinned_branches
+    )
     return OnDisk(
         journaled=bool(entries),
         decision_stands=bool(attempts & kept),

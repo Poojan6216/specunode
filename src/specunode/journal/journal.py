@@ -100,7 +100,7 @@ _UPDATE_NOT_SENT = (
     "WHERE run_id = :run_id AND nkey = :nkey"
 )
 _UPDATE_SETTLED = (
-    "UPDATE effect_dispatch SET status = :status, last_outcome = 'settled', "
+    "UPDATE effect_dispatch SET status = :status, last_outcome = :last_outcome, "
     "ack_json = :ack_json, entry_offset = :entry_offset, attempt = :attempt, "
     "settled_at = :settled_at WHERE run_id = :run_id AND nkey = :nkey"
 )
@@ -567,9 +567,15 @@ class _JournalWriter:
                 ack=json.loads(ack) if ack else None,
             )
         if status == "dead_letter":
-            # A resume must retry a dead-lettered effect: the run finished ok=False and the
-            # operator's remedy is to heal the upstream and resume (task 1.5).
-            return DispatchClaim(Claim.RETRY_SAFE, attempt=attempt)
+            # A dead letter whose request demonstrably never left is retried by a resume: the
+            # operator's remedy is to heal the upstream and resume (task 1.5). One that may have
+            # left is not -- a plain resume retried it, and applied a charge twice whenever the
+            # first had landed. It is ambiguous, as the lost reply that produced it was: the
+            # caller asks the upstream, or redelivers an idempotent tool, or stops again until
+            # an operator records what happened (``resolve_dispatch``).
+            if outcome == "not_sent":
+                return DispatchClaim(Claim.RETRY_SAFE, attempt=attempt)
+            return DispatchClaim(Claim.AMBIGUOUS, attempt=attempt)
         if outcome == "not_sent":
             # The request demonstrably never left this process, so resending is not a
             # duplicate. This downgrade is what keeps crash window W3 narrow.
@@ -620,12 +626,16 @@ class _JournalWriter:
                     "ts": ts,
                 },
             )
+            # A dead letter keeps whether its request provably never left, which is what lets
+            # a resume retry it; everything else is settled.
+            never_left = status == "dead_letter" and payload.get("sent") == "no"
             self._backend.execute(
                 _UPDATE_SETTLED,
                 {
                     "run_id": run_id,
                     "nkey": nkey,
                     "status": status,
+                    "last_outcome": "not_sent" if never_left else "settled",
                     "ack_json": None if ack is None else canonical(ack).decode("utf-8"),
                     "entry_offset": offset,
                     "attempt": attempt,
@@ -653,6 +663,10 @@ class _JournalWriter:
     def _unresolved(self, run_id: str) -> list[Mapping[str, JsonValue]]:
         rows = self._backend.execute(_SELECT_UNRESOLVED, {"run_id": run_id}).fetchall()
         return [dict(row) for row in rows]
+
+    def _dispatch_row(self, run_id: str, nkey: str) -> Mapping[str, JsonValue] | None:
+        row = self._backend.execute(_SELECT_CLAIM, {"run_id": run_id, "nkey": nkey}).fetchone()
+        return None if row is None else dict(row)
 
     def close(self) -> None:
         self._executor.shutdown(wait=True)
@@ -919,6 +933,80 @@ class Journal:
         validate_payload(kind, payload)
         return await self._writer.submit_async(
             lambda: self._writer._settle(run_id, nkey, status, ack, attempt, kind, payload)
+        )
+
+    def resolve_dispatch(
+        self,
+        run_id: str,
+        nkey: str,
+        *,
+        landed: bool,
+        ack: JsonValue = None,
+        by: str = "operator",
+    ) -> int:
+        """Record what happened to an effect the runtime could not settle on its own.
+
+        A dead letter whose request may have reached the upstream, or a claim a crash left
+        open, is not retried by a resume: nobody knows whether it took effect, and guessing is
+        how a card gets charged twice. Someone who has checked the upstream says which:
+
+        * ``landed`` -- it took effect. The claim is settled as dispatched with ``ack``, the
+          upstream's own result, and an ``effect_dispatched`` entry records who said so; a
+          resume skips the effect and hands the node ``ack``.
+        * not ``landed`` -- it never took effect. The claim is marked as never sent, and a
+          ``policy_event`` records who said so; a resume sends it, once, under the same key.
+
+        Each is one transaction, the entry and the claim together. Returns the entry's offset.
+        """
+        row = self._writer.submit(lambda: self._writer._dispatch_row(run_id, nkey))
+        if row is None:
+            raise JournalError(f"run {run_id!r} has no dispatch claim under key {nkey!r}")
+        if row["status"] == "dispatched":
+            raise JournalError(
+                f"{nkey!r} is already settled as dispatched; there is nothing to resolve"
+            )
+        dead = None
+        for entry in self.read(run_id, kinds=["effect_dead_lettered"]):
+            if entry.payload.get("nkey") == nkey:
+                dead = entry.payload
+        attempt = int(str(row["attempt"]))
+        if landed:
+            payload: dict[str, JsonValue] = {
+                "v": 1,
+                "effect_id": str(row["effect_id"]),
+                "branch_id": str(row["branch_id"]),
+                "nkey": nkey,
+                "key": str(row["idem_key"]),
+                "tool": str(row["tool"]),
+                "stage_index": -1,
+                "dispatch_index": -1,
+                "authorised_by_offset": (dead or {}).get("authorised_by_offset", -1),
+                "deduped": True,
+                "ack": ack,
+                "resolved_by": by,
+                "dry_run": False,
+                "compensation_for": None,
+            }
+            validate_payload("effect_dispatched", payload)
+            return self._writer.submit(
+                lambda: self._writer._settle(
+                    run_id, nkey, "dispatched", ack, attempt, "effect_dispatched", payload
+                )
+            )
+        event: dict[str, JsonValue] = {
+            "v": 1,
+            "event": "effect_resolved",
+            "reason": f"{by}: {row['tool']} under {nkey} never took effect",
+            "nkey": nkey,
+            "effect_id": str(row["effect_id"]),
+            "sent": "no",
+            "resolved_by": by,
+        }
+        validate_payload("policy_event", event)
+        return self._writer.submit(
+            lambda: self._writer._settle(
+                run_id, nkey, "dead_letter", None, attempt, "policy_event", event
+            )
         )
 
     def unresolved_dispatches(self, run_id: str) -> list[Mapping[str, JsonValue]]:

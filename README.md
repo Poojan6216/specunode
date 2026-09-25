@@ -282,7 +282,8 @@ idempotency token the tool was handed.
 Where a resume falls short rather than completing, it is because the process died between a
 request reaching the world and its acknowledgement being recorded. Nobody can tell afterwards
 whether it took effect. A tool that declared a repeat harmless is redelivered; one that did not
-is dead-lettered for a human. The demo says which happened.
+is dead-lettered for a human, who checks the upstream and records what happened with
+`specunode resolve`. The demo says which happened.
 
 ---
 
@@ -390,9 +391,10 @@ python bench/adversarial/run_attacks.py --all
   audited, speculation costs you those reads. The ledger counts them rather than netting them off.
 - **Reads without a witness cannot be checked for staleness.** They are reported *unwitnessed*,
   never as fresh.
-- **The ambiguous crash window is real.** If a process dies between a request reaching the world
-  and its acknowledgement being recorded, nobody can tell whether it took effect. A tool that
-  declared itself idempotent is redelivered; one that did not is dead-lettered for a human.
+- **The ambiguous window is real.** If a process dies, or a reply times out, between a request
+  reaching the world and its acknowledgement being recorded, nobody can tell whether it took
+  effect. A tool that declared itself idempotent is redelivered; one that did not is asked about
+  through its `reconcile`, or dead-lettered until someone records what happened.
 - **A placeholder transformed inside a string** — base64, hex — can evade hazard analysis.
 - **This is not an authorization layer.** If the model actually emits `send_email`, it is sent.
 

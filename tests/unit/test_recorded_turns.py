@@ -12,6 +12,7 @@ so a turn that was asked again rather than served shows up as a different decisi
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from specunode.core.decision import ToolCall
@@ -69,16 +70,32 @@ async def record(
             await first.complete(ask(question))
 
 
-async def sent(journal: Journal, branch: str) -> None:
-    """``branch`` sent an effect, as the drain records one that reached the world."""
+async def sent(journal: Journal, branch: str, name: str = "") -> None:
+    """``branch`` staged an effect and it reached the world, as the drain records one."""
+    effect_id = f"effect-{branch}{name}"
+    await journal.append_async(
+        RUN,
+        "effect_staged",
+        {
+            "v": 1,
+            "effect_id": effect_id,
+            "branch_id": branch,
+            "step": 2,
+            "tool": "charge_card",
+            "args_hash": "h",
+            "key": f"key-{effect_id}",
+            "nkey": f"nkey-{effect_id}",
+            "stage_index": 0,
+        },
+    )
     await journal.append_async(
         RUN,
         "effect_dispatched",
         {
             "v": 1,
-            "effect_id": f"effect-{branch}",
+            "effect_id": effect_id,
             "branch_id": branch,
-            "nkey": f"nkey-{branch}",
+            "nkey": f"nkey-{effect_id}",
             "stage_index": 0,
             "dispatch_index": 0,
             "authorised_by_offset": 0,
@@ -313,3 +330,74 @@ async def test_a_second_resume_is_served_the_whole_conversation(tmp_path: Path) 
     # naming the entry it was first recorded in.
     first_turn, second_turn = replies[0].offset, replies[1].offset
     assert origins == [None, None, first_turn, first_turn, second_turn]
+
+
+async def test_only_the_turns_up_to_the_last_send_are_served(tmp_path: Path) -> None:
+    """A conversation: the first answer charged, and the charge went out; the second named a
+    tool that does not exist, and nothing went out on it. The first is served -- the charge is
+    out -- and the second is asked again, so the run can recover from it. Serving the whole
+    attempt pinned the bad answer to every resume."""
+    journal = Journal(tmp_path / "journal.db")
+    await record(journal, "DEAD", ("bill cus-1", CHARGE_25))
+    await sent(journal, "DEAD")
+    await record(journal, "DEAD", ("now tell them", ("notfy", {"customer_id": "cus-1"})))
+
+    changed = model(("notify", {"customer_id": "cus-1"}))
+    target = resumed(journal, changed)
+    with scoped(scope("RESUMED")):
+        charge = await target.complete(ask("bill cus-1"))
+        notify = await target.complete(ask("now tell them"))
+    assert calls(charge) == [ToolCall(*CHARGE_25)]
+    assert calls(notify) == [ToolCall("notify", {"customer_id": "cus-1"})]
+    assert changed.calls == 1
+
+
+async def test_calls_made_at_once_are_matched_in_the_order_they_were_asked(
+    tmp_path: Path,
+) -> None:
+    """Two questions asked together; the second's answer came back first. The resume asks them
+    in the same order, and each is served its own answer. Matched in the order the answers came
+    back, neither was served."""
+
+    class ByQuestion:
+        def __init__(self, answers: dict[str, tuple[float, ModelResponse]]) -> None:
+            self.answers, self.calls = answers, 0
+
+        async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+            self.calls += 1
+            block = envelope.messages[-1].content[0]
+            assert isinstance(block, TextBlock)
+            delay, answer = self.answers[block.text]
+            await asyncio.sleep(delay)
+            return answer
+
+        def stream(self, envelope: RequestEnvelope) -> object:
+            raise NotImplementedError
+
+    journal = Journal(tmp_path / "journal.db")
+    first = JournaledModel(
+        ByQuestion(
+            {
+                "bill cus-1": (0.05, tool_turn(CHARGE_25, turn=0)),
+                "tell cus-1": (0.0, tool_turn(RECEIPT, turn=1)),
+            }
+        ),  # type: ignore[arg-type]
+        journal,
+    )
+    with scoped(scope("DEAD")):
+        await asyncio.gather(first.complete(ask("bill cus-1")), first.complete(ask("tell cus-1")))
+    await sent(journal, "DEAD")
+    replies = [e.payload["decision"] for e in journal.read(RUN, kinds=["model_response"])]
+    assert replies[0]["name"] == "send_receipt", "the answers did not come back out of order"
+
+    changed = ByQuestion(
+        {"bill cus-1": (0.0, tool_turn(CHARGE_30, turn=0)), "tell cus-1": (0.0, tool_turn(RECEIPT))}
+    )
+    target = JournaledModel(changed, journal)  # type: ignore[arg-type]
+    target.serve_recorded(RUN, RecordedTurns(journal, RUN))
+    with scoped(scope("RESUMED")):
+        charge, _receipt = await asyncio.gather(
+            target.complete(ask("bill cus-1")), target.complete(ask("tell cus-1"))
+        )
+    assert changed.calls == 0
+    assert calls(charge) == [ToolCall(*CHARGE_25)]

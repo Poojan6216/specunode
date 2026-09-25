@@ -19,7 +19,13 @@ from specunode.buffer.idempotency import (
     key_preimage,
 )
 from specunode.canonical import JsonValue
-from specunode.journal.journal import Claim, Journal, JournalWriteError, PendingClaim
+from specunode.journal.journal import (
+    Claim,
+    Journal,
+    JournalError,
+    JournalWriteError,
+    PendingClaim,
+)
 
 BASE: dict[str, object] = {
     "run_id": "01RUN",
@@ -231,8 +237,7 @@ async def test_an_unresolved_claim_after_a_crash_is_ambiguous_not_safe(tmp_path:
     assert not again.may_send
 
 
-async def test_a_dead_lettered_effect_is_retried_by_a_resume(tmp_path: Path) -> None:
-    journal = Journal(tmp_path / "j.db")
+async def dead_letter(journal: Journal, **extra: JsonValue) -> None:
     await journal.claim_dispatch(pending())
     await journal.settle_dispatch(
         run_id="01RUN",
@@ -248,10 +253,56 @@ async def test_a_dead_lettered_effect_is_retried_by_a_resume(tmp_path: Path) -> 
             "nkey": "nk-1",
             "attempts": 5,
             "last_error": {"type": "Partitioned", "message": "unreachable"},
+            **extra,
         },
     )
+
+
+async def test_a_dead_letter_that_never_left_is_retried_by_a_resume(tmp_path: Path) -> None:
+    """The operator's remedy for a failure before anything left: heal the upstream, resume."""
+    journal = Journal(tmp_path / "j.db")
+    await dead_letter(journal, sent="no")
     again = await journal.claim_dispatch(pending(attempt=6))
     assert again.outcome is Claim.RETRY_SAFE
+
+
+@pytest.mark.parametrize("sent", ["maybe", None], ids=["maybe", "unrecorded"])
+async def test_a_dead_letter_that_may_have_left_is_not_retried_by_a_resume(
+    tmp_path: Path, sent: str | None
+) -> None:
+    """It may have taken effect. A resume used to retry every dead letter, and applied a charge
+    twice whenever the first had landed; now it is as ambiguous as the lost reply behind it.
+    A dead letter written before ``sent`` existed is treated the same way."""
+    journal = Journal(tmp_path / "j.db")
+    await dead_letter(journal, **({} if sent is None else {"sent": sent}))
+    again = await journal.claim_dispatch(pending(attempt=6))
+    assert again.outcome is Claim.AMBIGUOUS
+
+
+async def test_an_operator_who_says_it_never_left_lets_a_resume_send_it(tmp_path: Path) -> None:
+    journal = Journal(tmp_path / "j.db")
+    await dead_letter(journal, sent="maybe")
+    journal.resolve_dispatch("01RUN", "nk-1", landed=False, by="alice")
+
+    again = await journal.claim_dispatch(pending(attempt=6))
+    assert again.outcome is Claim.RETRY_SAFE
+    events = [e.payload for e in journal.read("01RUN", kinds=["policy_event"])]
+    assert events[-1]["event"] == "effect_resolved"
+    assert events[-1]["resolved_by"] == "alice"
+
+
+async def test_an_operator_who_says_it_landed_lets_a_resume_skip_it(tmp_path: Path) -> None:
+    journal = Journal(tmp_path / "j.db")
+    await dead_letter(journal, sent="maybe")
+    journal.resolve_dispatch("01RUN", "nk-1", landed=True, ack={"charge_id": "ch_1"})
+
+    again = await journal.claim_dispatch(pending(attempt=6))
+    assert again.outcome is Claim.ALREADY_DISPATCHED
+    assert again.ack == {"charge_id": "ch_1"}
+    resolved = [e.payload for e in journal.read("01RUN", kinds=["effect_dispatched"])]
+    assert resolved[-1]["resolved_by"] == "operator"
+    with pytest.raises(JournalError, match="already settled"):
+        journal.resolve_dispatch("01RUN", "nk-1", landed=False)
 
 
 async def test_unresolved_dispatches_are_the_resume_reconciliation_list(tmp_path: Path) -> None:

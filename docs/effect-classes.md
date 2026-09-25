@@ -70,9 +70,11 @@ override table is the only route to any speculation at all.
 ## The three flags
 
 **`idempotent`** — whether a second delivery of the same call is harmless upstream. It is a
-claim, not something the runtime verifies, and it decides one thing: what happens when a crash
-leaves a dispatch ambiguous. `True` means redeliver; `False` means dead-letter and stop for a
-human. Choose it by asking "would I rather this ran twice, or stopped and waited for me?"
+claim, not something the runtime verifies, and it decides one thing: what happens when a crash,
+or a reply that never came, leaves a dispatch ambiguous. `True` means redeliver; `False` means
+never send it again on a guess -- ask the tool's `reconcile` if it has one, and otherwise
+dead-letter it and stop for a human. Choose it by asking "would I rather this ran twice, or
+stopped and waited for me?"
 
 **`witness`** — whether a `READ` returns `{"value": ..., "witness": ...}`, where the witness is a
 version, ETag or row counter. With one, the runtime re-checks before the branch retires and
