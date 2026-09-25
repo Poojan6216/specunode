@@ -1054,7 +1054,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**885 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
+**887 tests pass, 24 skip — 10 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
