@@ -39,6 +39,9 @@ bench = ["matplotlib>=3.8", "numpy>=1.26", "datasets>=2.20", "reportlab>=4.1"]
 [project.urls]
 Homepage = "https://github.com/Poojan6216/specunode"
 Repository = "https://github.com/Poojan6216/specunode"
+Documentation = "https://github.com/Poojan6216/specunode/tree/main/docs"
+Results = "https://github.com/Poojan6216/specunode/blob/main/RESULTS.md"
+Issues = "https://github.com/Poojan6216/specunode/issues"
 
 [project.scripts]
 specunode = "specunode.cli:main"

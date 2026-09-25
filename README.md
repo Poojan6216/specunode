@@ -32,7 +32,7 @@ was lost. A checkpoint cannot see it: the call either finished or it did not. Sp
 every effect in its journal under a deterministic key *before* sending it, so after a crash it
 knows exactly which effects may already be out -- and then it asks the upstream (a tool's
 `reconcile`) or stops for a human. It never guesses. Details and caveats in
-[RESULTS.md](RESULTS.md#pull-the-plug-what-a-crash-sends-twice).
+[RESULTS.md](https://github.com/Poojan6216/specunode/blob/main/RESULTS.md#pull-the-plug-what-a-crash-sends-twice).
 
 ## Quickstart
 
@@ -75,7 +75,7 @@ resuming from the journal ...
 charges made: 1, receipts sent: 1
 ```
 
-The whole example is [examples/quickstart.py](examples/quickstart.py), and a test runs it.
+The whole example is [examples/quickstart.py](https://github.com/Poojan6216/specunode/blob/main/examples/quickstart.py), and a test runs it.
 
 ## And faster, when the model is the slow part
 
@@ -83,13 +83,13 @@ Against `claude-sonnet-5`, running every call a reply asks for together and hand
 back at once took an on-call task from 11 replies to 5: 35.4% less time and, with prompt caching,
 77.7% less cost, with every run correct. Three independent checks side by side took 60.2% less
 time than one after another. Nothing reached the world from a branch that never retired.
-[Details](RESULTS.md#fewer-replies-caching-and-parallel-nodes-against-a-real-model).
+[Details](https://github.com/Poojan6216/specunode/blob/main/RESULTS.md#fewer-replies-caching-and-parallel-nodes-against-a-real-model).
 
 What the safety costs is measured too. Against the fastest loop you would write by hand --
 every call of a reply at once, no journal, nothing a crash could be resumed from -- the runtime
 is 0.6% slower with instant tools and 3.3% slower with 300 ms tools on the same alert; a fan-out
 of read-only checks pays 13.1% with slow tools, one round of re-checking its reads.
-[Details](RESULTS.md#when-the-model-is-the-slow-part-fewer-replies-and-replies-side-by-side).
+[Details](https://github.com/Poojan6216/specunode/blob/main/RESULTS.md#when-the-model-is-the-slow-part-fewer-replies-and-replies-side-by-side).
 
 ## What did not work
 
@@ -140,7 +140,7 @@ The last column is the point, and so is the fact that the second and third rows 
 same ten predicted charges and discarded them unsent.
 
 Those figures come from that command; they are committed in
-[`bench/results/demo_leak.json`](bench/results/demo_leak.json) and a test asserts the file still
+[`bench/results/demo_leak.json`](https://github.com/Poojan6216/specunode/blob/main/bench/results/demo_leak.json) and a test asserts the file still
 matches a fresh run.
 
 ---
@@ -185,8 +185,8 @@ project is named after, which the benchmarks below find adds nothing on top of i
 
 Measured on 300 real OpenHands trajectories from
 `nebius/SWE-rebench-openhands-trajectories` — 19,484 tool calls. Full numbers with confidence
-intervals in [`RESULTS.md`](RESULTS.md). The derived corpus is redistributed under the dataset's
-CC BY 4.0 licence, with what was changed listed in [`bench/corpus/NOTICE.md`](bench/corpus/NOTICE.md).
+intervals in [`RESULTS.md`](https://github.com/Poojan6216/specunode/blob/main/RESULTS.md). The derived corpus is redistributed under the dataset's
+CC BY 4.0 licence, with what was changed listed in [`bench/corpus/NOTICE.md`](https://github.com/Poojan6216/specunode/blob/main/bench/corpus/NOTICE.md).
 
 ```
 python bench/corpus/fetch.py
@@ -240,7 +240,7 @@ running every call a reply asks for and handing the results back together took t
 replies to 5: 35.4% less time and, with prompt caching, 77.7% less cost, with every run correct.
 Three independent checks run side by side took 60.2% less time than one after another. Caching
 alone cut the bill by 72.7% and did not change the time at this prompt size. Nothing reached the
-world from a branch that never retired. Details in [RESULTS.md](RESULTS.md).
+world from a branch that never retired. Details in [RESULTS.md](https://github.com/Poojan6216/specunode/blob/main/RESULTS.md).
 
 ---
 
@@ -304,7 +304,7 @@ Known gaps, stated rather than left to be discovered:
 - One sample workload, not three. The invariant tests hold on it and on tiers 0 and 1.
 
 `BUILD_SPEC.md`'s Final Report lists every one of these with the reason it is open. Every
-subcommand of the CLI is documented in [docs/cli.md](docs/cli.md).
+subcommand of the CLI is documented in [docs/cli.md](https://github.com/Poojan6216/specunode/blob/main/docs/cli.md).
 
 ---
 
@@ -333,7 +333,7 @@ never evaluated, because no shipped path produces one: a speculative child runs 
 call and never opens a turn. The test asserts that too, so if speculation ever crosses a model
 turn it fails rather than passing vacuously. The retirement-time rebuild the rule describes is
 not implemented; a branch that did send a request while guessing is refused at retirement
-instead. See [`docs/adapters.md`](docs/adapters.md).
+instead. See [`docs/adapters.md`](https://github.com/Poojan6216/specunode/blob/main/docs/adapters.md).
 
 ---
 
@@ -370,7 +370,7 @@ claims to. Both need a look.
 python bench/adversarial/run_attacks.py --all
 ```
 
-[`docs/limitations.md`](docs/limitations.md) explains what each one costs.
+[`docs/limitations.md`](https://github.com/Poojan6216/specunode/blob/main/docs/limitations.md) explains what each one costs.
 
 - **A tool declared `READ` that writes** defeats the store buffer completely. The effect class is
   your word and nothing checks it.
@@ -470,4 +470,4 @@ retire.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](https://github.com/Poojan6216/specunode/blob/main/LICENSE).
