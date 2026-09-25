@@ -210,10 +210,17 @@ def _make_shim(name: str, original: Any) -> Callable[..., Awaitable[JsonValue]]:
 
 @dataclass
 class SpecuNodeGraph:
-    """A wrapped graph. ``ainvoke`` runs it under the runtime and produces a ledger."""
+    """A wrapped graph. ``ainvoke`` runs it under the runtime and produces a ledger.
+
+    Each call drives its run with a Scheduler of its own, so one wrapped graph serves any
+    number of runs at once. It shared one, and two requests at once -- how a web handler calls
+    it -- ran as one: the second took over the first, both runs' charges were journaled under
+    the second, and the first never finished.
+    """
 
     adapter: LangGraphAdapter
-    scheduler: Any
+    #: Builds the Scheduler for one run.
+    new_scheduler: Callable[[], Any]
     default_run_id: str | None = None
 
     def _run_id(self, run_id: str | None) -> str:
@@ -222,7 +229,7 @@ class SpecuNodeGraph:
         return run_id or self.default_run_id or new_ulid()
 
     async def ainvoke(self, inputs: JsonValue, run_id: str | None = None) -> Any:
-        result = await self.scheduler.run(self._run_id(run_id), inputs)
+        result = await self.new_scheduler().run(self._run_id(run_id), inputs)
         if not result.ok and result.error:
             raise RuntimeError(result.error)
         return result.state
@@ -236,7 +243,7 @@ class SpecuNodeGraph:
         each branch produces something.
         """
         resolved = self._run_id(run_id)
-        result = await self.scheduler.run(resolved, inputs)
+        result = await self.new_scheduler().run(resolved, inputs)
         if not result.ok and result.error:
             raise RuntimeError(result.error)
         for row in result.ledger.rows:
@@ -245,7 +252,7 @@ class SpecuNodeGraph:
 
     async def run(self, inputs: JsonValue, run_id: str | None = None) -> Any:
         """Like :meth:`ainvoke` but returns the whole result, ledger included."""
-        return await self.scheduler.run(self._run_id(run_id), inputs)
+        return await self.new_scheduler().run(self._run_id(run_id), inputs)
 
 
 def wrap(
@@ -271,18 +278,22 @@ def wrap(
     from specunode.core.scheduler import Scheduler
 
     adapter = LangGraphAdapter(compiled=compiled, speculable=speculable)
-    scheduler = Scheduler(
-        graph=adapter,
-        registry=registry,
-        journal=journal,
-        # The run id is set by Scheduler.run, which is the only place that knows it. Passing
-        # one here as well is how the buffer and the ledger end up reading different runs.
-        buffer=StoreBuffer(journal=journal, run_id=""),
-        dispatcher=dispatcher or Dispatcher(registry=registry),
-        target=target,
-        policy=policy or Policy(speculation=False),
-    )
-    return SpecuNodeGraph(adapter=adapter, scheduler=scheduler, default_run_id=run_id)
+    sender = dispatcher or Dispatcher(registry=registry)
+
+    def new_scheduler() -> Scheduler:
+        return Scheduler(
+            graph=adapter,
+            registry=registry,
+            journal=journal,
+            # The run id is set by Scheduler.run, which is the only place that knows it. Passing
+            # one here as well is how the buffer and the ledger end up reading different runs.
+            buffer=StoreBuffer(journal=journal, run_id=""),
+            dispatcher=sender,
+            target=target,
+            policy=policy or Policy(speculation=False),
+        )
+
+    return SpecuNodeGraph(adapter=adapter, new_scheduler=new_scheduler, default_run_id=run_id)
 
 
 def as_tool_call(name: str, args: Mapping[str, JsonValue]) -> ToolCall:

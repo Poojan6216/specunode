@@ -170,6 +170,10 @@ class StoreBuffer:
     #: is in ``drain`` and is expressed against the *branch's* task, not this one: on a
     #: framework that owns its own loop the drain legitimately runs on the framework's task.
     scheduler_task: asyncio.Task[object] | None = None
+    #: The run a Scheduler is driving with this buffer, while it does. ``run_id`` could not
+    #: say: a second run started on the same buffer overwrote it, and the first run's effects
+    #: were journaled under the second's.
+    driving: str | None = None
 
     # -- staging ---------------------------------------------------------------------------
 
@@ -387,18 +391,42 @@ class StoreBuffer:
         the tool is handed, and an idempotency key that shifted when a guess turned out right
         would make a retry after adoption look like a different call.
 
-        ``stage_index`` is renumbered onto the end of the parent's list. That is not program
-        order: adoption happens once the turn is journaled, before the parent stages the writes
-        the model emitted in the turn, so a confirmed guess can take a lower stage index than a
-        write the model asked for ahead of it. The drain sends by position (``step``), which
-        is program order either way, and the ledger checks the order effects left against
-        position, not stage index.
+        ``stage_index`` is renumbered onto the end of the parent's list. The scheduler adopts a
+        guess when the loop over the reply that confirmed it reaches its block, after the writes
+        the model asked for ahead of it are staged and sent. The drain still sends by position
+        (``step``), and the ledger checks the order effects left against position, not stage
+        index, so neither depends on when the move happened.
         """
-        # Recorded *before* the move, and never only after it. ``adopt`` is a point-in-time
-        # transfer, but the child's task may not have reached :meth:`stage` yet -- the model can
-        # emit the confirming block while the speculation is still awaiting its own journal
-        # append. Anything it stages after this line has to land where a drain will find it,
-        # and :meth:`stage` reads this map to decide that. Recording the adoption only when
+        # The record first, and the move only once it is on disk. Moved first, a failed append
+        # -- a transient ``JournalBusy`` -- left the guess's write on the parent while the turn
+        # settling it failed: the cleanup discarded the child, whose list was already empty,
+        # and the next drain, a node that caught the failure and wrote something else, sent
+        # it. If this raises, nothing has moved, and the caller discards the child's effects
+        # where they are. An effect the child stages while it is being written moves with the
+        # rest: its own ``effect_staged`` entry names it, and its dispatch names the branch
+        # that sent it.
+        held = self._staged.get(child.id, [])
+        if held:
+            await self.journal.append_async(
+                self.run_id,
+                "effect_adopted",
+                {
+                    "v": 1,
+                    "branch_id": parent.id,
+                    "from_branch_id": child.id,
+                    "step": parent.cursor.step_index,
+                    "effect_ids": [effect.id for effect in held],
+                    "count": len(held),
+                },
+            )
+
+        # No ``await`` from here on, so the child's task cannot stage in the middle of the move.
+        #
+        # Recorded with the move, and not only when there is something to move. ``adopt`` is a
+        # point-in-time transfer, but the child's task may not have reached :meth:`stage` yet --
+        # the model can emit the confirming block while the speculation is still awaiting its
+        # own journal append. Anything it stages after this has to land where a drain will find
+        # it, and :meth:`stage` reads this map to decide that. Recording the adoption only when
         # there was something to move left exactly that window open: the late effect went into
         # the child's list, no drain ever visits it, and the node body waits on an ack nobody
         # will ever complete. The run hangs with no error and no ``run_finished`` entry, which
@@ -424,18 +452,6 @@ class StoreBuffer:
             for offset, effect in enumerate(moved)
         ]
         target.extend(adopted)
-        await self.journal.append_async(
-            self.run_id,
-            "effect_adopted",
-            {
-                "v": 1,
-                "branch_id": parent.id,
-                "from_branch_id": child.id,
-                "step": parent.cursor.step_index,
-                "effect_ids": [effect.id for effect in adopted],
-                "count": len(adopted),
-            },
-        )
         return len(adopted)
 
     def adopted_into(self, branch_id: str) -> str | None:
@@ -714,6 +730,7 @@ class StoreBuffer:
                         attempts=claim.attempt,
                         error=f"ambiguous_after_crash: {why}",
                         authorised_by_offset=authorised_by_offset,
+                        dispatch_index=dispatch_index,
                     )
                     outcomes.append((effect.id, EffectOutcome.DEAD_LETTER))
                     halted_at, ok = dispatch_index, False
@@ -803,6 +820,7 @@ class StoreBuffer:
                 attempts=result.attempts,
                 error=result.error or "dispatch failed",
                 authorised_by_offset=authorised_by_offset,
+                dispatch_index=dispatch_index,
                 sent=sent,
             )
             outcomes.append((effect.id, EffectOutcome.DEAD_LETTER))
@@ -903,6 +921,7 @@ class StoreBuffer:
         attempts: int,
         error: str,
         authorised_by_offset: int,
+        dispatch_index: int,
         sent: str = "maybe",
     ) -> None:
         await self.journal.settle_dispatch(
@@ -922,6 +941,11 @@ class StoreBuffer:
                 "attempts": attempts,
                 "last_error": {"type": "ToolDispatchError", "message": error},
                 "authorised_by_offset": authorised_by_offset,
+                # Where it was tried in the branch's send order, and its place in the branch's
+                # list: without them the ledger took the index it was staged at, which for an
+                # adopted guess is its index on the guess's own branch.
+                "dispatch_index": dispatch_index,
+                "stage_index": effect.stage_index,
                 # "no" only when the request demonstrably never left this process. The claim
                 # table forgets it once the dead letter settles; a resume deciding whether the
                 # decision behind this effect still matters reads it here.

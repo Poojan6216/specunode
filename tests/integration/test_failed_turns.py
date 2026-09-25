@@ -294,3 +294,89 @@ async def test_a_turn_that_fails_on_the_runtimes_side_is_closed_at_once(tmp_path
     result = await scheduler.run(new_ulid(), {})
     assert result.ok, result.error
     assert [m.tool for m in world.mutations] == ["restart_job"]
+
+
+async def test_a_guess_whose_adoption_was_not_recorded_is_not_sent(tmp_path: object) -> None:
+    """The turn is journaled and confirms a guessed charge, but the record of moving the charge
+    onto the node's branch fails to write -- a transient ``JournalBusy``. The move came first,
+    so the charge stayed on the branch while the turn failed; the cleanup discarded the guess,
+    whose list was already empty, and the node, catching the failure and sending an apology,
+    sent the charge with it. The move now waits for its record. Found by the eleventh review."""
+    from pathlib import Path
+
+    from examples.support_agent.agent import build_tools
+    from tests.chaos._kill_agent import seeded_world
+
+    from specunode.canonical import JsonValue
+    from specunode.drafters.base import Prediction
+    from specunode.integrations.plain import PlainAdapter, node, registry_of
+    from specunode.journal.journal import JournalBusy
+
+    charge = ("charge_card", {"customer_id": "cus-1", "amount": 25.0})
+    scheduler: Scheduler | None = None
+    caught: list[str] = []
+
+    class GuessesTheCharge:
+        async def predict(self, context: object) -> list[Prediction]:
+            history = getattr(context, "history", ())
+            if history and history[-1].name == "lookup_customer":
+                return [Prediction(decision=ToolCall(*charge), tier=1, score=0.9)]
+            return []
+
+    class Model:
+        async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+            raise NotImplementedError
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            from specunode.core.model import TurnComplete
+
+            reply = tool_turn(("lookup_customer", {"customer_id": "cus-1"}), charge)
+            yield ToolUseComplete(index=0, block=reply.content[0])  # type: ignore[arg-type]
+            deadline = time.monotonic() + 10.0
+            while (  # noqa: ASYNC110
+                scheduler is None or scheduler.counters.effects_staged < 1
+            ) and time.monotonic() < deadline:
+                await asyncio.sleep(0.001)
+            yield ToolUseComplete(index=1, block=reply.content[1])  # type: ignore[arg-type]
+            yield TurnComplete(response=reply)
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        try:
+            await session.call_turn(ASK)  # type: ignore[misc]
+        except JournalBusy as exc:
+            caught.append(str(exc))
+            await session.call_tool("send_receipt", {"customer_id": "cus-1", "charge_id": "none"})
+        session.state["billed"] = True
+        return ToolCall("send_receipt", {})
+
+    world = seeded_world(Path(str(tmp_path)))
+    registry = registry_of(build_tools(world))
+    journal = Journal(Path(str(tmp_path)) / "journal.db")
+    append = journal.append_async
+    failed: list[str] = []
+
+    async def busy_once(run_id: str, kind: str, payload: dict[str, JsonValue]) -> int:
+        if kind == "effect_adopted" and not failed:
+            failed.append(kind)
+            raise JournalBusy("database is locked (transient)")
+        return await append(run_id, kind, payload)
+
+    journal.append_async = busy_once  # type: ignore[method-assign,assignment]
+    scheduler = Scheduler(
+        graph=PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill"),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(Model(), journal),  # type: ignore[arg-type]
+        policy=Policy(speculation=True),
+        predictor=GuessesTheCharge(),  # type: ignore[arg-type]
+    )
+    result = await scheduler.run(new_ulid(), {})
+    world.close()
+    assert result.ok, result.error
+    assert failed and caught, "the adoption record never failed, so nothing was tested"
+    assert [m.tool for m in world.mutations] == ["send_receipt"], "the guessed charge was sent"
+    discarded = [e.payload for e in journal.read(result.run_id, kinds=["effect_discarded"])]
+    assert [d["reason"] for d in discarded] == ["turn_failed"]

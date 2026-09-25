@@ -210,4 +210,53 @@ async def test_the_buffer_and_the_ledger_read_the_same_run(tmp_path: Path) -> No
     assert world.mutations, "the world was changed"
     assert result.ledger.rows, "so the ledger must not be empty"
     assert len(result.ledger.rows) == len(world.mutations)
-    assert graph.scheduler.buffer.run_id == result.run_id
+    sent = list(journal.read(result.run_id, kinds=["effect_dispatched"]))
+    assert len(sent) == len(world.mutations), "an effect was journaled under another run"
+
+
+async def test_two_runs_of_one_wrapped_graph_at_once_stay_apart(tmp_path: Path) -> None:
+    """One wrapped graph, two requests at once -- how a web handler calls it. ``wrap()`` built
+    one Scheduler for the graph, and a Scheduler keeps its run on itself: the second run took
+    over the first, both runs' charges were journaled under the second, and the first never
+    finished. Found by the eleventh review."""
+    import asyncio
+    import re
+
+    from specunode.core.model import ModelResponse, RequestEnvelope, TextBlock
+
+    class ChargesTheCustomerAskedAbout:
+        async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+            block = envelope.messages[-1].content[0]
+            assert isinstance(block, TextBlock)
+            found = re.search(r"cus-\d+", block.text)
+            assert found is not None, block.text
+            await asyncio.sleep(0.01)  # both runs are in a model turn at once
+            return tool_turn(("charge_card", {"customer_id": found.group(0), "amount": 25.0}))
+
+        async def stream(self, envelope: RequestEnvelope) -> object:
+            raise NotImplementedError
+
+    world = standard_world()
+    journal = Journal(tmp_path / "journal.db")
+    registry = build_registry(world)
+    model = ChargesTheCustomerAskedAbout()
+    graph = wrap(
+        build_graph(world, model),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        target=JournaledModel(model, journal, provider="scripted"),  # type: ignore[arg-type]
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),
+    )
+    runs = {"cus-1": new_ulid(), "cus-2": new_ulid()}
+    results = await asyncio.gather(
+        *(graph.run({"customer_id": customer}, run_id=run) for customer, run in runs.items())
+    )
+    for (customer, run), result in zip(runs.items(), results, strict=True):
+        assert result.ok, result.error
+        assert result.run_id == run
+        assert [(row.call.name, row.call.args["customer_id"]) for row in result.ledger.rows] == [
+            ("charge_card", customer),
+            ("send_receipt", customer),
+        ]
+        assert len(list(journal.read(run, kinds=["run_finished"]))) == 1
+    assert sorted(m.tool for m in world.mutations) == ["charge_card"] * 2 + ["send_receipt"] * 2

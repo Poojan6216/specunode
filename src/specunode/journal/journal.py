@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -105,9 +106,10 @@ _REARM_NOT_SENT = (
     "claimed_at = :claimed_at WHERE run_id = :run_id AND nkey = :nkey "
     "AND last_outcome = 'not_sent' AND status IN ('in_flight', 'dead_letter')"
 )
-# Session-scoped, so a process that dies releases it with its connection.
-_TRY_RUN_LOCK = "SELECT pg_try_advisory_lock(hashtext(:key)) AS locked"
-_RUN_UNLOCK = "SELECT pg_advisory_unlock(hashtext(:key)) AS unlocked"
+# Session-scoped, on a connection of the run's own: a process that dies releases it with the
+# connection. The key is 64 bits of a hash of the run id -- ``hashtext`` gave 32, and two
+# unrelated runs could not be driven at once when theirs collided.
+_TRY_RUN_LOCK = "SELECT pg_try_advisory_lock(%(key)s) AS locked"
 _UPDATE_NOT_SENT = (
     "UPDATE effect_dispatch SET last_outcome = 'not_sent', attempt = :attempt "
     "WHERE run_id = :run_id AND nkey = :nkey"
@@ -156,6 +158,14 @@ class RunBusy(JournalError):
 #: Runs being driven in this process, by journal location. ``Journal.hold_run``.
 _held_runs: set[tuple[str, str]] = set()
 _held_runs_lock = threading.Lock()
+#: For a Postgres journal, the connection each held run's lock lives on, by the same key.
+_run_lock_connections: dict[tuple[str, str], Any] = {}
+
+
+def _run_lock_key(run_id: str) -> int:
+    """A run's Postgres advisory lock key: a signed 64-bit slice of a hash of its id."""
+    digest = hashlib.sha256(f"specunode-run:{run_id}".encode()).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
 
 
 class Claim(Enum):
@@ -992,7 +1002,29 @@ class Journal:
         invented for it: a send intent is neither a model output nor a tool result, so Hard
         Rule 5 does not reach it.
         """
+        if self.is_postgres:
+            await asyncio.to_thread(self._check_run_lock, claim.run_id)
         return await self._writer.submit_async(lambda: self._writer._claim(claim))
+
+    def _check_run_lock(self, run_id: str) -> None:
+        """Refuse to send if a held run's Postgres lock has gone with its connection.
+
+        The lock lives exactly as long as the connection holding it: a server restart, a
+        failover or ``pg_terminate_backend`` ends both, while this process drives on -- and
+        another could then take the run up and send what this one is sending. So before each
+        effect is claimed, the connection is asked if it is still there. A run not held through
+        :meth:`hold_run` -- a buffer used on its own -- has nothing to check.
+        """
+        connection = _run_lock_connections.get((self._lock_location(), run_id))
+        if connection is None:
+            return
+        try:
+            connection.execute("SELECT 1")
+        except Exception as exc:
+            raise RunBusy(
+                f"run {run_id!r} lost its lock: the connection holding it closed ({exc}). "
+                "Nothing more is sent from here; resume the run to continue it."
+            ) from exc
 
     async def mark_not_sent(self, run_id: str, nkey: str, attempt: int) -> None:
         """Record that an attempt failed before anything left the process."""
@@ -1027,7 +1059,7 @@ class Journal:
         holding it dies -- a crashed run can always be resumed, and a running one cannot be
         resumed twice.
         """
-        key = (str(self.location), run_id)
+        key = (self._lock_location(), run_id)
         with _held_runs_lock:
             if key in _held_runs:
                 raise RunBusy(f"run {run_id!r} is already being driven in this process")
@@ -1039,29 +1071,38 @@ class Journal:
             with _held_runs_lock:
                 _held_runs.discard(key)
 
+    def _lock_location(self) -> str:
+        """The journal's location as the run lock names it: a DSN, or the file's real path.
+
+        Resolved, so that two paths to one file -- a symlink, a relative path -- are one lock.
+        Named as given, they were two, and both holders drove the run.
+        """
+        if self.is_postgres:
+            return str(self.location)
+        return os.path.realpath(self.location)
+
     @contextlib.contextmanager
     def _run_lock(self, run_id: str) -> Iterator[None]:
         if self.is_postgres:
-            lock = {"key": f"specunode-run:{run_id}"}
-            backend = self._writer._backend
-            row = self._writer.submit(lambda: backend.execute(_TRY_RUN_LOCK, lock).fetchone())
-            if not row or not row["locked"]:
-                raise RunBusy(f"run {run_id!r} is being driven by another process")
-            try:
+            with self._postgres_run_lock(run_id):
                 yield
-            finally:
-                self._writer.submit(lambda: backend.execute(_RUN_UNLOCK, lock).fetchone())
             return
         try:
             import fcntl
         except ImportError:  # pragma: no cover - not a platform CI runs on
             yield
             return
-        path = Path(self.location)
+        path = Path(self._lock_location())
         folder = path.with_name(path.name + ".locks")
-        folder.mkdir(exist_ok=True)
-        name = run_id if re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id) else chash(run_id)[:40]
-        handle = os.open(folder / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        # Always a hash, never the id itself: on a filesystem that ignores case -- macOS's, by
+        # default -- two ids that differ only in case named one file, and one run could not be
+        # driven while the other was.
+        lock_file = folder / f"{chash(run_id)[:40]}.lock"
+        try:
+            folder.mkdir(exist_ok=True)
+            handle = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as exc:
+            raise JournalError(f"cannot take run {run_id!r}'s lock at {lock_file}: {exc}") from exc
         try:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1073,6 +1114,36 @@ class Journal:
                 fcntl.flock(handle, fcntl.LOCK_UN)
         finally:
             os.close(handle)
+
+    @contextlib.contextmanager
+    def _postgres_run_lock(self, run_id: str) -> Iterator[None]:
+        """Hold ``run_id``'s advisory lock on a connection opened for it alone.
+
+        It was taken on the writer's connection, which every run of the process shares, and
+        which ``evict_writer`` -- the cure for a dead connection -- closes: evicting it released
+        every run's lock with the runs still going.
+        """
+        import psycopg
+
+        try:
+            connection = psycopg.connect(str(self.location), autocommit=True)
+        except psycopg.Error as exc:
+            raise JournalError(f"cannot take run {run_id!r}'s lock: {exc}") from exc
+        key = (self._lock_location(), run_id)
+        try:
+            row = connection.execute(_TRY_RUN_LOCK, {"key": _run_lock_key(run_id)}).fetchone()
+            if not row or not row[0]:
+                raise RunBusy(f"run {run_id!r} is being driven by another process")
+            _run_lock_connections[key] = connection
+            try:
+                yield
+            finally:
+                _run_lock_connections.pop(key, None)
+        finally:
+            # Closing the connection releases the lock. An error here -- the connection already
+            # gone -- has released it too, and must not replace whatever the run is raising.
+            with contextlib.suppress(Exception):
+                connection.close()
 
     def resolve_dispatch(
         self,

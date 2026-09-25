@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
@@ -338,6 +338,8 @@ class Scheduler:
     #: Turns run with early issue, kept so a test can assert on their timings.
     _turns: list[SpeculativeTurn] = field(default_factory=list)
     _budget: Budget | None = field(default=None, repr=False)
+    #: The run this Scheduler drives, or drove: it drives one (``_driving``).
+    _driven: str | None = field(default=None, repr=False)
 
     # -- bookkeeping the ports call back into ------------------------------------------------
 
@@ -490,10 +492,49 @@ class Scheduler:
         Held for its whole length (``Journal.hold_run``): a run is driven by one process, and
         one task in it, at a time.
         """
-        with self.journal.hold_run(run_id):
+        with self._driving(run_id):
             return await self._run(run_id, inputs)
 
+    @contextlib.contextmanager
+    def _driving(self, run_id: str) -> Iterator[None]:
+        """Drive ``run_id`` with this Scheduler, its buffer and the run held -- or raise.
+
+        A Scheduler keeps the run it drives on itself: its id, its counters, the turns and the
+        branches in flight; and its buffer keeps the run's staged effects. The LangGraph wrapper
+        built one per wrapped graph, and two requests at once -- how a web handler calls it --
+        shared it: the second run took over the first's, both runs' charges were journaled
+        under the second, and the first never finished. So a Scheduler drives one run, and a
+        buffer serves one run at a time. No ``await`` between the checks and the claims, so two
+        tasks cannot both pass them.
+        """
+        if self._driven is not None:
+            raise SchedulerError(
+                f"this Scheduler has already driven run {self._driven!r}. A Scheduler keeps the "
+                "run it drives on itself, so it drives one: build one per run or resume, or use "
+                "specunode.Runtime, which does."
+            )
+        if self.buffer.driving is not None:
+            raise SchedulerError(
+                f"this Scheduler's StoreBuffer is in use by run {self.buffer.driving!r}. A buffer "
+                "holds one run's staged effects: give each Scheduler its own."
+            )
+        with self.journal.hold_run(run_id):
+            self._driven = run_id
+            self.buffer.driving = run_id
+            try:
+                yield
+            finally:
+                self.buffer.driving = None
+
     async def _run(self, run_id: str, inputs: JsonValue) -> RunResult:
+        if self.journal.last_offset(run_id) is not None:
+            # A run started again from its beginning asks the model everything afresh, and any
+            # call that comes out different goes out under a key nothing has seen -- a second
+            # charge, with nothing to connect it to the first. ``resume`` is the way back in.
+            raise SchedulerError(
+                f"run {run_id!r} already has entries in this journal. To continue it, resume "
+                "it: a resume knows what already went out, and starting it again does not."
+            )
         self.run_id = run_id
         # One source of truth for the run id. Letting the buffer carry its own lets the two
         # disagree, and the failure is silent and confident: effects are journaled under one
@@ -599,7 +640,7 @@ class Scheduler:
         Held for its whole length, like :meth:`run`: two resumes of one run at once each took up
         the same claim, and between them sent a charge twice.
         """
-        with self.journal.hold_run(run_id):
+        with self._driving(run_id):
             return await self._resume(run_id)
 
     async def _resume(self, run_id: str) -> RunResult:
@@ -1773,9 +1814,10 @@ class SpeculativeTurn:
         #: Slot tasks whose work was adopted from a confirmed speculation. They may be parked
         #: on an ack this branch has to drain, which an ordinary slot task never is.
         self._adopted_tasks: set[asyncio.Task[JsonValue]] = set()
-        #: Guesses the model confirmed during this turn. Their writes join this branch only once
-        #: the turn is journaled; a turn that fails discards them instead.
-        self._confirmed: list[Branch] = []
+        #: Guesses the model confirmed during this turn, by the ordinal of the block that
+        #: confirmed each. A guess's writes join this branch only when the turn is journaled and
+        #: its block's turn comes in program order; a turn that fails discards them instead.
+        self._confirmed: dict[int, Branch] = {}
         self._history: list[ToolCall] = []
         self._results_so_far: list[JsonValue] = []
         self._predicted: ToolCall | None = None
@@ -1819,26 +1861,16 @@ class SpeculativeTurn:
             # A guess the model confirmed before the stream failed was confirmed by a turn that
             # never became durable, so what it staged is discarded, unsent. It was adopted
             # mid-stream once, and a node that caught the failure and finished sent it.
-            for child in self._confirmed:
-                scheduler.counters.effects_discarded += await scheduler.buffer.discard_and_journal(
-                    child, "turn_failed"
-                )
+            await self._discard_confirmed()
             raise
 
         # Any speculation still open when the turn ended predicted a call the model never made.
         await self._squash_open("turn_ended")
         try:
-            # The turn is journaled: what the guesses it confirmed staged becomes this branch's.
-            while self._confirmed:
-                await scheduler.buffer.adopt(self._confirmed[0], branch)
-                self._confirmed.pop(0)
             results = await self._settle_turn(tools, slots)
         except BaseException:
             # A guess not yet adopted when this failed stays where nothing drains it.
-            for child in self._confirmed:
-                scheduler.counters.effects_discarded += await scheduler.buffer.discard_and_journal(
-                    child, "turn_failed"
-                )
+            await self._discard_confirmed()
             # Settling is where a node parks on its own staged write, so it is where a node is
             # cancelled when a sibling in its group fails, and where a write whose ack fails
             # raises. The reads this turn issued early for later blocks were still running
@@ -1939,6 +1971,15 @@ class SpeculativeTurn:
                 self.stream_ended_at = time.monotonic()
                 self.response = event.response
 
+    async def _discard_confirmed(self) -> None:
+        """Discard what the guesses this turn confirmed, and nothing adopted yet, staged."""
+        scheduler = self._scheduler
+        for child in self._confirmed.values():
+            scheduler.counters.effects_discarded += await scheduler.buffer.discard_and_journal(
+                child, "turn_failed"
+            )
+        self._confirmed.clear()
+
     def _reads_a_pending_write(self, spec: ToolSpec, call: ToolCall) -> bool:
         """Whether ``call`` may read what a write the model emitted earlier this turn changes."""
         touched = keys_touched(spec, call.args)
@@ -1955,6 +1996,15 @@ class SpeculativeTurn:
         results: list[JsonValue] = []
         for ordinal, emitted in enumerate(self.decisions):
             task = slots[ordinal]
+            child = self._confirmed.get(ordinal)
+            if child is not None:
+                # The guess confirmed by this block joins the branch now, in program order: any
+                # earlier write has been sent and any earlier read made. Adopted when the turn
+                # ended instead, it was drained with the first write this loop parked on --
+                # before a read the model asked for ahead of it, which then saw its effect.
+                # Forgotten only once adopted: an adoption that fails is discarded with the rest.
+                await scheduler.buffer.adopt(child, branch)
+                del self._confirmed[ordinal]
             if task is not None:
                 if task in self._adopted_tasks and not task.done():
                     # The only slot this branch cannot finish on its own: an adopted
@@ -2143,12 +2193,13 @@ class SpeculativeTurn:
             # used to compensate for the child taking two positions for one call, and the two
             # errors cancelled only by coincidence.
             #
-            # Not now, though: when the turn is journaled (``run``). Moved here, mid-stream, the
-            # write sat on a branch any drain could send it from -- one woken by another task of
-            # the same node parking on its own write -- before the turn that confirmed it was on
-            # disk; and if the stream then failed, it had already gone. Until the turn ends it
-            # stays on the child, which nothing drains.
-            self._confirmed.append(child)
+            # Not now, though: once the turn is journaled, when the loop over its reply reaches
+            # this block (``_settle_turn``). Moved here, mid-stream, the write sat on a branch
+            # any drain could send it from -- one woken by another task of the same node
+            # parking on its own write -- before the turn that confirmed it was on disk; and if
+            # the stream then failed, it had already gone. Until then it stays on the child,
+            # which nothing drains.
+            self._confirmed[len(self.decisions)] = child
             # Deliberately no park signal here. Waking the scheduler at this point drains a
             # buffer that holds the adopted effect and nothing else -- the writes from blocks
             # the model emitted *earlier* are staged after the stream ends, so they are not

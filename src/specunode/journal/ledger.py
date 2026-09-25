@@ -352,7 +352,7 @@ class Ledger:
     speculation_disabled_reason: str | None = None
     #: True when no break-even was measured for this workload, so the alpha gate is inactive.
     alpha_gate_unmeasured: bool = False
-    #: Effects whose ``dispatch_index`` disagrees with their ``stage_index``.
+    #: Effects a branch sent out of program order (``_order_anomalies``).
     dispatch_order_anomalies: int = 0
     #: Effects whose staged and dispatched ``args_hash`` disagree.
     args_hash_mismatches: int = 0
@@ -713,8 +713,9 @@ def _row(
         stage_index = _as_int(staged, "stage_index")
     dispatch_index = _as_int(payload, "dispatch_index")
     if dispatch_index < 0:
-        # effect_dead_lettered records no dispatch_index: the drain halts at the first dead
-        # letter, so the failing effect's position in the send order is its stage position.
+        # An effect_dead_lettered written before it recorded where it was tried. The drain
+        # halts at the first dead letter, so its stage position stands in -- for display only:
+        # ``_order_anomalies`` leaves dead letters out.
         dispatch_index = stage_index
     ack = payload.get("ack")
     return LedgerRow(
@@ -746,15 +747,20 @@ def _row(
 def _order_anomalies(rows: Sequence[LedgerRow]) -> int:
     """Effects each branch sent out of program order: by position, then by stage.
 
-    Program order, not stage order. A confirmed guess is staged when its turn is journaled,
-    before the writes the model emitted ahead of it in the same turn are staged -- so its stage
-    index is lower though its position is later -- and the drain, which sends by position,
+    Program order, not stage order. A confirmed guess used to join its branch when its turn
+    was journaled, before the writes the model emitted ahead of it were staged -- so its stage
+    index was lower though its position was later -- and the drain, which sends by position,
     sent a correct run in exactly the right order while this reported it out of order.
+
+    Only effects that were sent. A dead letter's place in the send order was not recorded until
+    later, and the stage index that stood in for it collided with a sent effect's, so a correct
+    run whose last effect failed was reported out of order.
     """
     anomalies = 0
     by_branch: dict[str, list[LedgerRow]] = {}
     for row in rows:
-        by_branch.setdefault(row.branch_id, []).append(row)
+        if row.status in ("DISPATCHED", "COMPENSATED"):
+            by_branch.setdefault(row.branch_id, []).append(row)
     for branch_rows in by_branch.values():
         program = sorted(branch_rows, key=lambda row: (row.step_index, row.stage_index))
         sent = sorted(branch_rows, key=lambda row: row.dispatch_index)

@@ -309,3 +309,36 @@ def test_the_signing_key_is_stable_across_calls(tmp_path: Path) -> None:
     first = load_or_create_key(tmp_path / "keys")
     second = load_or_create_key(tmp_path / "keys")
     assert first.key_id == second.key_id
+
+
+def test_a_dead_letter_is_left_out_of_the_send_order() -> None:
+    """A dead letter written before it recorded where it was tried takes its stage index as its
+    place in the send order, and that can collide with an effect that was sent. It says nothing
+    about the order effects left in, so the check leaves it out."""
+    from specunode.core.decision import ToolCall
+    from specunode.journal.ledger import LedgerRow, _order_anomalies
+
+    def row(name: str, step: int, status: str) -> LedgerRow:
+        return LedgerRow(
+            effect_id=f"e-{name}",
+            call=ToolCall(name, {}),
+            key=f"k-{name}",
+            nkey=f"n-{name}",
+            node_id="bill",
+            step_index=step,
+            branch_id="b",
+            branch_ord=0,
+            stage_index=0,
+            dispatch_index=0,
+            retire_seq=0,
+            authorised_by_step=0,
+            status=status,  # type: ignore[arg-type]
+        )
+
+    # Sorted for display, the dead letter can come first: the same index as the charge.
+    assert (
+        _order_anomalies(
+            [row("send_receipt", 2, "DEAD_LETTER"), row("charge_card", 1, "DISPATCHED")]
+        )
+        == 0
+    )

@@ -239,3 +239,89 @@ def test_a_dead_writer_can_be_evicted_and_replaced() -> None:
     second.append(run_id, "policy_event", {"v": 1, "event": "tick", "reason": "pg"})
     assert server_rows(run_id) == before + 1, "the replacement writer did not reach the server"
     assert second.verify_chain(run_id).ok, "the chain did not survive the writer being replaced"
+
+
+def test_two_runs_whose_old_lock_keys_collide_are_driven_at_once() -> None:
+    """The run lock's key was ``hashtext``, 32 bits, and ``specunode-run:run-37193`` and
+    ``specunode-run:run-81426`` hash alike: two unrelated runs could not be driven at once.
+    Found by the eleventh review."""
+    pytest.importorskip("psycopg")
+    from specunode.journal.journal import Journal
+
+    tag = f"{os.getpid()}"
+    journal = Journal(dsn())
+    with journal.hold_run(f"run-37193-{tag}"), journal.hold_run(f"run-81426-{tag}"):
+        pass
+    # The pair itself, as the review found it.
+    with journal.hold_run("run-37193"), journal.hold_run("run-81426"):
+        pass
+
+
+def test_evicting_the_writer_does_not_release_a_held_run() -> None:
+    """The lock was taken on the writer's connection, and ``evict_writer`` -- the cure for a
+    dead one -- closed it, releasing every run's lock with the runs still going."""
+    pytest.importorskip("psycopg")
+    from specunode.journal.journal import Journal, RunBusy, evict_writer
+
+    run_id = f"01PGHELD{os.getpid():018d}"[:26]
+    with Journal(dsn()).hold_run(run_id):
+        evict_writer(dsn())
+        with pytest.raises(RunBusy, match="another process"), Journal(dsn())._run_lock(run_id):
+            pass
+
+
+async def test_a_run_whose_lock_went_with_its_connection_sends_nothing_more() -> None:
+    """The lock lives as long as its connection: a restart, a failover or
+    ``pg_terminate_backend`` ends both while the process drives on, and another could then take
+    the run up. The next claim is refused instead of made."""
+    psycopg = pytest.importorskip("psycopg")
+    from specunode.journal import journal as module
+    from specunode.journal.journal import Journal, PendingClaim, RunBusy
+
+    run_id = f"01PGLOST{os.getpid():018d}"[:26]
+    journal = Journal(dsn())
+    with journal.hold_run(run_id):
+        held = module._run_lock_connections[(journal._lock_location(), run_id)]
+        with psycopg.connect(dsn(), autocommit=True) as admin:
+            admin.execute("SELECT pg_terminate_backend(%s)", (held.info.backend_pid,))
+        with pytest.raises(RunBusy, match="lost its lock"):
+            await journal.claim_dispatch(
+                PendingClaim(
+                    run_id=run_id,
+                    nkey="n-1",
+                    idem_key="k-1",
+                    effect_id="e-1",
+                    branch_id="b-1",
+                    tool="charge_card",
+                )
+            )
+    assert not journal.unresolved_dispatches(run_id), "a claim was staked after the lock was lost"
+
+
+def test_the_cli_reads_a_postgres_journal() -> None:
+    """``--journal`` was a ``Path``, which folds ``postgresql://`` into ``postgresql:/``: the
+    CLI opened a SQLite file in a folder named ``postgresql:``. Found by the eleventh review."""
+    pytest.importorskip("psycopg")
+    from typer.testing import CliRunner
+
+    from specunode.cli import app
+    from specunode.journal.journal import Journal
+
+    run_id = f"01PGCLI{os.getpid():019d}"[:26]
+    Journal(dsn()).append(run_id, "policy_event", {"v": 1, "event": "tick", "reason": "cli"})
+    result = CliRunner().invoke(app, ["runs", "--journal", dsn()])
+    assert result.exit_code == 0, result.output
+    assert run_id in result.output.split()
+
+
+def test_a_runtime_given_a_dsn_opens_postgres() -> None:
+    pytest.importorskip("psycopg")
+    import specunode
+    from specunode.core.decision import FreeText
+
+    @specunode.node()
+    async def done(session: specunode.RunSession) -> specunode.Decision:
+        return FreeText.of("done")
+
+    runtime = specunode.Runtime(specunode.graph([done], lambda state: None), journal=dsn())
+    assert runtime._journal().is_postgres

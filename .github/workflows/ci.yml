@@ -96,6 +96,8 @@ jobs:
             tests/integration/test_speculation.py \
             tests/integration/test_budget.py \
             tests/integration/test_adoption.py \
+            tests/integration/test_early_issue.py \
+            tests/integration/test_failed_turns.py \
             tests/integration/test_stale_read.py \
             tests/integration/test_t1_end_to_end.py \
             tests/test_equivalence.py \

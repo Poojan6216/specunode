@@ -3,8 +3,11 @@
 `specunode` answers questions about a run that already happened, or continues one that did not
 finish. No subcommand decides anything: the journal decides, and these read it.
 
-Every command that reads a run takes `--journal PATH`, defaulting to `./.specunode/journal.db`.
-`--version` (or `-V`) prints the version; `specunode` alone prints this list.
+Every command that reads a run takes `--journal`: a SQLite file, or a `postgresql://` DSN.
+Without it, the journal is the one the config's `journal` section names -- its `path`, or for
+`kind: postgres` its `dsn` (or `SPECUNODE_JOURNAL_DSN`) -- and without a config,
+`./.specunode/journal.db`. `--version` (or `-V`) prints the version; `specunode` alone prints
+this list.
 
 Commands that need a config (`resume`, `replay`, `mcp-proxy`) take `--config PATH`. Without the
 option the search is `./specunode.yaml`, then `$XDG_CONFIG_HOME/specunode/config.yaml` (or

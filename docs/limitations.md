@@ -97,11 +97,29 @@ tool declared idempotent may be handed the *same* call again, after a crash lost
 its first delivery; that is what declaring it idempotent permits.
 
 It also assumes one driver per run. `run` and `resume` hold the run for as long as they drive
-it -- within a process, and across processes through a lock the operating system (or, for a
-Postgres journal, the database) releases when the process holding it dies -- and a second
-attempt to drive it raises `RunBusy`. Two resumes of one run at once used to take up the same
-claim, and between them send it twice. The lock is not taken on Windows, where only the
-in-process half applies.
+it, and a second attempt to drive it raises `RunBusy`. Two resumes of one run at once used to
+take up the same claim, and between them send it twice. Within a process the hold is a
+registry; across processes it is a lock that goes when the process holding it dies, so a
+crashed run can always be resumed:
+
+- **SQLite:** a lock file per run under `<journal>.locks/`, beside the journal. The files stay
+  after their runs end; they are empty, and safe to delete while no run is being driven. The
+  lock is not taken on Windows, where only the in-process half applies.
+- **Postgres:** an advisory lock on a connection of its own, which lives exactly as long as that
+  connection. A server restart, a failover or a dropped connection ends it while the process
+  drives on, and another process could then take the run up -- so before each effect is sent
+  the connection is checked, and a run whose lock has gone stops with `RunBusy` rather than
+  send. Behind a connection pooler this needs session pooling: in transaction pooling nothing
+  holds the lock at all.
+
+And one run per `Scheduler`. A Scheduler keeps the run it drives on itself -- its counters, the
+branches in flight, its buffer's staged effects -- so it drives one run: a second `run` or
+`resume` on it raises, as does a `StoreBuffer` shared by two runs at once. The LangGraph
+wrapper shared one Scheduler across every call until the eleventh review, and two requests at
+once ran as one; each call now gets its own. `specunode.Runtime` builds one per call too. And
+`run` refuses a run id the journal already holds: started again from its beginning, a run asks
+the model everything afresh, and a call that comes out different goes out under a key nothing
+has seen. `resume` is the way back into a run.
 
 There is no setting that makes a model answer a changed question the same way, and on the
 current models there is not even one that narrows it: `temperature`, `top_p` and `top_k` are

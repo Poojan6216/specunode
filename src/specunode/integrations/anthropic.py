@@ -242,7 +242,7 @@ class AnthropicModel:
         return ModelResponse(
             model=str(getattr(raw, "model", envelope.model)),
             content=_blocks_from_api(getattr(raw, "content", [])),
-            stop_reason=str(getattr(raw, "stop_reason", "end_turn") or "end_turn"),
+            stop_reason=_stop_reason(raw),
             usage=_usage_from_api(getattr(raw, "usage", None)),
         )
 
@@ -254,8 +254,10 @@ class AnthropicModel:
         """
         async with self._client.messages.stream(**self._params(envelope)) as stream:
             index = 0
+            finished = False
             async for event in stream:
                 event_type = getattr(event, "type", "")
+                finished = finished or event_type == "message_stop"
                 if event_type == "text":
                     yield TextDelta(index=index, text=str(getattr(event, "text", "")))
                 elif event_type == "content_block_stop":
@@ -264,12 +266,25 @@ class AnthropicModel:
                     if parsed and isinstance(parsed[0], ToolUseBlock):
                         yield ToolUseComplete(index=index, block=parsed[0])
                     index += 1
+            if not finished:
+                # A connection that dropped mid-reply. The SDK still assembles a message from
+                # what arrived -- a tool call cut off mid-argument parses, and "amount": 150.0
+                # cut after the 1 is a charge of 1 -- so the reply is refused, not finished.
+                raise ModelError("the stream ended before the model finished its reply")
             final = await stream.get_final_message()
         yield TurnComplete(
             response=ModelResponse(
                 model=str(getattr(final, "model", envelope.model)),
                 content=_blocks_from_api(getattr(final, "content", [])),
-                stop_reason=str(getattr(final, "stop_reason", "end_turn") or "end_turn"),
+                stop_reason=_stop_reason(final),
                 usage=_usage_from_api(getattr(final, "usage", None)),
             )
         )
+
+
+def _stop_reason(message: object) -> str:
+    """The reply's stop reason, which must be there: without one it may not be finished."""
+    reason = getattr(message, "stop_reason", None)
+    if not reason:
+        raise ModelError("the model's reply has no stop reason, so it may not be complete")
+    return str(reason)

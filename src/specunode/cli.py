@@ -13,6 +13,7 @@ that names what it is for.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from importlib import resources
 from pathlib import Path
@@ -21,7 +22,7 @@ import typer
 
 from specunode import __version__
 from specunode.config import DEFAULT_CONFIG_NAME, Config, ConfigError, load_config
-from specunode.journal.journal import Journal, JournalError
+from specunode.journal.journal import Journal, JournalError, is_postgres_dsn
 from specunode.journal.ledger import (
     build_ledger,
     load_or_create_key,
@@ -39,7 +40,10 @@ app = typer.Typer(
     add_completion=False,
 )
 
-DEFAULT_JOURNAL = Path("./.specunode/journal.db")
+JOURNAL_HELP = (
+    "Journal: a SQLite file or a postgresql:// DSN. Defaults to the config's journal, and "
+    "without one to ./.specunode/journal.db."
+)
 
 
 def _load_or_exit(config: Path | None) -> Config:
@@ -57,6 +61,22 @@ def _load_or_exit(config: Path | None) -> Config:
     except ConfigError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc
+
+
+def _journal_location(journal: str | None, loaded: Config | None = None) -> str:
+    """Where a command's journal is: ``--journal``, else the config's ``journal`` section.
+
+    A string, never a ``Path``: a Postgres DSN is a location too, and ``Path`` folds its ``//``
+    into ``/``, which turned ``postgresql://host/db`` into a SQLite file named ``postgresql:``.
+    And the config's section was read by nothing, so a journal configured there was not the
+    one any command used.
+    """
+    if journal:
+        return journal
+    settings = (loaded if loaded is not None else _load_or_exit(None)).journal
+    if settings.kind == "postgres":
+        return settings.dsn or os.environ.get("SPECUNODE_JOURNAL_DSN", "")
+    return str(settings.path)
 
 
 def _version_callback(value: bool) -> None:
@@ -105,17 +125,17 @@ def init(
 
 @app.command()
 def runs(
-    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+    journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
 ) -> None:
     """List the runs this journal holds."""
-    for run_id in Journal(journal).runs():
+    for run_id in Journal(_journal_location(journal)).runs():
         typer.echo(run_id)
 
 
 @app.command()
 def ledger(
     run_id: str = typer.Argument(..., help="The run to render."),
-    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+    journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
     short: bool = typer.Option(False, "--short", help="Abbreviate ids."),
     normalised: bool = typer.Option(
         False, "--normalised", help="Render only what the equivalence relation compares."
@@ -123,7 +143,7 @@ def ledger(
     as_json: bool = typer.Option(False, "--json", help="Emit the rows as JSON."),
 ) -> None:
     """Print a run's effect ledger: what reached the world, and what authorised it."""
-    built = build_ledger(Journal(journal), run_id)
+    built = build_ledger(Journal(_journal_location(journal)), run_id)
     if as_json:
         typer.echo(
             json.dumps(
@@ -149,7 +169,7 @@ def ledger(
 @app.command()
 def resume(
     run_id: str = typer.Argument(..., help="The run to continue."),
-    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+    journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
     config: Path = typer.Option(None, "--config", help=f"Defaults to ./{DEFAULT_CONFIG_NAME}."),
 ) -> None:
     """Continue a run that was interrupted, without re-sending what already went out.
@@ -180,7 +200,7 @@ def resume(
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc
 
-    book = Journal(journal)
+    book = Journal(_journal_location(journal, loaded))
     scheduler = Scheduler(
         graph=adapter,
         registry=registry,
@@ -217,7 +237,7 @@ def resolve(
     ack: str = typer.Option(
         None, "--ack", help="With --landed: the upstream's result, as JSON, handed to the node."
     ),
-    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+    journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
 ) -> None:
     """Record what happened to an effect the runtime could not settle on its own.
 
@@ -231,7 +251,7 @@ def resolve(
         raise typer.Exit(2)
     # The ledger shortens keys with an ellipsis; a key pasted from it keeps one.
     key = key.rstrip("…").rstrip(".")
-    book = Journal(journal)
+    book = Journal(_journal_location(journal))
     # Either key names the effect: the ledger prints the idempotency key the tool was handed,
     # and the dedupe key is what the claim is filed under. Both lead to the dedupe key.
     names: dict[str, str] = {}
@@ -263,7 +283,7 @@ def resolve(
 @app.command()
 def replay(
     run_id: str = typer.Argument(..., help="The run to replay."),
-    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+    journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
     config: Path = typer.Option(None, "--config", help=f"Defaults to ./{DEFAULT_CONFIG_NAME}."),
     speculation: str = typer.Option("on", "--speculation", help="on|off."),
     dispatch: bool = typer.Option(
@@ -297,7 +317,8 @@ def replay(
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc
 
-    source = Journal(journal)
+    location = _journal_location(journal, loaded)
+    source = Journal(location)
     recovery = recover(source, run_id)
     # A replay re-drives the run from its *beginning*, so it starts from the inputs the
     # journal recorded rather than from the state the run ended in. Starting from the end
@@ -312,7 +333,7 @@ def replay(
         inputs = {}
     # A fresh journal: replaying into the one being read would interleave a new run's entries
     # with the record it is checking against, and the record is the only evidence there is.
-    into = Journal(journal.parent / f"replay-{run_id}.db")
+    into = Journal(_beside(location) / f"replay-{run_id}.db")
     policy = loaded.to_policy()
     scheduler = Scheduler(
         graph=adapter,
@@ -339,7 +360,14 @@ def replay(
         raise typer.Exit(1)
 
 
-def signature_path(journal: Path, run_id: str, explicit: Path | None = None) -> Path:
+def _beside(journal: Path | str) -> Path:
+    """The folder files that belong with a journal go in: its own, or ``.specunode`` here."""
+    if is_postgres_dsn(journal):
+        return Path(".specunode")
+    return Path(journal).parent
+
+
+def signature_path(journal: Path | str, run_id: str, explicit: Path | None = None) -> Path:
     """Where a run's ledger signature lives: beside the journal, never inside it.
 
     Inside is impossible, not merely untidy. The signed payload covers ``journal_head`` and
@@ -352,13 +380,13 @@ def signature_path(journal: Path, run_id: str, explicit: Path | None = None) -> 
     """
     if explicit is not None:
         return explicit
-    return journal.parent / "ledgers" / f"{run_id}.sig"
+    return _beside(journal) / "ledgers" / f"{run_id}.sig"
 
 
 @app.command("verify-ledger")
 def verify_ledger_command(
     run_id: str = typer.Argument(..., help="The run to verify."),
-    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+    journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
     keystore: Path = typer.Option(Path("./.specunode/keys"), "--keystore"),
     signature: Path = typer.Option(
         None, "--signature", help="Signature file. Defaults to <journal dir>/ledgers/<run>.sig."
@@ -371,9 +399,10 @@ def verify_ledger_command(
     """
     from dataclasses import replace as _replace
 
-    store = Journal(journal)
+    location = _journal_location(journal)
+    store = Journal(location)
     built = build_ledger(store, run_id)
-    envelope_path = signature_path(journal, run_id, signature)
+    envelope_path = signature_path(location, run_id, signature)
     if envelope_path.is_file():
         built = _replace(built, signature=envelope_path.read_text(encoding="utf-8").strip())
     result = verify_ledger(built, journal=store, store=keystore)
@@ -387,7 +416,7 @@ def verify_ledger_command(
 @app.command("sign-ledger")
 def sign_ledger_command(
     run_id: str = typer.Argument(..., help="The run to sign."),
-    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+    journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
     keystore: Path = typer.Option(Path("./.specunode/keys"), "--keystore"),
     out: Path = typer.Option(
         None, "--out", help="Where to write it. Defaults to <journal dir>/ledgers/<run>.sig."
@@ -399,10 +428,11 @@ def sign_ledger_command(
     nowhere, so ``verify-ledger`` rebuilt an unsigned ledger and reported ``unsigned`` on every
     run that had been signed.
     """
-    store = Journal(journal)
+    location = _journal_location(journal)
+    store = Journal(location)
     key = load_or_create_key(keystore)
     signed = sign_ledger(build_ledger(store, run_id), key)
-    destination = signature_path(journal, run_id, out)
+    destination = signature_path(location, run_id, out)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(signed.signature + "\n", encoding="utf-8")
     typer.echo(f"signed with {key.key_id}")
@@ -413,10 +443,10 @@ def sign_ledger_command(
 @app.command()
 def verify(
     run_id: str = typer.Argument(..., help="The run whose chain to walk."),
-    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+    journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
 ) -> None:
     """Walk a run's hash chain and report the first break, if any."""
-    result = Journal(journal).verify_chain(run_id)
+    result = Journal(_journal_location(journal)).verify_chain(run_id)
     if result.ok:
         typer.echo(f"ok: {result.entries} entries, chain verified")
         return
@@ -427,10 +457,10 @@ def verify(
 @app.command()
 def status(
     run_id: str = typer.Argument(..., help="The run to inspect."),
-    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="Journal database."),
+    journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
 ) -> None:
     """Say what a run left behind, and what a resume would build on."""
-    recovery = recover(Journal(journal), run_id)
+    recovery = recover(Journal(_journal_location(journal)), run_id)
     typer.echo(f"run {run_id}")
     typer.echo(f"  finished: {recovery.finished}")
     typer.echo(f"  entries through offset: {recovery.last_offset}")

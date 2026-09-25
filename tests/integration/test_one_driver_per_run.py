@@ -24,7 +24,7 @@ from specunode.canonical import JsonValue
 from specunode.core.decision import Decision, FreeText
 from specunode.core.graph import RunSession
 from specunode.core.policy import Policy
-from specunode.core.scheduler import Scheduler
+from specunode.core.scheduler import Scheduler, SchedulerError
 from specunode.integrations.plain import PlainAdapter, node, registry_of, tool
 from specunode.journal.journal import Journal, RunBusy
 from specunode.testing.models import ScriptedModel
@@ -109,4 +109,115 @@ def test_a_run_held_by_another_process_cannot_be_driven_here(tmp_path: Path) -> 
         holder.wait()
     # Its holder is gone -- killed, as a crash would -- so the run is free again.
     with Journal(path).hold_run(RUN):
+        pass
+
+
+async def test_a_scheduler_drives_one_run(tmp_path: Path) -> None:
+    """A Scheduler keeps the run it drives on itself -- its id, its counters, its buffer -- so
+    a second run on it took the first over when both were going, and inherited the first's
+    counters when it came after. The LangGraph wrapper shared one across every call. A second
+    run, at once or later, is now refused. Found by the eleventh review."""
+    journal = Journal(tmp_path / "journal.db")
+    taken: list[str] = []
+    driver = scheduler(journal, taken, down=[False])
+    first = asyncio.create_task(driver.run(RUN, {}))
+    await asyncio.sleep(0.01)  # the first run's charge is in flight
+    with pytest.raises(SchedulerError, match="already driven run"):
+        await driver.run("01ONEDRIVERBBBBBBBBBBBBBBB", {})
+    assert (await first).ok
+    with pytest.raises(SchedulerError, match="already driven run"):
+        await driver.resume(RUN)
+    assert taken == ["cus-1 25.0"]
+    assert driver.counters.effects_dispatched == 1
+
+
+async def test_a_buffer_serves_one_run_at_a_time(tmp_path: Path) -> None:
+    journal = Journal(tmp_path / "journal.db")
+    taken: list[str] = []
+    one = scheduler(journal, taken, down=[False])
+    other = scheduler(journal, taken, down=[False])
+    other.buffer = one.buffer
+    first = asyncio.create_task(one.run(RUN, {}))
+    await asyncio.sleep(0.01)
+    with pytest.raises(SchedulerError, match="StoreBuffer is in use by run"):
+        await other.run("01ONEDRIVERBBBBBBBBBBBBBBB", {})
+    assert (await first).ok
+    assert taken == ["cus-1 25.0"]
+
+
+async def test_a_run_is_started_once_and_resumed_after(tmp_path: Path) -> None:
+    """Started again from its beginning, a run asks the model everything afresh, and a call
+    that comes out different goes out under a key nothing has seen. ``resume`` knows what
+    already went out; ``run`` on a run the journal holds is refused and says so."""
+    journal = Journal(tmp_path / "journal.db")
+    taken: list[str] = []
+    down = [True]
+    assert not (await scheduler(journal, taken, down=down).run(RUN, {})).ok
+    down[0] = False
+    with pytest.raises(SchedulerError, match="resume it"):
+        await scheduler(journal, taken, down=down).run(RUN, {})
+    assert taken == []
+    assert (await scheduler(journal, taken, down=down).resume(RUN)).ok
+    assert taken == ["cus-1 25.0"]
+
+
+def hold_elsewhere(path: Path, run_id: str) -> subprocess.Popen[str]:
+    """Hold ``run_id`` from another process, through ``path``, until killed."""
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\n"
+            "from specunode.journal.journal import Journal\n"
+            f"with Journal({str(path)!r}).hold_run({run_id!r}):\n"
+            "    print('held', flush=True)\n"
+            "    time.sleep(30)\n",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout is not None and holder.stdout.readline().strip() == "held"
+    return holder
+
+
+def test_two_paths_to_one_journal_are_one_lock(tmp_path: Path) -> None:
+    """A symlink to the journal named a second lock folder beside it, and a run held through
+    one path could be driven through the other, in another process or in this one. Found by
+    the eleventh review."""
+    path = tmp_path / "journal.db"
+    Journal(path)
+    alias = tmp_path / "alias.db"
+    alias.symlink_to(path)
+    holder = hold_elsewhere(path, RUN)
+    try:
+        with pytest.raises(RunBusy, match="another process"), Journal(alias).hold_run(RUN):
+            pass
+    finally:
+        holder.kill()
+        holder.wait()
+    with (
+        Journal(path).hold_run(RUN),
+        pytest.raises(RunBusy, match="in this process"),
+        Journal(alias).hold_run(RUN),
+    ):
+        pass
+
+
+def test_run_ids_that_differ_only_in_case_are_two_runs(tmp_path: Path) -> None:
+    """The lock file was named after the run id, and a filesystem that ignores case -- macOS's
+    by default -- made ``run-a`` and ``RUN-A`` one file: one could not be driven while the other
+    was. Found by the eleventh review."""
+    journal = Journal(tmp_path / "journal.db")
+    with journal.hold_run("run-a"), journal.hold_run("RUN-A"):
+        pass
+
+
+def test_a_lock_that_cannot_be_made_is_a_journal_error(tmp_path: Path) -> None:
+    """Not an ``OSError`` from deep inside, which the CLI did not catch."""
+    from specunode.journal.journal import JournalError
+
+    path = tmp_path / "journal.db"
+    journal = Journal(path)
+    (tmp_path / "journal.db.locks").write_text("not a folder")
+    with pytest.raises(JournalError, match="cannot take run"), journal.hold_run(RUN):
         pass

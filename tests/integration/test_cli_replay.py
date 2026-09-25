@@ -231,3 +231,24 @@ def test_a_config_path_that_does_not_exist_is_refused_rather_than_replaced(
     result = CliRunner().invoke(app, args)
     assert result.exit_code == 2, result.output
     assert str(absent) in result.output
+
+
+def test_the_cli_reads_the_journal_the_config_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The config's ``journal`` section was read by nothing: every command opened
+    ``./.specunode/journal.db`` whatever it said. ``--journal`` still wins."""
+    elsewhere = tmp_path / "books" / "journal.db"
+    elsewhere.parent.mkdir()
+    Journal(elsewhere).append("01CONFIGURED", "policy_event", {"v": 1, "event": "t", "reason": "r"})
+    (tmp_path / "specunode.yaml").write_text(
+        f"schema_version: 1\njournal:\n  path: {elsewhere}\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    listed = CliRunner().invoke(app, ["runs"])
+    assert listed.exit_code == 0, listed.output
+    assert listed.output.split() == ["01CONFIGURED"]
+    other = tmp_path / "other.db"
+    Journal(other).append("01FLAGGED", "policy_event", {"v": 1, "event": "t", "reason": "r"})
+    flagged = CliRunner().invoke(app, ["runs", "--journal", str(other)])
+    assert flagged.output.split() == ["01FLAGGED"]

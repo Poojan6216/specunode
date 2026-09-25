@@ -572,6 +572,28 @@ class RecordedTurnSource(Protocol):
         ...
 
 
+#: Stop reasons that mean the reply did not finish: it ran out of room, or was stopped.
+CUT_OFF = frozenset({"max_tokens", "model_context_window_exceeded", "refusal"})
+
+
+def refuse_cut_off(response: ModelResponse) -> None:
+    """Raise if ``response`` was cut off with a tool call in it.
+
+    A call cut off mid-argument can still parse -- ``"amount": 150.0`` stopped after the ``1``
+    is a charge of 1 -- and nothing downstream can tell it from a call the model finished. So a
+    reply that stopped before it finished -- out of tokens or context, or stopped by a refusal
+    -- and asked for anything is not acted on at all, and is not journaled as an answer; the
+    node sees a ``ModelError`` and can ask again.
+    """
+    if response.stop_reason in CUT_OFF and any(
+        isinstance(block, ToolUseBlock) for block in response.content
+    ):
+        raise ModelError(
+            f"the reply stopped at {response.stop_reason} with a tool call in it, which may be "
+            "incomplete; nothing in it is acted on -- give the model room and ask again"
+        )
+
+
 class JournaledModel:
     """Wraps a :class:`ModelClient` so every request and response is durable before use.
 
@@ -710,6 +732,7 @@ class JournaledModel:
                 return recorded.response
             started = time.monotonic()
             response = await self._inner.complete(envelope)
+            refuse_cut_off(response)
             latency_ms = int((time.monotonic() - started) * 1000)
             await self._journal_response(response, scope, request_id, digest, latency_ms)
             return response
@@ -762,6 +785,7 @@ class JournaledModel:
             completed = False
             async for event in self._inner.stream(envelope):
                 if isinstance(event, TurnComplete):
+                    refuse_cut_off(event.response)
                     latency_ms = int((time.monotonic() - started) * 1000)
                     await self._journal_response(
                         event.response, scope, request_id, digest, latency_ms

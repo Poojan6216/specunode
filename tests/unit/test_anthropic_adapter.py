@@ -105,6 +105,8 @@ class _FakeStream:
     async def __aiter__(self) -> AsyncIterator[object]:
         for block in self.message.content:
             yield type("Ev", (), {"type": "content_block_stop", "content_block": block})()
+        # The SDK passes the API's last event through; a stream without it was cut off.
+        yield type("Ev", (), {"type": "message_stop"})()
 
     async def get_final_message(self) -> _FakeMessage:
         return self.message

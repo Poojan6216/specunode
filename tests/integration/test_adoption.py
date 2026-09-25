@@ -306,9 +306,10 @@ async def test_a_guess_confirmed_after_an_emitted_write_is_reported_in_program_o
     tmp_path: Path,
 ) -> None:
     """The turn asks for a lookup, a charge, then the receipt a guess had already staged. The
-    guess joins the branch when the turn is journaled, before the charge is staged, so its
-    stage index is the lower one. The drain sends by position -- charge, then receipt -- and the
-    ledger, checking stage index instead, reported a correct run as out of order."""
+    guess joined the branch when the turn was journaled, before the charge was staged, so its
+    stage index was the lower one. The drain sent by position -- charge, then receipt -- and the
+    ledger, checking stage index instead, reported a correct run as out of order. The ledger
+    checks position now; and the guess now joins the branch at its place in the reply."""
     import asyncio
     import time
     from collections.abc import AsyncIterator
@@ -391,5 +392,111 @@ async def test_a_guess_confirmed_after_an_emitted_write_is_reported_in_program_o
     assert sum(turn.adopted for turn in scheduler._turns) == 1, "the guess was not confirmed"
     assert [m.tool for m in world.mutations] == ["charge_card", "send_receipt"]
     ledger = build_ledger(journal, result.run_id)
+    assert ledger.dispatch_order_anomalies == 0
+    assert "in program order" in render_ledger(ledger)
+
+
+async def test_a_run_whose_last_effect_failed_is_still_reported_in_program_order(
+    tmp_path: Path,
+) -> None:
+    """The turn charges and then sends the receipt a guess had staged, and the mail relay is
+    down. A dead letter recorded no place in the send order, and the ledger put the index it
+    was staged at in its place -- the guess's index on its own branch, the same as the charge's
+    -- so a run that sent in exactly the right order was reported out of it. Found by the
+    eleventh review."""
+    import asyncio
+    import time
+    from collections.abc import AsyncIterator
+
+    from tests.chaos._kill_agent import seeded_world
+
+    from specunode.canonical import JsonValue
+    from specunode.core.decision import Decision
+    from specunode.core.effects import EffectClass
+    from specunode.core.graph import RunSession
+    from specunode.core.model import (
+        Message,
+        RequestEnvelope,
+        StreamEvent,
+        TextBlock,
+        ToolUseComplete,
+        TurnComplete,
+    )
+    from specunode.drafters.base import Prediction
+    from specunode.integrations.plain import PlainAdapter, node, registry_of, tool
+    from specunode.journal.ledger import build_ledger, render_ledger
+
+    charge = ("charge_card", {"customer_id": "cus-1", "amount": 25.0})
+    receipt = ("send_receipt", {"customer_id": "cus-1", "charge_id": "ch_known"})
+    scheduler: Scheduler | None = None
+
+    class GuessesTheReceipt:
+        async def predict(self, context: object) -> list[Prediction]:
+            history = getattr(context, "history", ())
+            if history and history[-1].name == "charge_card":
+                return [Prediction(decision=ToolCall(*receipt), tier=1, score=0.9)]
+            return []
+
+    class Model:
+        async def complete(self, envelope: RequestEnvelope) -> object:
+            raise NotImplementedError
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            reply = tool_turn(charge, receipt)
+            yield ToolUseComplete(index=0, block=reply.content[0])  # type: ignore[arg-type]
+            deadline = time.monotonic() + 10.0
+            while (  # noqa: ASYNC110
+                scheduler is None or scheduler.counters.effects_staged < 1
+            ) and time.monotonic() < deadline:
+                await asyncio.sleep(0.001)
+            yield ToolUseComplete(index=1, block=reply.content[1])  # type: ignore[arg-type]
+            yield TurnComplete(response=reply)
+
+    world = seeded_world(tmp_path)
+
+    @tool(effect=EffectClass.WRITE, idempotent=False, forward_keys="customer:{args.customer_id}")
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        return await world.charge_card(customer_id=customer_id, amount=amount)
+
+    @tool(effect=EffectClass.WRITE, forward_keys="customer:{args.customer_id}")
+    async def send_receipt(customer_id: str, charge_id: str) -> JsonValue:
+        raise ConnectionError("mail relay down")
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        try:
+            await session.call_turn(  # type: ignore[misc]
+                RequestEnvelope(
+                    model="scripted",
+                    messages=(Message(role="user", content=(TextBlock(text="bill"),)),),
+                    stream=True,
+                )
+            )
+        finally:
+            session.state["billed"] = True
+        return ToolCall("send_receipt", {})
+
+    registry = registry_of([charge_card, send_receipt])
+    journal = Journal(tmp_path / "journal.db")
+    scheduler = Scheduler(
+        graph=PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill"),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(Model(), journal),  # type: ignore[arg-type]
+        policy=Policy(speculation=True),
+        predictor=GuessesTheReceipt(),  # type: ignore[arg-type]
+    )
+    result = await scheduler.run(new_ulid(), {})
+    world.close()
+    assert not result.ok
+    assert sum(turn.adopted for turn in scheduler._turns) == 1, "the guess was not confirmed"
+    assert [m.tool for m in world.mutations] == ["charge_card"]
+    ledger = build_ledger(journal, result.run_id)
+    assert [(row.call.name, row.status) for row in ledger.rows] == [
+        ("charge_card", "DISPATCHED"),
+        ("send_receipt", "DEAD_LETTER"),
+    ]
     assert ledger.dispatch_order_anomalies == 0
     assert "in program order" in render_ledger(ledger)

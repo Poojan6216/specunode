@@ -460,3 +460,90 @@ async def test_a_read_after_a_write_in_the_same_reply_sees_the_write(tmp_path: P
     world.close()
     assert result.ok, result.error
     assert seen["balance"] == 75.0, "the read ran before the write the model asked for first"
+
+
+async def test_a_read_between_two_writes_sees_the_first_and_not_the_guessed_second(
+    tmp_path: Path,
+) -> None:
+    """The reply charges 25, looks the customer up, and charges 10 -- the charge a guess had
+    already staged. The guess joined the branch when the turn ended, so the drain that sent the
+    first charge sent the second with it, and the lookup, deferred until after the first, ran
+    after both: the node was handed 65, a balance the customer never had at that point in the
+    reply. A confirmed guess now joins the branch only when the reply's order reaches it. Found
+    by the eleventh review."""
+    import asyncio
+    import time
+    from collections.abc import AsyncIterator
+
+    from examples.support_agent.agent import build_tools
+    from tests.chaos._kill_agent import seeded_world
+
+    from specunode.core.model import StreamEvent, ToolUseComplete, TurnComplete
+    from specunode.drafters.base import Prediction
+    from specunode.integrations.plain import PlainAdapter, node, registry_of
+
+    second = ("charge_card", {"customer_id": "cus-1", "amount": 10.0})
+    seen: dict[str, object] = {}
+    scheduler: Scheduler | None = None
+
+    class GuessesTheSecondCharge:
+        async def predict(self, context: object) -> list[Prediction]:
+            history = getattr(context, "history", ())
+            if history and history[-1].name == "lookup_customer":
+                return [Prediction(decision=ToolCall(*second), tier=1, score=0.9)]
+            return []
+
+    class Model:
+        async def complete(self, envelope: RequestEnvelope) -> object:
+            raise NotImplementedError
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            reply = tool_turn(
+                ("charge_card", {"customer_id": "cus-1", "amount": 25.0}),
+                ("lookup_customer", {"customer_id": "cus-1"}),
+                second,
+            )
+            yield ToolUseComplete(index=0, block=reply.content[0])  # type: ignore[arg-type]
+            yield ToolUseComplete(index=1, block=reply.content[1])  # type: ignore[arg-type]
+            # The guess stages its charge before the model confirms it.
+            deadline = time.monotonic() + 10.0
+            while (  # noqa: ASYNC110
+                scheduler is None or scheduler.counters.effects_staged < 1
+            ) and time.monotonic() < deadline:
+                await asyncio.sleep(0.001)
+            yield ToolUseComplete(index=2, block=reply.content[2])  # type: ignore[arg-type]
+            yield TurnComplete(response=reply)
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        ask = RequestEnvelope(
+            model="scripted",
+            messages=(Message(role="user", content=(TextBlock(text="charge, show, charge"),)),),
+            stream=True,
+        )
+        results = await session.call_turn(ask)  # type: ignore[misc]
+        seen["balance"] = results[1]["value"]["balance"]
+        session.state["billed"] = True
+        return ToolCall(*second)
+
+    world = seeded_world(tmp_path)
+    registry = registry_of(build_tools(world))
+    journal = Journal(tmp_path / "journal.db")
+    scheduler = Scheduler(
+        graph=PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill"),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(Model(), journal),  # type: ignore[arg-type]
+        policy=Policy(speculation=True, early_issue=True),
+        predictor=GuessesTheSecondCharge(),  # type: ignore[arg-type]
+    )
+    result = await scheduler.run(new_ulid(), {})
+    balance = world.tables["customers"]["cus-1"]["balance"]
+    world.close()
+    assert result.ok, result.error
+    assert sum(turn.adopted for turn in scheduler._turns) == 1, "the guess was not confirmed"
+    assert [m.tool for m in world.mutations] == ["charge_card", "charge_card"]
+    assert balance == 65.0
+    assert seen["balance"] == 75.0, "the read ran after a write the model asked for after it"

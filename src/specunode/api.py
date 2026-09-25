@@ -42,7 +42,7 @@ from specunode.core.policy import Policy
 from specunode.core.scheduler import RunResult, Scheduler
 from specunode.ids import new_ulid
 from specunode.integrations.plain import PlainAdapter, registry_of
-from specunode.journal.journal import Journal
+from specunode.journal.journal import Journal, is_postgres_dsn
 
 __all__ = ["Runtime", "current_idempotency_key", "graph"]
 
@@ -121,6 +121,10 @@ class Runtime:
     def _journal(self) -> Journal:
         if isinstance(self.journal, Journal):
             return self.journal
+        if is_postgres_dsn(self.journal):
+            # Not through ``Path``, which folds the DSN's ``//`` into ``/`` and made a SQLite
+            # file of it -- in a folder named ``postgresql:``.
+            return Journal(str(self.journal))
         path = Path(self.journal)
         path.parent.mkdir(parents=True, exist_ok=True)
         return Journal(path)

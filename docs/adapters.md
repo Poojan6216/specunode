@@ -91,6 +91,11 @@ because re-deriving a framework's routing and reducers outside it breaks the one
 makes wrapping worthwhile: that a wrapped graph reaches the same final state as an unwrapped
 one.
 
+An adapter is shared; a Scheduler is not. One wrapped graph serves any number of runs at once
+-- how a web handler calls it -- each driven by a Scheduler of its own, which is what `wrap()`
+builds per call. So keep nothing about a run on the adapter: what a node needs about its run
+comes from the session it is handed.
+
 ### Run the body as a task, not inside a context manager
 
 A node parked on a staged write's result has to retire **while its body is still suspended**.
