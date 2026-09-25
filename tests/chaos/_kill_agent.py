@@ -35,16 +35,13 @@ the world, change on disk -- on every machine, every time.
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
-import threading
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from bench._kill_points import arm, watch
 from examples.support_agent.agent import build, build_tools
 
 from specunode.buffer.dispatcher import Dispatcher
@@ -62,16 +59,12 @@ from specunode.core.model import (
 from specunode.core.policy import Policy
 from specunode.core.scheduler import Scheduler
 from specunode.integrations.plain import PlainAdapter, node, registry_of
-from specunode.journal import journal as journal_module
 from specunode.journal.journal import Journal
 from specunode.testing.models import ScriptedModel, tool_turn
 from specunode.testing.world import World
 
 CHARGE = ("charge_card", {"customer_id": "cus-1", "amount": 25.0})
 CHANGED_MIND = ("charge_card", {"customer_id": "cus-1", "amount": 30.0})
-
-#: Every method that changes the journal database, all run on its writer thread.
-DURABLE_WRITES = ("_append", "_claim", "_mark_not_sent", "_settle")
 
 
 def seeded_world(directory: Path) -> World:
@@ -80,21 +73,6 @@ def seeded_world(directory: Path) -> World:
         for index in range(1, 4):
             world.seed("customers", f"cus-{index}", name=f"Customer {index}", balance=100.0)
     return world
-
-
-class Counter:
-    """Counts one kind of event and dies at the chosen one."""
-
-    def __init__(self, die_at: int | None) -> None:
-        self.count = 0
-        self.die_at = die_at
-        self._lock = threading.Lock()
-
-    def tick(self) -> None:
-        with self._lock:
-            self.count += 1
-            if self.count == self.die_at:
-                os._exit(9)
 
 
 def build_billing(world: World) -> tuple[PlainAdapter, object]:
@@ -121,35 +99,6 @@ def build_billing(world: World) -> tuple[PlainAdapter, object]:
     return PlainAdapter.of([bill], route), registry_of(build_tools(world))  # type: ignore[arg-type]
 
 
-def count_journal_writes(counter: Counter) -> None:
-    """Tick before each durable write, so ``op:N`` dies with writes 1..N-1 on disk."""
-    writer = journal_module._JournalWriter
-    for name in DURABLE_WRITES:
-        original: Callable[..., Any] = getattr(writer, name)
-
-        def before(self: object, *args: Any, _original: Callable[..., Any] = original) -> Any:
-            counter.tick()
-            return _original(self, *args)
-
-        setattr(writer, name, before)
-
-
-def count_world_mutations(world: World, sends: Counter, mutations: Counter) -> None:
-    """Tick either side of the fsync to the world log: ``send:N`` before, ``mutation:N`` after.
-
-    Dying before the log write loses the request -- the world's in-memory change dies with the
-    process, and the world a resumed process opens never had it. Dying after loses the reply.
-    """
-    original = world._persist_mutation
-
-    def around(*args: Any) -> None:
-        sends.tick()
-        original(*args)
-        mutations.tick()
-
-    world._persist_mutation = around  # type: ignore[method-assign]
-
-
 async def main() -> None:
     directory = Path(sys.argv[1])
     run_id = sys.argv[2]
@@ -157,14 +106,9 @@ async def main() -> None:
     resuming = "resume" in sys.argv[4:]
     charge = CHANGED_MIND if "changed-mind" in sys.argv[4:] else CHARGE
 
-    kind, _, at = kill.partition(":")
-    writes = Counter(int(at) if kind == "op" else None)
-    sends = Counter(int(at) if kind == "send" else None)
-    mutations = Counter(int(at) if kind == "mutation" else None)
-    count_journal_writes(writes)
-
+    points = arm(kill)
     world = seeded_world(directory)
-    count_world_mutations(world, sends, mutations)
+    watch(world, points)
     adapter, registry = build_billing(world) if "billing" in sys.argv[4:] else build(world)
     journal = Journal(directory / "journal.db")
     model = ScriptedModel(turns=[tool_turn(charge, turn=0), tool_turn(charge, turn=1)])
@@ -183,11 +127,7 @@ async def main() -> None:
         else await scheduler.run(run_id, {"customer_id": "cus-1"})
     )
     world.close()
-    print(
-        f"done ok={result.ok} rows={len(result.ledger.rows)} "
-        f"ops={writes.count} mutations={mutations.count}",
-        flush=True,
-    )
+    print(f"done ok={result.ok} rows={len(result.ledger.rows)} {points.report()}", flush=True)
 
 
 if __name__ == "__main__":

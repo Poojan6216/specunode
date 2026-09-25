@@ -269,33 +269,59 @@ def test_a_kill_at_any_point_of_the_demo_resumes_to_a_prefix_without_duplicates(
     tmp_path: Path,
 ) -> None:
     """The demo draws one kill point, so a narrow window can hide from it -- one did, and CI
-    found it. Here the kill walks the whole run instead, and every resume is held to the two
-    properties that matter: nothing applied twice, and nothing the clean run did not do.
+    found it. Here the kill walks the whole run instead: every durable journal write and both
+    sides of every effect, each a real mid-run death on any machine. Every resume is held to the
+    two properties that matter: nothing applied twice, and nothing the clean run did not do.
+
+    The points were 24 delays spread across one timed run; on a slow runner most of them landed
+    after the run had finished, so the sweep covered a fifth of it and said so only in a count.
 
     Applied, not delivered: a kill that lands after ``restart_job`` reached the world and before
     its reply was recorded is resumed by handing it the same token again, because it declared a
-    repeat harmless, and the world absorbs it. This test counted that as a duplicate, and so
-    failed whenever a kill happened to land there -- rarely, which is how the claim it made
-    survived as long as it did."""
+    repeat harmless, and the world absorbs it."""
+    from concurrent.futures import ThreadPoolExecutor
+
     sys.path.insert(0, str(REPO))
-    from bench.demo import _absorbed, _applied_twice, _delivered, _helper, _work_ms
+    from bench.demo import _absorbed, _applied_twice, _delivered, _helper
 
     clean_dir = tmp_path / "clean"
     clean_dir.mkdir()
-    work = _work_ms(_helper(clean_dir, "01CLEANAAAAAAAAAAAAAAAAAAA", -1)[1])
+    ran = _helper(clean_dir, "01CLEANAAAAAAAAAAAAAAAAAAA", -1)[1]
     clean = _delivered(clean_dir)
-    killed = 0
-    for point in range(24):
-        directory = tmp_path / f"kill-{point}"
+    counts = dict(token.split("=", 1) for token in ran.split() if "=" in token)
+    points = [f"op:{n}" for n in range(1, int(counts["ops"]) + 1)]
+    points += [f"{side}:{n}" for side in ("send", "mutation") for n in (1, 2)]
+    assert int(counts["mutations"]) == 2, counts
+
+    def kill_then_resume(index: int) -> tuple[Path, int, str, str]:
+        directory = tmp_path / points[index].replace(":", "-")
         directory.mkdir()
-        run_id = f"01KILL{point:020d}"[:26]
-        killed += _helper(directory, run_id, work * (0.02 + 0.96 * point / 23))[0] != 0
-        _helper(directory, run_id, -1, resume=True)
+        run_id = f"01KILL{index:020d}"
+        died, out = _helper(directory, run_id, points[index])
+        try:
+            _helper(directory, run_id, -1, resume=True)
+            refused = ""
+        except SystemExit as exc:
+            refused = str(exc)
+        return directory, died, out, refused
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(kill_then_resume, range(len(points))))
+
+    refusals = 0
+    for point, (directory, died, out, refused) in zip(points, outcomes, strict=True):
+        assert died == 9 and "done" not in out, f"{point}: not killed there ({died}): {out}"
+        if refused:
+            # Killed before the run's first entry: nothing to resume, and a resume must say so
+            # rather than start the run afresh.
+            assert "nothing to resume" in refused and _delivered(directory) == [], point
+            refusals += 1
+            continue
         resumed = _delivered(directory)
         assert resumed == clean[: len(resumed)], (point, resumed, clean)
         assert _applied_twice(directory) == 0, point
         assert set(_absorbed(directory)) <= {"restart_job"}, (point, _absorbed(directory))
-    assert killed >= 12, f"only {killed} of 24 kill points landed inside the run"
+    assert refusals == 1, f"{refusals} points left nothing to resume; expected only op:1"
 
 
 async def test_a_resume_asks_again_a_turn_whose_decision_sent_nothing(tmp_path: Path) -> None:

@@ -623,19 +623,22 @@ KILL_SEED = 20260916
 
 
 def _helper(
-    directory: Path, run_id: str, delay_ms: float, *, resume: bool = False
+    directory: Path, run_id: str, kill: float | str, *, resume: bool = False
 ) -> tuple[int, str]:
-    """Run the subprocess to completion, or to its own SIGKILL. Returns (returncode, stdout).
+    """Run the subprocess to completion, or to its own death. Returns (returncode, stdout).
+
+    ``kill`` is a delay in milliseconds, -1 for none, or a named point such as ``op:12``
+    (``bench._kill_points``).
 
     Blocking on purpose, and kept in a synchronous function so it is obvious that it blocks:
     the demo has nothing else to do while the run it is measuring is running, and an async
     subprocess here would only add a way for the kill to race the reader.
     """
-    args = [sys.executable, str(HELPER), str(directory), run_id, f"{delay_ms}"]
+    args = [sys.executable, str(HELPER), str(directory), run_id, f"{kill}"]
     if resume:
         args.append("resume")
     done = subprocess.run(args, capture_output=True, text=True, timeout=180)
-    if delay_ms < 0 and done.returncode != 0:
+    if kill == -1 and done.returncode != 0:
         raise SystemExit(f"the helper failed: {done.stderr[-800:]}")
     return done.returncode, done.stdout
 

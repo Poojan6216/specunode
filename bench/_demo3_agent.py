@@ -1,6 +1,10 @@
 """Subprocess helper for Demo 3: run the ops workload, optionally dying part-way through.
 
-``python bench/_demo3_agent.py <dir> <run_id> <delay_ms|-1> [resume]``
+``python bench/_demo3_agent.py <dir> <run_id> <delay_ms|op:N|send:N|mutation:N|-1> [resume]``
+
+A delay is what the demo itself uses: a SIGKILL-like death at a moment measured to land inside
+the run's work. A named point (``bench._kill_points``) is what the test sweep uses, because a
+delay can miss the run on a slow machine and a named point cannot.
 
 A separate process because the demo's claim is about a process that *died*, and a process
 cannot SIGKILL itself and then go on to prove anything. The world writes to a durable log, so
@@ -20,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from bench._kill_points import arm, is_kill_point, watch
 from bench.demo import (
     BLOCK_MS,
     TURN_1,
@@ -42,10 +47,13 @@ from specunode.testing.models import ScriptedModel, tool_turn
 async def main() -> None:
     directory = Path(sys.argv[1])
     run_id = sys.argv[2]
-    delay_ms = float(sys.argv[3])
+    kill = sys.argv[3]
+    delay_ms = -1.0 if is_kill_point(kill) else float(kill)
     resuming = len(sys.argv) > 4 and sys.argv[4] == "resume"
 
+    points = arm(kill if is_kill_point(kill) else "-1")
     world = demo3_world(directory)
+    watch(world, points)
     registry = demo3_registry(world)
     journal = Journal(directory / "journal.db")
     # A resumed run is a new process, so its script would otherwise start over while the run
@@ -82,7 +90,11 @@ async def main() -> None:
     result = await scheduler.resume(run_id) if resuming else await scheduler.run(run_id, {})
     work_ms = (time.monotonic() - started) * 1000.0
     world.close()
-    print(f"done ok={result.ok} rows={len(result.ledger.rows)} work_ms={work_ms:.3f}", flush=True)
+    print(
+        f"done ok={result.ok} rows={len(result.ledger.rows)} work_ms={work_ms:.3f} "
+        f"{points.report()}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
