@@ -1897,3 +1897,88 @@ async def test_a_write_left_running_is_not_staged_once_its_node_returned(
     assert left[0].done(), "the call left running is still waiting"
     assert isinstance(left[0].exception(), TurnAbandoned)
     assert sent == []
+
+
+# -- the twenty-fourth review --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ends_at", "fails"),
+    [(0.06, False), (0.1, False), (0.13, False), (0.1, True)],
+    ids=["answered at 60 ms", "answered at 100 ms", "answered at 130 ms", "failed at 100 ms"],
+)
+async def test_a_turn_left_running_is_judged_by_when_its_answer_arrived(
+    tmp_path: Path, ends_at: float, fails: bool
+) -> None:
+    """The node returns at 150 ms, and the run's disk takes 100 ms to write an answer. A turn it
+    left running, answered just before the return, was still under way live -- its answer being
+    written -- and done in the replay, which writes nothing: live it gave its positions back,
+    replayed it kept them, and the next node asked at a position the journal had no turn for.
+    A finished run did not replay. Found by the twenty-fourth review."""
+    charged: list[str] = []
+
+    def build() -> tuple[PlainAdapter, object]:
+        @tool(effect="read")
+        async def lookup_plan(customer_id: str) -> JsonValue:
+            return {"plan": "basic"}
+
+        @tool(effect="write", idempotent=False)
+        async def charge_card(customer_id: str, amount: float) -> JsonValue:
+            charged.append(f"charge {amount}")
+            return {"charge_id": "ch"}
+
+        async def summarise(session: RunSession) -> None:
+            with contextlib.suppress(BaseException):
+                await session.call_turn(SUMMARY_TURN)  # type: ignore[misc]
+
+        @node(name="plan")
+        async def plan(session: RunSession) -> Decision:
+            asyncio.get_running_loop().create_task(summarise(session))  # never awaited
+            await asyncio.sleep(0.15)
+            session.state["planned"] = True
+            return ToolCall("lookup_plan", {})
+
+        @node(name="bill")
+        async def bill(session: RunSession) -> Decision:
+            assert session.model is not None
+            price = await session.model.complete(PRICE_TURN)
+            await session.call_tool(
+                "charge_card", {"customer_id": "cus-1", "amount": float(price.text)}
+            )
+            session.state["billed"] = True
+            return ToolCall("charge_card", {})
+
+        def route(state: Mapping[str, JsonValue]) -> str | None:
+            if not state.get("planned"):
+                return "plan"
+            return None if state.get("billed") else "bill"
+
+        return PlainAdapter.of([plan, bill], route), registry_of([lookup_plan, charge_card])
+
+    db = tmp_path / "run.db"
+    run_id = new_ulid()
+    adapter, registry = build()
+    result = await asyncio.wait_for(
+        scheduler(
+            SlowTo(db, {"model_response"}),
+            adapter,
+            registry,
+            LooksUpForAWhile(0.01, ends_at, fails=fails),
+        ).run(run_id, {}),
+        timeout=30,
+    )
+    await asyncio.sleep(0.5)  # what was left running ends
+    assert result.ok, result.error
+
+    adapter, registry = build()
+    replay_db = tmp_path / "replay.db"
+    replay_run = new_ulid()
+    replayed = await asyncio.wait_for(
+        scheduler(Journal(replay_db), adapter, registry, replay_of(Journal(db), run_id)).run(
+            replay_run, {}
+        ),
+        timeout=30,
+    )
+    await asyncio.sleep(0.5)
+    assert replayed.ok, replayed.error
+    assert cursors_after(Journal(db), run_id) == cursors_after(Journal(replay_db), replay_run)

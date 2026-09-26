@@ -563,6 +563,30 @@ def partial_turns_discarded() -> Iterator[None]:
         _partial_discarded.reset(token)
 
 
+#: Told when the model's whole answer to a target turn read inside it arrives -- before it is
+#: written, and no later on a resume or in a replay, which pace it the same. Written first, the
+#: answer was handed over a write's time later live than in a replay, which writes nothing.
+_answer_arrived: ContextVar[Callable[[], None] | None] = ContextVar(
+    "specunode_answer_arrived", default=None
+)
+
+
+@contextmanager
+def answer_arrival(told: Callable[[], None]) -> Iterator[None]:
+    """Streams read inside this block call ``told`` when a target turn's whole answer arrives."""
+    token = _answer_arrived.set(told)
+    try:
+        yield
+    finally:
+        _answer_arrived.reset(token)
+
+
+def _tell_answer_arrived() -> None:
+    told = _answer_arrived.get()
+    if told is not None:
+        told()
+
+
 def current_scope() -> CallScope:
     scope = call_scope.get()
     if scope is None:
@@ -1623,6 +1647,8 @@ class JournaledModel:
                             source.release(recorded, scope)
                         else:
                             await source.due(recorded, scope, asked_at)
+                            if recorded.failed is None:
+                                _tell_answer_arrived()
                     except (asyncio.CancelledError, GeneratorExit, TurnAbandoned) as stopped:
                         # The caller did not have the whole turn: recorded as what it did have,
                         # so the next resume is handed what this one was, and no more.
@@ -1678,6 +1704,8 @@ class JournaledModel:
                         if isinstance(event, TurnComplete):
                             final, final_ms = event.response, at_ms
                             refuse_cut_off(event.response)
+                            if self._role == "target":
+                                _tell_answer_arrived()
                             recorded_outcome = True
                             await self._outcome(
                                 event.response,

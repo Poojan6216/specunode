@@ -175,11 +175,14 @@ among the turn's own, at another place on a resume, under another key. Await the
 ask the model on the side, use `session.model.complete()`, which takes no position. A turn that
 does not complete -- it fails, or the node stops waiting for it -- takes no positions at all,
 however many of its blocks had arrived. And once a node returns, what it left running takes no
-more positions and reaches the world no further: a turn still under way gives back the positions
-its blocks took, makes none of its calls, and has the guess it had open squashed; a call not yet
-begun is refused with `TurnAbandoned`; and a write already begun is refused where it would be
-staged. A write staged before the return goes out with the node's own -- and whether one got that
-far is a matter of timing, so await every write a node makes.
+more positions and makes no more calls: a turn still under way makes none of its calls, has the
+guess it had open squashed, and gives back the positions its blocks took unless the model's
+whole answer had already arrived; a call not yet begun is refused with `TurnAbandoned`; and a
+write already begun is refused where it would be staged. What was already on its way finishes --
+a read already sent to the upstream, a question already put to the model -- and a write staged
+before the return goes out with the node's own. How far work left running got by the return is
+a matter of timing, and a replay, which writes no answers, can get it further: await the work a
+node needs, every write above all.
 
 ### A model call that fails raises `ModelError`
 

@@ -1064,6 +1064,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [2.5] DEFECTS (fixed), found by the twenty-first review -- twelve, five critical, three of them in the twentieth's rewind: (1, critical) a deadline firing during a failed turn's cleanup skipped the rewind, and a fallback charge went out twice -- the positions are given back first, before any await, and the cleanup finishes whatever the caller does; (2, critical) the rewind reset the cursor over positions another turn of the node had taken -- a node's turn now runs alone, a second `call_turn` or a `call_tool` during one refused; (3, critical) a turn a node left running moved its cursor after it retired, and the run carried on from that, not the journaled `cursor_after` -- it carries on from what was journaled, and a retired node's calls and turns are refused; (4, critical) the rule check judged a run by every rule it had seen, and its advice charged twice -- each failed turn is judged by the rule in force when it was recorded; (5, critical, older) a resume slower to write its question gave the node less time for its answer than the run had -- a served answer's clock starts where the run's did; (6) the rewind handed a position a write had taken during the question's write out again -- a turn is open from when it is asked; (7) `status` called resumable a run `resume` refused; (8) the rule check refused runs whose failed turn took no positions; (9) a read left running wrote its result after `run_finished`; (10, 11) a deadline during a guess's confirmation or fork counted it twice or left it unresolved; (12) the set of finished drives grew without end -- a drive's end now travels with its calls. And a CI test that counted overlapping calls on a timing window no longer depends on the disk's speed. Each fix fails under its own planted bug. — 2026-09-26
 [2.5] DEFECTS, found by the twenty-second review -- eight, four critical, two of them in the twenty-first's repairs: (1, critical) the old-rule check read a turn by its envelope's `stream` flag, and `call_turn` streams whatever the flag says, so a run an earlier version recorded was resumed under the new rule and charged twice; (3, critical) the twenty-first review changed where calls sit after a turn a deadline cut short without changing the rule's number -- the rule is 3 now, and a run any part of which was recorded under another rule is refused whole, resume, replay and `status` alike, which also ends (7) a refusal judged by attempt rather than node; (4, critical, older) a turn journaled as answered went on reading its stream while the client closed its connection, a deadline fired meanwhile, and the node fell back while a resume took the model's path -- a turn is over once its answer is on disk and handed over, and an error the client raises closing no longer replaces it; (5) a turn or call a node left running moved the position its retirement journaled -- nothing it left running takes a position once its body returns, and its calls are refused; (6) a left-over turn's guess was settled after `run_finished`, and a confirmed one made a finished run resumable -- such guesses are squashed as the node returns, and a turn's bookkeeping writes nothing once its drive is over; (8) mypy, held to 3.11 under 3.12, could not read numpy's stubs -- it checks as the interpreter it runs under. (2, critical, older) is not fixed in code: a served answer is handed over only after this process writes the question and the answer again, and a call whose effect already went out returns at once, so a resume on a slower machine can hand a node racing a deadline its answer late -- `docs/replay.md` said the pace held however slow the disk; it now says how far it holds. Each code fix fails under its own planted bug. — 2026-09-26
 [2.5] DEFECTS (fixed), found by the twenty-third review -- four, one critical, in the twenty-second's repair of a turn's end: (1, critical) a stream ended at its answer still waited, on the node's time, for a client that closes its connection in its own `async with` exit -- and a deadline firing during the wait was swallowed, so the run priced an order at 2.6 s where its resume fell back at 1 s and charged a second amount; the client now closes in the background; (2) a turn left running could still open a guess after its node returned -- a drafter slow to guess, or a fork being written as the node returned -- and its call reached the upstream, unresolved or resolved before its fork; looked at again after each wait, the fork through the drive guard, and the squash as the node returns waits for a fork being written; (3) a turn left running kept the positions its blocks took while the node ran if it failed after the return, and gave them back if before -- it gives them back as the node returns; (4) a write left running that began before the return was staged after it -- it is refused where it would be staged. Each fix fails under its own planted bug. — 2026-09-26
+[2.5] DEFECTS (fixed), found by the twenty-fourth review -- three, none critical, one serious in the twenty-third's repair: (1, serious) a turn a node left running gave its positions back at the node's return if it was still under way -- and one answered just before the return was still under way live, its answer being written, and done in a replay, which writes nothing: the next node asked at a position the journal had no turn for, and a finished run did not replay. It is judged now by whether its answer had arrived, which a resume and a replay pace the same, and the rule is 4; (2) adapters.md said what a node left running reaches the world no further, and a read already sent, or a question already asked, finishes -- it says so; (3) the twenty-third's change of where a left-over turn leaves the cursor kept the rule at 3 -- it is 4. The fix fails under its own planted bug. — 2026-09-26
 [3.3] Four tests settled a guess inside a 15–25 ms block delay, which a journal append on a slow CI disk could miss. Found all at once by running the suite with every append 40 ms slower (`tests/slow_journal.py`); each now holds the settling block until the event it needs has happened, and passes at 40, 100 and 250 ms of added latency. The `slow-disk` CI job runs the tests that guess that way on every push. — 2026-09-25
 ```
 
@@ -1074,20 +1075,20 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**1102 tests pass, 24 skip — 18 of the passes against a real Postgres 16 server.** `ruff check`,
+**1106 tests pass, 24 skip — 18 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed -- mypy checking as
 the interpreter it runs under, 3.11 in CI and 3.12 here -- which is a stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Twenty-three independent adversarial reviews have found 221 defects here, 43 of them critical.**
-The counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8, 10, 6, 7, 7, 6, 12, 7, 5, 7, 12, 8, 4.** All are fixed but two, kept and
+**Twenty-four independent adversarial reviews have found 224 defects here, 43 of them critical.**
+The counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8, 10, 6, 7, 7, 6, 12, 7, 5, 7, 12, 8, 4, 3.** All are fixed but two, kept and
 documented: a node's writes are refused while any model turn it started is unjournaled, even one
 that did not decide the write; and a resume keeps the model's time but not the machine's -- a
 served answer comes back no sooner than it did, but a disk slower than the run's can hand it
 over late, and a call whose effect already went out returns at once, so a node racing a deadline
 on the edge can decide otherwise on a slower machine. That number is the most useful thing in this report, so it
 is at the top rather than buried: the version of this document written a day earlier described
-a finished project. The twenty-third to sixth reviews (2026-09-25 and -26) and the fifth (2026-09-23) are
+a finished project. The twenty-fourth to sixth reviews (2026-09-25 and -26) and the fifth (2026-09-23) are
 summarised below; the fourth is in commit `c8802ec`.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
@@ -1207,6 +1208,23 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (4 guesses forked, 4 squashed, 4 charges staged and discarded, the
 alpha gate closed once, 0 wasted tokens — a pattern-index guess costs no model tokens — and 0
 leaks) and 7.8 replay under model drift (both cases diverge at step 0).
+
+### What the twenty-fourth review found
+
+Three findings, none critical -- the first review since the fourteenth with no critical, and it
+found nothing that sends an effect twice or invents one. One serious, in the twenty-third's
+repair:
+
+- **Serious: a finished run could fail to replay.** A turn a node left running gave its
+  positions back as the node returned if it was still under way -- and one whose answer came just
+  before the return was still under way live, its answer being written, but done in a replay,
+  which writes nothing. The next node asked at a position the journal had no turn for. A
+  left-over turn is judged now by whether the model's whole answer had arrived, which live, a
+  resume and a replay pace the same.
+- And two minor: adapters.md said what a node left running reaches the world no further, where
+  a read already sent and a question already asked finish -- it says so now; and the
+  twenty-third review changed where a left-over turn leaves the cursor without changing the
+  position rule's number -- it is 4.
 
 ### What the twenty-third review found
 

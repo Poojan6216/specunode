@@ -67,11 +67,13 @@ class BranchStatus(Enum):
         return self in (BranchStatus.RETIRED, BranchStatus.SQUASHED, BranchStatus.STALLED)
 
 
-#: Which rule places a node's calls at program positions -- and so derives their keys. 3: a model
-#: turn that does not complete takes none; a node's turn runs alone; and once a node's body has
-#: returned, nothing it left running takes one. Recorded in ``run_started``; a run recorded under
-#: another rule is neither resumed nor replayed under this one.
-POSITION_RULE = 3
+#: Which rule places a node's calls at program positions -- and so derives their keys. 4: a model
+#: turn that does not complete takes none; a node's turn runs alone; once a node's body has
+#: returned, nothing it left running takes one; and a turn still under way then keeps the ones
+#: its blocks took if, and only if, the model's whole answer had arrived. Recorded in
+#: ``run_started``; a run recorded under another rule is neither resumed nor replayed under this
+#: one.
+POSITION_RULE = 4
 
 
 @dataclass(frozen=True, slots=True)

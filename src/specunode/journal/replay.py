@@ -42,6 +42,7 @@ from specunode.core.model import (
     _served_events,
     _served_never_answers,
     _sleep_until,
+    _tell_answer_arrived,
     current_scope,
     project,
     request_hash,
@@ -379,6 +380,8 @@ class ReplayModel:
         if turn.failed is not None:
             # The turn failed in the run being replayed, after what it had streamed so far.
             raise ModelError(turn.failed)
+        if self.role == "target":
+            _tell_answer_arrived()
         yield TurnComplete(response=response)
 
     # -- introspection for tests and the CLI -----------------------------------------------------

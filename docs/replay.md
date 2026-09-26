@@ -142,8 +142,10 @@ required whenever the run falls short.
 An idempotency key is derived from the run, the node, the program position, the tool and the
 *arguments*. A model turn that did not complete -- it failed, or its node gave up on it -- takes
 no positions, however many of its blocks had arrived -- and a turn still under way when its node
-returns is one it stopped waiting for: its positions are given back then, and its calls are not
-made. A call the node left running is refused once the node has returned, before it takes a
+returns is one it stopped waiting for: its calls are not made, and its positions are given back
+then, unless the model's whole answer had already arrived -- judged by when the answer arrived,
+which a resume and a replay pace the same, not by when it was written, which a replay does not
+do. A call the node left running is refused once the node has returned, before it takes a
 position or where it would stage a write. So the node's next call sits where it would had the
 turn not been asked, and a timing that a resume reproduces only roughly moves no key. Where a node's calls sit has
 changed between versions of SpecuNode -- the position rule, recorded in `run_started` -- and a

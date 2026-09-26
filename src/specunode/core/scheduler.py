@@ -57,6 +57,7 @@ from specunode.core.model import (
     TurnComplete,
     TurnResults,
     _let_finish,
+    answer_arrival,
     call_scope,
     drive_over,
     end_drive,
@@ -1372,16 +1373,20 @@ class Scheduler:
     async def _squash_what_it_left(self, branch: Branch) -> None:
         """Settle the turns a node left running when its body returned.
 
-        A turn still under way is one the node stopped waiting for, and takes no positions --
-        however many of its blocks had arrived by the return, which is a matter of timing: its
-        positions are given back now, before anything is awaited, as a turn that fails gives
-        them back. And nothing they guessed can be adopted now. Left to be settled when the
+        A turn still under way whose model had not answered it is one the node stopped waiting
+        for, and takes no positions: they are given back now, before anything is awaited, as a
+        turn that fails gives them back. One whose whole answer had arrived keeps them, even
+        while that answer is still being written. Judged by the write instead, a turn answered
+        just before the return was still under way live -- its answer being written -- and done
+        in a replay, which writes nothing: the next node asked at another position, and a
+        finished run did not replay. Arrival is paced the same live, on a resume and in a
+        replay. And nothing they guessed can be adopted now. Left to be settled when the
         model's next block arrived, a guess was squashed -- or confirmed -- after
         ``run_finished``; and once that was refused, it was never resolved at all. Squashed
         here, while the run is still driven.
         """
         for turn in self._turns:
-            if turn.branch is branch and turn.under_way:
+            if turn.branch is branch and turn.under_way and not turn.answered:
                 branch.rewind_to(turn.base)
         for turn in self._turns:
             if turn.branch is branch:
@@ -2180,6 +2185,9 @@ class SpeculativeTurn:
         self._cost_tokens: int = 0
         #: Between ``call_turn`` asking for it and handing its results over, or failing.
         self.under_way = False
+        #: The model's whole answer has arrived -- told before it is written, and at the same
+        #: point on a resume or in a replay (``answer_arrival``).
+        self.answered = False
         #: The open guess's fork, while it is being written; and the last squash, once begun --
         #: what a squash made as the node returns waits for, whichever task began it.
         self._forking: asyncio.Future[None] | None = None
@@ -2294,8 +2302,11 @@ class SpeculativeTurn:
     ) -> None:
         # call_turn reads the stream for the node and raises if it fails, so no part of a
         # failed turn reaches the node: the turn is closed, not left open to refuse its writes.
-        with partial_turns_discarded():
+        with partial_turns_discarded(), answer_arrival(self._answer_arrived):
             await self._read(envelope, tools, slots)
+
+    def _answer_arrived(self) -> None:
+        self.answered = True
 
     async def _read(
         self,
