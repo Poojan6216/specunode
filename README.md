@@ -195,7 +195,9 @@ project is named after, which the benchmarks below find adds nothing on top of i
 
 Measured on 300 real OpenHands trajectories from
 `nebius/SWE-rebench-openhands-trajectories` — 19,484 tool calls. Full numbers with confidence
-intervals in [`RESULTS.md`](https://github.com/Poojan6216/specunode/blob/main/RESULTS.md). The derived corpus is redistributed under the dataset's
+intervals in [`RESULTS.md`](https://github.com/Poojan6216/specunode/blob/main/RESULTS.md), and as a
+[PDF report](https://github.com/Poojan6216/specunode/blob/main/SpecuNode-Report-generated.pdf)
+built from the same results files by `bench/make_report_pdf.py`. The derived corpus is redistributed under the dataset's
 CC BY 4.0 licence, with what was changed listed in [`bench/corpus/NOTICE.md`](https://github.com/Poojan6216/specunode/blob/main/bench/corpus/NOTICE.md).
 
 ```
