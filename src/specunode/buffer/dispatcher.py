@@ -19,6 +19,7 @@ as such.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -88,6 +89,7 @@ class Dispatcher:
         *,
         idempotency_key: str,
         branch_id: str,
+        before_attempt: Callable[[], Awaitable[None]] | None = None,
     ) -> DispatchOutcome:
         """Call ``tool``, retrying until it acks or the attempts run out.
 
@@ -106,6 +108,9 @@ class Dispatcher:
         The call runs under a :class:`CallScope` carrying the branch and the key, which is how
         the fake world attributes every mutation -- and therefore how the leak test can state
         its invariant as a set comparison.
+
+        ``before_attempt`` runs before every attempt, and stops the dispatch by raising: the
+        store buffer checks there that this process still holds the run.
         """
         spec = self.registry.get(tool)
         if self.dry_run:
@@ -118,6 +123,8 @@ class Dispatcher:
         maybe_sent = False
 
         for attempt in range(1, self.max_attempts + 1):
+            if before_attempt is not None:
+                await before_attempt()
             scope = CallScope(branch_id=branch_id, effect_key=idempotency_key, speculative=False)
             token = call_scope.set(scope)
             retriable = True

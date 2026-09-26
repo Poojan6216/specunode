@@ -101,6 +101,12 @@ class OneNode:
         raise NotImplementedError
 
 
+def assert_failed_turn(journal: Journal, run_id: str) -> None:
+    """The turn is on disk as the failure it was, with nothing in it recorded as an answer."""
+    outcomes = [e.payload for e in journal.read(run_id, kinds=["model_response"])]
+    assert outcomes and all(o.get("failed") and o["decision"] is None for o in outcomes), outcomes
+
+
 async def run(
     tmp_path: object, body: Callable[[RunSession], object], *, guess: bool
 ) -> tuple[RunResult, World, Journal]:
@@ -134,7 +140,7 @@ async def test_a_guess_confirmed_before_the_turn_failed_is_not_sent(tmp_path: ob
     result, world, journal = await run(tmp_path, tolerant, guess=True)
     assert result.ok, result.error
     assert [m.tool for m in world.mutations] == [], "a restart went out on a turn never journaled"
-    assert not list(journal.read(result.run_id, kinds=["model_response"]))
+    assert_failed_turn(journal, result.run_id)
     reasons = [e.payload["reason"] for e in journal.read(result.run_id, kinds=["effect_discarded"])]
     assert "turn_failed" in reasons
 
@@ -261,7 +267,7 @@ async def test_a_stream_that_just_stops_is_a_failed_turn(tmp_path: object) -> No
     result = await scheduler.run(new_ulid(), {})
     assert result.ok, result.error
     assert world.mutations_by("restart_job") == [], "a guess went out on a turn never completed"
-    assert not list(journal.read(result.run_id, kinds=["model_response"]))
+    assert_failed_turn(journal, result.run_id)
 
 
 async def test_a_turn_that_fails_on_the_runtimes_side_is_closed_at_once(tmp_path: object) -> None:
@@ -380,3 +386,76 @@ async def test_a_guess_whose_adoption_was_not_recorded_is_not_sent(tmp_path: obj
     assert [m.tool for m in world.mutations] == ["send_receipt"], "the guessed charge was sent"
     discarded = [e.payload for e in journal.read(result.run_id, kinds=["effect_discarded"])]
     assert [d["reason"] for d in discarded] == ["turn_failed"]
+
+
+async def test_a_run_whose_confirmed_guess_was_discarded_is_not_reported_in_flight(
+    tmp_path: object,
+) -> None:
+    """The turn fails after confirming a guess, and the node lets the failure end the run. The
+    guess's resolution stayed "confirmed", which recovery reads as a drain the process died in:
+    a run that sent nothing was reported resumable, with a branch that might have sent
+    something. Found by the twelfth review."""
+    from specunode.journal.replay import recover
+
+    async def gives_up(session: RunSession) -> None:
+        await session.call_turn(ASK)  # type: ignore[misc]
+
+    result, world, journal = await run(tmp_path, gives_up, guess=True)
+    assert not result.ok
+    assert world.mutations == []
+    recovery = recover(journal, result.run_id)
+    assert recovery.confirmed_not_retired == () and not recovery.resumable
+    resolved = journal.read(result.run_id, kinds=["branch_resolved"])
+    resolutions = [(e.payload["status"], e.payload.get("reason")) for e in resolved]
+    assert ("squashed", "turn_failed") in resolutions, resolutions
+
+
+async def test_a_run_cancelled_from_outside_writes_nothing_after_it_returns(
+    tmp_path: object,
+) -> None:
+    """A timeout or a shutdown cancels a run with a guess open. The node bodies were cancelled
+    and not waited for, so their own cleanup -- the guess squashed, its write discarded -- was
+    journaled after the run returned and let go of the run, where a resume may already be
+    writing. Found by the twelfth review."""
+
+    class Hangs:
+        async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+            raise NotImplementedError
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            yield ToolUseComplete(
+                index=0,
+                block=ToolUseBlock(id="t0", name="fetch_runbook", args={"section": "restart"}),
+            )
+            await asyncio.Event().wait()  # the rest of the reply never comes
+
+    async def body(session: RunSession) -> None:
+        await session.call_turn(ASK)  # type: ignore[misc]
+
+    world = standard_world()
+    registry = registry_for(world)
+    journal = Journal(tmp_path / "journal.db")  # type: ignore[operator]
+    scheduler = Scheduler(
+        graph=OneNode(body),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(Hangs(), journal),
+        policy=Policy(speculation=True),
+        predictor=FixedDrafter(RESTART),  # type: ignore[arg-type]
+    )
+    run_id = new_ulid()
+    running = asyncio.create_task(scheduler.run(run_id, {}))
+    deadline = time.monotonic() + 10.0
+    while scheduler.counters.effects_staged < 1 and time.monotonic() < deadline:  # noqa: ASYNC110
+        await asyncio.sleep(0.001)
+    running.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await running
+    written = journal.last_offset(run_id)
+    for _ in range(20):
+        await asyncio.sleep(0.005)
+    assert journal.last_offset(run_id) == written, "the run wrote after it had returned"
+    discarded = list(journal.read(run_id, kinds=["effect_discarded"]))
+    assert discarded, "the guess's staged write was never recorded as discarded"

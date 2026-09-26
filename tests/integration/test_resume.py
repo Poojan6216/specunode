@@ -250,3 +250,47 @@ async def test_the_cursor_is_restored_from_the_journal_not_inferred(tmp_path: Pa
     recovery = recover(journal, run_id)
     assert recovery.cursor.step_index == last["step_index"]
     assert [list(v) for v in recovery.cursor.visits] == [list(v) for v in last["visits"]]
+
+
+async def test_a_run_records_its_start_before_anything_else(tmp_path: Path) -> None:
+    """With the default policy a ``policy_event`` was written first, and a crash between it and
+    ``run_started`` left a run with an entry and no inputs: ``run`` refused the id, and
+    ``resume`` drove it from empty state -- the support agent, defaulting the missing customer,
+    charged the wrong one. Found by the twelfth review."""
+    world = standard_world()
+    adapter, registry = build(world)
+    journal = Journal(tmp_path / "journal.db")
+    model = ScriptedModel(turns=[tool_turn(CHARGE, turn=0)])
+    scheduler = Scheduler(
+        graph=adapter,
+        registry=registry,  # type: ignore[arg-type]
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),  # type: ignore[arg-type]
+        target=JournaledModel(model, journal, provider="scripted"),
+        policy=Policy(),  # guessing on, no alpha floor: the policy_event is written
+    )
+    result = await scheduler.run(new_ulid(), {"customer_id": "cus-1"})
+    kinds = [entry.kind for entry in journal.read(result.run_id)]
+    assert kinds[0] == "run_started" and "policy_event" in kinds, kinds
+
+
+async def test_a_run_that_never_recorded_its_start_is_started_not_resumed(tmp_path: Path) -> None:
+    """A journal from before that order -- an entry, and no ``run_started``. Nothing is sent
+    before the start is recorded, so nothing was: ``resume`` refuses, and ``run`` starts it."""
+    import pytest
+
+    from specunode.core.scheduler import SchedulerError
+
+    world = standard_world()
+    run_id = new_ulid()
+    journal = Journal(tmp_path / "journal.db")
+    journal.append(run_id, "policy_event", {"v": 1, "event": "e", "reason": "r", "step": 0})
+    assert not recover(journal, run_id).resumable
+    resumer, _journal = make(tmp_path, world)
+    with pytest.raises(SchedulerError, match="never recorded its start"):
+        await resumer.resume(run_id)
+    starter, _journal = make(tmp_path, world)
+    result = await starter.run(run_id, {"customer_id": "cus-1"})
+    assert result.ok, result.error
+    assert [m.tool for m in world.mutations] == ["charge_card", "send_receipt"]

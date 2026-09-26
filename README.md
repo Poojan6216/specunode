@@ -31,7 +31,8 @@ The crash that charges a customer twice is the one where the charge went through
 was lost. A checkpoint cannot see it: the call either finished or it did not. SpecuNode claims
 every effect in its journal under a deterministic key *before* sending it, so after a crash it
 knows exactly which effects may already be out -- and then it asks the upstream (a tool's
-`reconcile`) or stops for a human. It never guesses. Details and caveats in
+`reconcile`) or stops for a human. It never guesses. SpecuNode's rows are a plain-Python graph;
+a crashed LangGraph run cannot be resumed in this version. Details and caveats in
 [RESULTS.md](https://github.com/Poojan6216/specunode/blob/main/RESULTS.md#pull-the-plug-what-a-crash-sends-twice).
 
 Nor does a resumed step ask the model again for a decision that may already have sent
@@ -39,9 +40,9 @@ something. Nothing is sent before the answer that decided it is journaled, and a
 served that answer from there -- so a model that would decide differently the second time
 cannot add a second, different charge, as long as the step asks the same question and builds
 the same call
-([limitations](https://github.com/Poojan6216/specunode/blob/main/docs/limitations.md#dispatch-is-at-least-once-and-the-ambiguous-window-is-real);
-this applies to runs continued with `resume`, not to a LangGraph graph re-run from its
-checkpointer).
+([limitations](https://github.com/Poojan6216/specunode/blob/main/docs/limitations.md#dispatch-is-at-least-once-and-the-ambiguous-window-is-real)).
+All of this is about runs continued with `resume`, which in this version means plain-Python
+graphs: a crashed LangGraph run cannot be resumed yet.
 
 ## Quickstart
 
@@ -293,7 +294,8 @@ v0.1.0, and honest about where it is. Working today:
 
 - the canonical form, the hash-chained journal, replay and crash recovery
 - effect classes, the store buffer, at-least-once dispatch with deterministic idempotency keys
-- the sequential scheduler, the LangGraph integration, the plain-Python API, `resume`
+- the sequential scheduler, the LangGraph integration, the plain-Python API, `resume` (for
+  plain-Python graphs; a crashed LangGraph run cannot be resumed yet)
 - tier-0 early issue, the tier-1 pattern index, and a tier-2 draft model behind an extra —
   "working" here means they run and are measured, not that they pay: tier 1's measured
   acceptance on the corpus above is 0.0000 within a turn and 0.0002 across, and tier 2's is

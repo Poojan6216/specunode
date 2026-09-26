@@ -238,7 +238,10 @@ class AnthropicModel:
         return cast(Any, envelope_to_params(envelope, cache=self.cache))
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
-        raw = await self._client.messages.create(**self._params(envelope))
+        try:
+            raw = await self._client.messages.create(**self._params(envelope))
+        except _api_errors() as exc:
+            raise ModelError(f"{type(exc).__name__}: {exc}") from exc
         return ModelResponse(
             model=str(getattr(raw, "model", envelope.model)),
             content=_blocks_from_api(getattr(raw, "content", [])),
@@ -252,6 +255,13 @@ class AnthropicModel:
         That is the whole of the tier-0 drafter's input, and the reason it can issue a read
         before the turn ends. The pattern is Claude Code's streaming tool executor.
         """
+        try:
+            async for event in self._stream(envelope):
+                yield event
+        except _api_errors() as exc:
+            raise ModelError(f"{type(exc).__name__}: {exc}") from exc
+
+    async def _stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
         async with self._client.messages.stream(**self._params(envelope)) as stream:
             index = 0
             finished = False
@@ -280,6 +290,19 @@ class AnthropicModel:
                 usage=_usage_from_api(getattr(final, "usage", None)),
             )
         )
+
+
+def _api_errors() -> tuple[type[BaseException], ...]:
+    """The SDK's API errors -- a refused request, a rate limit, a dropped connection.
+
+    Raised as :class:`ModelError`, the one type the runtime records a failed turn as and a
+    node catches to ask again, instead of whichever of the SDK's own types this was.
+    """
+    try:
+        from anthropic import APIError
+    except ImportError:  # pragma: no cover - the client could not have been built
+        return ()
+    return (APIError,)
 
 
 def _stop_reason(message: object) -> str:

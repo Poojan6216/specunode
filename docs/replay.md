@@ -142,10 +142,13 @@ and the *arguments*. Nothing is dispatched before the model turn that decided it
 and a resumed node whose earlier answer may already have sent something is served that answer
 when it asks the same question -- so the resumed run makes the same calls, derives the same keys,
 and the dedupe table catches the earlier attempt, whatever the model would have said the second
-time. An answer that sent nothing is asked for again; there is nothing to protect. What a resume
-cannot keep the same is anything else that shapes a call: a read made again that returns
-something new, a timestamp, code that changed. Then a different call at the same position gets
-a different key, and the world receives it as well.
+time. An answer that sent nothing is asked for again; there is nothing to protect. A turn that
+failed -- a reply cut off or refused, a model that was overloaded -- is recorded as the failure
+it was and served again as that failure, and a replay raises it again at the same point: a node
+that caught it and asked again then asks its second question, and is matched with the answer to
+that. What a resume cannot keep the same is anything else that shapes a call: a read made again
+that returns something new, a timestamp, code that changed. Then a different call at the same
+position gets a different key, and the world receives it as well.
 
 The kill/resume test resumes every kill point with a model that would decide differently if it
 were asked, on a node that asks and charges in one step as well as on one that only decides, and
@@ -154,9 +157,10 @@ holds each point to the outcome its on-disk state requires. See `docs/limitation
 ### On the LangGraph path
 
 State belongs to the checkpointer. LangGraph owns its own reducers and channel semantics, and a
-second copy in the journal would be a second answer to what the run's state is. So a LangGraph
-resume needs a LangGraph checkpointer, and the journal's hash chain does not cover the state it
-holds. The plain-Python path journals its deltas and needs nothing else.
+second copy in the journal would be a second answer to what the run's state is. So the journal's
+hash chain does not cover the state LangGraph holds, and a crashed LangGraph run cannot be
+resumed in this version (docs/limitations.md). The plain-Python path journals its deltas and
+needs nothing else.
 
 ## Where the journal lives
 

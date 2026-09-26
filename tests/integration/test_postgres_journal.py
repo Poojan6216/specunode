@@ -325,3 +325,73 @@ def test_a_runtime_given_a_dsn_opens_postgres() -> None:
 
     runtime = specunode.Runtime(specunode.graph([done], lambda state: None), journal=dsn())
     assert runtime._journal().is_postgres
+
+
+@pytest.mark.parametrize("path", ["retry", "send_again"])
+async def test_a_run_that_lost_its_lock_between_attempts_sends_nothing_more(path: str) -> None:
+    """The lock was checked once, before the claim. A process whose lock went during a retry's
+    backoff -- or while it asked the upstream whether its first attempt had landed -- sent the
+    retry anyway, while another process that had taken the run up sent the same charge. Found
+    by the twelfth review."""
+    psycopg = pytest.importorskip("psycopg")
+    from collections.abc import Mapping
+
+    from specunode.buffer.dispatcher import Dispatcher, ToolDispatchError
+    from specunode.buffer.store_buffer import StoreBuffer
+    from specunode.canonical import JsonValue
+    from specunode.core.decision import Decision, FreeText
+    from specunode.core.graph import RunSession
+    from specunode.core.policy import Policy
+    from specunode.core.scheduler import Scheduler
+    from specunode.integrations.plain import PlainAdapter, node, registry_of, tool
+    from specunode.journal import journal as module
+    from specunode.journal.journal import Journal
+    from specunode.testing.models import ScriptedModel
+
+    run_id = f"01PGRETRY{path[:4].upper()}{os.getpid():013d}"[:26]
+    journal = Journal(dsn())
+    attempts: list[str] = []
+
+    def drop_the_lock() -> None:
+        held = module._run_lock_connections[(journal._lock_location(), run_id)]
+        with psycopg.connect(dsn(), autocommit=True) as admin:
+            admin.execute("SELECT pg_terminate_backend(%s)", (held.info.backend_pid,))
+
+    async def charged(key: str, args: Mapping[str, JsonValue]) -> JsonValue | None:
+        drop_the_lock()  # while the upstream is asked, the lock goes
+        return None  # "absent": the first attempt never arrived
+
+    @tool(effect="write", idempotent=False, reconcile=charged)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        attempts.append(customer_id)
+        if len(attempts) == 1:
+            if path == "retry":
+                drop_the_lock()  # during the backoff before the retry, the lock goes
+                raise ToolDispatchError("connection refused", sent="no")
+            raise ToolDispatchError("timed out after sending", sent="maybe")
+        return {"charge_id": "ch_1"}
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        await session.call_tool("charge_card", {"customer_id": "cus-1", "amount": 25.0})
+        session.state["billed"] = True
+        return FreeText.of("billed")
+
+    registry = registry_of([charge_card])
+    scheduler = Scheduler(
+        graph=PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill"),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=3, base_delay_ms=50.0),
+        target=ScriptedModel(turns=[]),  # type: ignore[arg-type]
+        policy=Policy(speculation=False),
+    )
+    try:
+        result = await scheduler.run(run_id, {})
+        outcome = result.error or ""
+        assert not result.ok
+    except Exception as exc:  # the failure may surface as the run's error or as a raise
+        outcome = str(exc)
+    assert attempts == ["cus-1"], "a process that had lost the run sent it again"
+    assert "lost its lock" in outcome, outcome

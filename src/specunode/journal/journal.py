@@ -36,8 +36,9 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -644,6 +645,7 @@ class _JournalWriter:
         that is, it fails flakily, and a flaky safety test gets quarantined.
         """
         payload_json, payload_hash = canonical(payload).decode("utf-8"), chash(payload)
+        offset = -1
         self._backend.begin_immediate()
         try:
             head = self._head.get(run_id) or self._seed_head(run_id)
@@ -686,6 +688,15 @@ class _JournalWriter:
                     f"{nkey!r} has no claim in run {run_id!r} that is still open to settle"
                 )
             self._backend.commit()
+        except _INTEGRITY_ERRORS as exc:
+            # Another writer took this offset: two processes are driving one run. A raw
+            # driver error here said nothing of that.
+            self._backend.rollback()
+            self._head.pop(run_id, None)
+            raise JournalConcurrencyError(
+                f"offset {offset} of run {run_id} is already taken; another writer holds this "
+                f"journal ({self.path})"
+            ) from exc
         except Exception:
             self._backend.rollback()
             self._head.pop(run_id, None)
@@ -1002,9 +1013,20 @@ class Journal:
         invented for it: a send intent is neither a model output nor a tool result, so Hard
         Rule 5 does not reach it.
         """
-        if self.is_postgres:
-            await asyncio.to_thread(self._check_run_lock, claim.run_id)
+        await self.check_run_lock(claim.run_id)
         return await self._writer.submit_async(lambda: self._writer._claim(claim))
+
+    async def check_run_lock(self, run_id: str) -> None:
+        """Raise :class:`RunBusy` if ``run_id`` is held here and its lock has since gone.
+
+        Called before an effect is claimed and before every attempt to send it -- a retry
+        after a backoff, a send again once the upstream said the first never arrived: checked
+        once, before the claim, a process that lost its lock during a retry's backoff sent the
+        retry while another process was sending the same effect. A SQLite lock cannot go while
+        its holder lives, so only a Postgres journal has anything to check.
+        """
+        if self.is_postgres:
+            await asyncio.to_thread(self._check_run_lock, run_id)
 
     def _check_run_lock(self, run_id: str) -> None:
         """Refuse to send if a held run's Postgres lock has gone with its connection.
@@ -1070,6 +1092,31 @@ class Journal:
         finally:
             with _held_runs_lock:
                 _held_runs.discard(key)
+
+    @contextlib.asynccontextmanager
+    async def hold_run_async(self, run_id: str) -> AsyncIterator[None]:
+        """:meth:`hold_run`, taken off the event loop.
+
+        Taking a Postgres run lock opens a connection, and a slow or unreachable server held
+        the event loop -- every run in the process -- for as long as that took. A caller
+        cancelled while the lock is being taken lets the attempt finish, and lets go of it.
+        """
+        held = self.hold_run(run_id)
+        taking = asyncio.ensure_future(asyncio.to_thread(held.__enter__))
+        try:
+            await asyncio.shield(taking)
+        except asyncio.CancelledError:
+            with contextlib.suppress(BaseException):
+                await taking
+                held.__exit__(None, None, None)
+            raise
+        try:
+            yield
+        except BaseException:
+            if not held.__exit__(*sys.exc_info()):
+                raise
+        else:
+            held.__exit__(None, None, None)
 
     def _lock_location(self) -> str:
         """The journal's location as the run lock names it: a DSN, or the file's real path.

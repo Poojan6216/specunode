@@ -11,9 +11,11 @@ resumed and a running one cannot be resumed twice.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import subprocess
 import sys
-from collections.abc import Mapping
+import time
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -220,4 +222,49 @@ def test_a_lock_that_cannot_be_made_is_a_journal_error(tmp_path: Path) -> None:
     journal = Journal(path)
     (tmp_path / "journal.db.locks").write_text("not a folder")
     with pytest.raises(JournalError, match="cannot take run"), journal.hold_run(RUN):
+        pass
+
+
+class SlowLock(Journal):
+    """A journal whose run lock takes a while to take, as a Postgres one does on a slow server."""
+
+    @contextlib.contextmanager
+    def _run_lock(self, run_id: str) -> Iterator[None]:
+        time.sleep(0.3)
+        with super()._run_lock(run_id):
+            yield
+
+
+async def test_taking_the_run_lock_does_not_hold_up_other_runs(tmp_path: Path) -> None:
+    """A Postgres run lock opens a connection, and it was taken on the event loop: a slow server
+    held up every run in the process. Found by the twelfth review."""
+    journal = SlowLock(tmp_path / "journal.db")
+    ticks: list[float] = []
+
+    async def other_work() -> None:
+        for _ in range(10):
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    started = time.monotonic()
+    ticker = asyncio.create_task(other_work())
+    async with journal.hold_run_async(RUN):
+        pass
+    await ticker
+    assert sum(1 for tick in ticks if tick < started + 0.25) >= 5, "the loop stood still"
+
+
+async def test_a_run_cancelled_while_taking_its_lock_is_not_left_held(tmp_path: Path) -> None:
+    journal = SlowLock(tmp_path / "journal.db")
+
+    async def hold() -> None:
+        async with journal.hold_run_async(RUN):
+            await asyncio.Event().wait()
+
+    holding = asyncio.create_task(hold())
+    await asyncio.sleep(0.05)  # the lock is being taken
+    holding.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await holding
+    with Journal(tmp_path / "journal.db").hold_run(RUN):
         pass

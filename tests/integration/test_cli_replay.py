@@ -252,3 +252,68 @@ def test_the_cli_reads_the_journal_the_config_names(
     Journal(other).append("01FLAGGED", "policy_event", {"v": 1, "event": "t", "reason": "r"})
     flagged = CliRunner().invoke(app, ["runs", "--journal", str(other)])
     assert flagged.output.split() == ["01FLAGGED"]
+
+
+def test_resuming_an_unknown_run_is_a_message_not_a_traceback(scene: Path) -> None:
+    """The refusal escaped as a traceback and exit 1 -- which says a run did not complete.
+    Found by the twelfth review."""
+    result = CliRunner().invoke(
+        app,
+        [
+            "resume",
+            "01NOSUCHRUNAAAAAAAAAAAAAAA",
+            "--journal",
+            str(scene / "journal.db"),
+            "--config",
+            str(scene / "specunode.yaml"),
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert "no entries" in result.output
+    assert isinstance(result.exception, SystemExit), result.exception
+
+
+def test_a_journal_path_in_a_config_is_read_from_the_configs_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Relative to wherever the command ran, a config read from elsewhere named a journal
+    nobody had written; and ``~`` was taken literally, making a folder named ``~``. Every
+    command takes ``--config`` now, so all of them can read the journal ``resume`` used.
+    Found by the twelfth review."""
+    project = tmp_path / "project"
+    (project / "books").mkdir(parents=True)
+    Journal(project / "books" / "j.db").append(
+        "01RELATIVE", "policy_event", {"v": 1, "event": "e", "reason": "r"}
+    )
+    (project / "specunode.yaml").write_text(
+        "schema_version: 1\njournal:\n  path: books/j.db\n", encoding="utf-8"
+    )
+    home = tmp_path / "home"
+    (home / "journals").mkdir(parents=True)
+    Journal(home / "journals" / "h.db").append(
+        "01TILDE", "policy_event", {"v": 1, "event": "e", "reason": "r"}
+    )
+    (tmp_path / "tilde.yaml").write_text(
+        "schema_version: 1\njournal:\n  path: ~/journals/h.db\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(tmp_path)  # not the project: the path is the config's, not the shell's
+
+    relative = CliRunner().invoke(app, ["runs", "--config", str(project / "specunode.yaml")])
+    assert relative.output.split() == ["01RELATIVE"], relative.output
+    tilde = CliRunner().invoke(app, ["runs", "--config", str(tmp_path / "tilde.yaml")])
+    assert tilde.output.split() == ["01TILDE"], tilde.output
+    assert not (tmp_path / "~").exists()
+
+
+def test_a_config_that_does_not_load_says_how_to_name_the_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "specunode.yaml").write_text("schema_version: 1\nbogus_key: 1\n", encoding="utf-8")
+    event = {"v": 1, "event": "e", "reason": "r"}
+    Journal(tmp_path / "j.db").append("01NAMED", "policy_event", event)
+    monkeypatch.chdir(tmp_path)
+    refused = CliRunner().invoke(app, ["runs"])
+    assert refused.exit_code == 2 and "--journal" in refused.output, refused.output
+    named = CliRunner().invoke(app, ["runs", "--journal", str(tmp_path / "j.db")])
+    assert named.exit_code == 0 and named.output.split() == ["01NAMED"], named.output

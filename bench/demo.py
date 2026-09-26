@@ -702,6 +702,7 @@ def answered_turns(journal: Journal, run_id: str) -> int:
         if entry.payload.get("role", "target") == "target"
         and not entry.payload.get("speculative")
         and "recorded_from" not in entry.payload
+        and "failed" not in entry.payload
         and (entry.payload.get("branch_id") in retired or entry.payload.get("request_id") in pinned)
     )
 

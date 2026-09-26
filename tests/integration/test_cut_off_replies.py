@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,13 @@ def model_serving(body: str) -> object:
     return AnthropicModel(client=sdk, cache=False)
 
 
+def assert_refused(journal: Journal, run_id: str) -> None:
+    """The turn's outcome is on disk as a failure, and nothing in it as an answer."""
+    outcomes = [e.payload for e in journal.read(run_id, kinds=["model_response"])]
+    assert outcomes, "the refused turn left no outcome, and a resume cannot serve past it"
+    assert all(o.get("failed") and o["decision"] is None for o in outcomes), outcomes
+
+
 async def charge_through(tmp_path: Path, body: str) -> tuple[list[str], Journal, str]:
     taken: list[str] = []
 
@@ -176,7 +184,7 @@ async def test_a_reply_whose_connection_dropped_is_refused(tmp_path: Path) -> No
     taken, journal, error = await charge_through(tmp_path, DROPPED)
     assert taken == [], "a call from a reply that never finished was sent"
     assert "before the model finished" in error, error
-    assert not list(journal.read("01CUTOFFAAAAAAAAAAAAAAAAAA", kinds=["model_response"]))
+    assert_refused(journal, "01CUTOFFAAAAAAAAAAAAAAAAAA")
 
 
 async def test_a_reply_cut_off_at_max_tokens_is_not_acted_on(tmp_path: Path) -> None:
@@ -184,7 +192,7 @@ async def test_a_reply_cut_off_at_max_tokens_is_not_acted_on(tmp_path: Path) -> 
     taken, journal, error = await charge_through(tmp_path, MAX_TOKENS)
     assert taken == [], "a charge of 1 -- a call cut off mid-argument -- was sent"
     assert "max_tokens" in error, error
-    assert not list(journal.read("01CUTOFFAAAAAAAAAAAAAAAAAA", kinds=["model_response"]))
+    assert_refused(journal, "01CUTOFFAAAAAAAAAAAAAAAAAA")
 
 
 @pytest.mark.parametrize("stop", ["max_tokens", "model_context_window_exceeded", "refusal"])
@@ -210,4 +218,31 @@ async def test_complete_refuses_a_cut_off_reply_too(tmp_path: Path, stop: str) -
         pytest.raises(ModelError, match=stop),
     ):
         await target.complete(ASK)
-    assert not list(journal.read("01CUTOFFBAAAAAAAAAAAAAAAAA", kinds=["model_response"]))
+    assert_refused(journal, "01CUTOFFBAAAAAAAAAAAAAAAAA")
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_an_api_error_is_a_model_error(streamed: bool) -> None:
+    """The SDK's own error types went straight through: a node catching ``ModelError`` to ask
+    again did not catch an overloaded API, and the runtime did not record it as a failed turn,
+    so a resume could not serve past it."""
+    from specunode.integrations.anthropic import AnthropicModel
+
+    def handler(request: object) -> object:
+        body = {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+        return httpx.Response(529, json=body)
+
+    sdk = anthropic.AsyncAnthropic(
+        api_key="offline",
+        base_url="http://offline.invalid",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    model = AnthropicModel(client=sdk, cache=False)
+    with pytest.raises(ModelError, match="Overloaded") as raised:
+        if streamed:
+            async for _event in model.stream(ASK):
+                pass
+        else:
+            await model.complete(replace(ASK, stream=False))
+    assert isinstance(raised.value.__cause__, anthropic.APIError)

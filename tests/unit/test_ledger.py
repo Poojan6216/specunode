@@ -342,3 +342,30 @@ def test_a_dead_letter_is_left_out_of_the_send_order() -> None:
         )
         == 0
     )
+
+
+async def test_a_ledger_signed_in_format_1_is_not_reported_as_edited(tmp_path: Path) -> None:
+    """Dead letters left the dispatch-order check, which a signature covers, so a ledger signed
+    before the change failed verification as "edited after signing". It verifies, and says
+    which format it was signed in. Found by the twelfth review."""
+    from dataclasses import replace
+
+    from specunode.canonical import canonical
+    from specunode.journal.ledger import SIGN_DOMAIN, _b64, ledger_payload
+
+    journal, _, _ = await drive(tmp_path, TWO_WRITES)
+    ledger = build_ledger(journal, RUN)
+    key = load_or_create_key(tmp_path / "keys")
+    # Format 1, built here rather than by the code under test: the version, and a dispatch-order
+    # count taken over every row. No dead letter here, so the count is the same either way.
+    format_1 = {**ledger_payload(ledger), "v": 1}
+    old = key.private.sign(SIGN_DOMAIN + canonical(format_1))
+    envelope = f"ed25519:{key.key_id}:{_b64(key.public_bytes)}:{_b64(old)}"
+    signed = replace(ledger, signature=envelope)
+    verdict = verify_ledger(signed, journal=journal, trusted=[key.key_id])
+    assert verdict.ok, verdict
+    assert "format 1" in (verdict.detail or "")
+    current = verify_ledger(sign_ledger(ledger, key), journal=journal, trusted=[key.key_id])
+    assert current.ok and current.detail is None
+    edited = replace(signed, rows=signed.rows[:1])
+    assert verify_ledger(edited, journal=journal, trusted=[key.key_id]).category == "integrity"

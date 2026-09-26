@@ -215,3 +215,49 @@ def test_one_call_per_reply_is_enforced_by_the_api_not_only_asked_for() -> None:
     from dataclasses import replace
 
     assert request_hash(one) != request_hash(replace(one, tool_choice=None))
+
+
+async def test_a_reply_cut_off_without_a_call_is_not_the_model_finishing(tmp_path: Path) -> None:
+    """A last reply that ran out of tokens part-way through its answer asked for no tools, and
+    the loop reported it as ``end_turn`` -- "the model's own decision that it was finished".
+    Found by the twelfth review."""
+    from dataclasses import replace
+
+    from specunode.core.decision import Decision, FreeText
+    from specunode.core.graph import RunSession
+    from specunode.core.loop import agent_loop
+    from specunode.core.model import Message, RequestEnvelope
+    from specunode.integrations.plain import PlainAdapter, node, registry_of
+    from specunode.testing.models import free_text_turn
+
+    seen: dict[str, object] = {}
+
+    @node(name="answer")
+    async def answer(session: RunSession) -> Decision:
+        loop = await agent_loop(
+            session,
+            RequestEnvelope(
+                model="scripted",
+                messages=(Message(role="user", content=(TextBlock(text="summarise"),)),),
+                stream=True,
+            ),
+        )
+        seen["stopped"], seen["calls_per_turn"] = loop.stopped, loop.calls_per_turn
+        session.state["done"] = True
+        return FreeText.of("done")
+
+    cut_off = replace(free_text_turn("The incident began when"), stop_reason="max_tokens")
+    journal = Journal(tmp_path / "journal.db")
+    registry = registry_of([])
+    scheduler = Scheduler(
+        graph=PlainAdapter.of([answer], lambda s: None if s.get("done") else "answer"),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry),
+        target=JournaledModel(ScriptedModel(turns=[cut_off]), journal),
+        policy=Policy(speculation=False),
+    )
+    result = await scheduler.run(new_ulid(), {})
+    assert result.ok, result.error
+    assert seen == {"stopped": "max_tokens", "calls_per_turn": 0.0}

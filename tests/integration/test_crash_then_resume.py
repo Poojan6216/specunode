@@ -13,7 +13,7 @@ and nothing the committed run did not decide is reproduced.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -32,8 +32,13 @@ from specunode.core.graph import RunSession
 from specunode.core.model import (
     JournaledModel,
     Message,
+    ModelError,
+    ModelResponse,
     RequestEnvelope,
+    StreamEvent,
     TextBlock,
+    ToolUseComplete,
+    TurnComplete,
     decisions_of,
 )
 from specunode.core.policy import Policy
@@ -432,3 +437,107 @@ async def test_a_run_a_resume_finished_is_not_reported_as_still_resumable(tmp_pa
     assert after.finished
     assert after.confirmed_not_retired == ()
     assert not after.resumable
+
+
+# -- a turn that failed, and was asked again ---------------------------------------------------
+
+SMALL = RequestEnvelope(
+    model="scripted",
+    max_tokens=64,
+    stream=True,
+    messages=(Message(role="user", content=(TextBlock(text="Charge cus-1 for the plan"),)),),
+)
+ROOMY = replace(SMALL, max_tokens=4096)
+
+
+class FailsTheFirstQuestion:
+    """Fails the question asked with little room -- cut off mid-call, or overloaded -- and
+    answers the one asked with more with a charge of ``amount``."""
+
+    def __init__(self, amount: float, failure: str) -> None:
+        self.amount = amount
+        self.failure = failure
+        self.asked: list[int | None] = []
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        raise NotImplementedError
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        self.asked.append(envelope.max_tokens)
+        if envelope.max_tokens != 64:
+            reply = charge(self.amount)
+        elif self.failure == "overloaded":
+            raise ModelError("overloaded_error")
+        else:  # "amount": 25.0 cut off after the 2
+            reply = replace(charge(2.0), stop_reason="max_tokens")  # type: ignore[type-var]
+        yield ToolUseComplete(index=0, block=reply.content[0])  # type: ignore[attr-defined]
+        yield TurnComplete(response=reply)  # type: ignore[arg-type]
+
+
+def asks_again() -> tuple[PlainAdapter, ToolRegistry, list[float]]:
+    charged: list[float] = []
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        charged.append(amount)
+        return {"charge_id": f"ch_{len(charged)}"}
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        try:
+            await session.call_turn(SMALL)  # type: ignore[misc]
+        except ModelError:  # as the refusal says: give the model room, and ask again
+            await session.call_turn(ROOMY)  # type: ignore[misc]
+        session.state["billed"] = True
+        return ToolCall("charge_card", {})
+
+    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
+    return adapter, registry_of([charge_card]), charged
+
+
+@pytest.mark.parametrize("failure", ["cut_off", "overloaded"])
+async def test_a_turn_that_failed_and_was_asked_again_is_served_as_it_went(
+    tmp_path: Path, failure: str
+) -> None:
+    """The node's first question failed -- a reply cut off mid-call, or the model overloaded
+    -- so it asked again, with more room, and the charge went out; then the process died.
+    The failed question had no outcome on disk, so on resume it matched nothing, and every
+    question the node asked after it went to the live model: one that had changed its mind
+    charged a second time. The failure is recorded now, and served again. Found by the
+    twelfth review."""
+    db = tmp_path / "source.db"
+    adapter, registry, charged = asks_again()
+    run_id = new_ulid()
+    with pytest.raises(Crash):
+        await scheduler(
+            CrashingJournal(db, before_commit_of("bill#0")),
+            adapter,
+            registry,
+            FailsTheFirstQuestion(25.0, failure),
+        ).run(run_id, {})
+    await bury_the_dead_process()
+    assert charged == [25.0]
+
+    changed_its_mind = FailsTheFirstQuestion(30.0, failure)
+    resumed = await scheduler(Journal(db), adapter, registry, changed_its_mind).resume(run_id)
+    assert resumed.ok, resumed.error
+    assert changed_its_mind.asked == [], "the resume asked the model what the journal answers"
+    assert charged == [25.0], "a second, different charge went out"
+
+
+async def test_replay_reproduces_a_turn_that_failed(tmp_path: Path) -> None:
+    """Replay refused the faithful re-run of a node that asked again: its first question was
+    matched with the answer to the second."""
+    journal = Journal(tmp_path / "source.db")
+    adapter, registry, charged = asks_again()
+    result = await scheduler(
+        journal, adapter, registry, FailsTheFirstQuestion(25.0, "cut_off")
+    ).run(new_ulid(), {})
+    assert result.ok, result.error
+
+    adapter, registry, _again = asks_again()
+    replayed = await scheduler(
+        Journal(tmp_path / "replay.db"), adapter, registry, replay_of(journal, result.run_id)
+    ).run(new_ulid(), {})
+    assert replayed.ok, replayed.error
+    assert charged == [25.0] and _again == [25.0]

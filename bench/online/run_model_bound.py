@@ -203,7 +203,8 @@ def summarise(cell: Cell, rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     if cell.agent == "incident" and rows:
         replies = [row["replies"] for row in rows]
         calls = [row["calls"] for row in rows]
-        tool_replies = [row["replies"] - (1 if row["stopped"] == "end_turn" else 0) for row in rows]
+        # Every stop but the turn cap ends on a reply that asked for no tools.
+        tool_replies = [r["replies"] - (0 if r["stopped"] == "max_turns" else 1) for r in rows]
         cached = sum(r["cache_read_tokens"] for r in rows)
         total_in = sum(r["input_tokens"] + r["cache_write_tokens"] + r["cache_read_tokens"]
                        for r in rows)  # fmt: skip

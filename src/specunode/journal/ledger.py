@@ -112,7 +112,9 @@ SIGN_DOMAIN: Final = b"specunode/ledger/v1\x00"
 DEFAULT_KEYSTORE: Final = Path("./.specunode")
 
 _KEY_ENV: Final = "SPECUNODE_SIGNING_KEY"
-_PAYLOAD_VERSION: Final = 1
+#: 2 since dead letters left the dispatch-order check (``_order_anomalies``). A format-1
+#: signature is still recognised, and said to be one, rather than reported as an edit.
+_PAYLOAD_VERSION: Final = 2
 
 EffectStatus = Literal["DISPATCHED", "DEAD_LETTER", "COMPENSATED"]
 
@@ -756,11 +758,14 @@ def _order_anomalies(rows: Sequence[LedgerRow]) -> int:
     later, and the stage index that stood in for it collided with a sent effect's, so a correct
     run whose last effect failed was reported out of order.
     """
+    return _anomalies_among([row for row in rows if row.status in ("DISPATCHED", "COMPENSATED")])
+
+
+def _anomalies_among(rows: Sequence[LedgerRow]) -> int:
     anomalies = 0
     by_branch: dict[str, list[LedgerRow]] = {}
     for row in rows:
-        if row.status in ("DISPATCHED", "COMPENSATED"):
-            by_branch.setdefault(row.branch_id, []).append(row)
+        by_branch.setdefault(row.branch_id, []).append(row)
     for branch_rows in by_branch.values():
         program = sorted(branch_rows, key=lambda row: (row.step_index, row.stage_index))
         sent = sorted(branch_rows, key=lambda row: row.dispatch_index)
@@ -956,6 +961,14 @@ def ledger_payload(ledger: Ledger) -> Mapping[str, JsonValue]:
 def signed_bytes(ledger: Ledger) -> bytes:
     """Exactly what Ed25519 signs and verifies."""
     return SIGN_DOMAIN + canonical(ledger_payload(ledger))
+
+
+def _signed_bytes_v1(ledger: Ledger) -> bytes:
+    """What a format-1 signature covered: the dispatch-order check counted dead letters too."""
+    payload = dict(ledger_payload(ledger))
+    payload["v"] = 1
+    payload["dispatch_order_anomalies"] = _anomalies_among(ledger.rows)
+    return SIGN_DOMAIN + canonical(payload)
 
 
 # -- keys -----------------------------------------------------------------------------------
@@ -1182,14 +1195,25 @@ def verify_ledger(
             f"envelope key id {key_id} does not name its embedded public key",
         )
 
+    unsigned = replace(ledger, signature="")
+    note: str | None = None
     try:
-        public.verify(signature, signed_bytes(replace(ledger, signature="")))
+        public.verify(signature, signed_bytes(unsigned))
     except InvalidSignature:
-        return _fail(
-            "INTEGRITY",
-            "integrity",
-            "the rows are not the bytes this signature covers; they were edited after signing",
-            key_id=key_id,
+        try:
+            # Signed before the format changed, the rows can still be the ones signed: said
+            # so, rather than reported as edited.
+            public.verify(signature, _signed_bytes_v1(unsigned))
+        except InvalidSignature:
+            return _fail(
+                "INTEGRITY",
+                "integrity",
+                "the rows are not the bytes this signature covers; they were edited after signing",
+                key_id=key_id,
+            )
+        note = (
+            "signed in ledger format 1, which also counted dead letters in the dispatch-order "
+            "check; the rows are the ones that were signed"
         )
 
     known = frozenset(trusted) if trusted is not None else trusted_key_ids(store)
@@ -1210,7 +1234,9 @@ def verify_ledger(
             exit_code=0,
             key_id=key_id,
             journal="not_checked",
-            detail="no journal supplied; the run binding was not checked",
+            detail="; ".join(
+                filter(None, ["no journal supplied; the run binding was not checked", note])
+            ),
         )
 
     chain = journal.verify_chain(ledger.run_id)
@@ -1225,7 +1251,7 @@ def verify_ledger(
             exit_code=0,
             key_id=key_id,
             journal="absent",
-            detail=f"no entries for run {ledger.run_id} in this store",
+            detail="; ".join(filter(None, [f"no entries for run {ledger.run_id} here", note])),
         )
     if not chain.ok:
         return _fail(
@@ -1252,6 +1278,7 @@ def verify_ledger(
         exit_code=0,
         key_id=key_id,
         journal="verified",
+        detail=note,
     )
 
 

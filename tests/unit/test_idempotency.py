@@ -385,3 +385,33 @@ async def test_one_effect_keyed_two_ways_is_refused(tmp_path: Path) -> None:
     await journal.claim_dispatch(pending(nkey="a", effect_id="ef-shared"))
     with pytest.raises(JournalWriteError, match="one effect is one idempotency key"):
         await journal.claim_dispatch(pending(nkey="b", effect_id="ef-shared"))
+
+
+async def test_a_settle_that_finds_its_offset_taken_is_a_concurrency_error(tmp_path: Path) -> None:
+    """Two processes driving one run collide on the chain's next offset. The settle raised the
+    database's own integrity error, which said nothing of that; an append already raised
+    ``JournalConcurrencyError``. Found by the twelfth review."""
+    import sqlite3
+
+    from specunode.journal.journal import JournalConcurrencyError
+
+    path = tmp_path / "j.db"
+    journal = Journal(path)
+    journal.append("01RUN", "policy_event", {"v": 1, "event": "e", "reason": "r", "step": 0})
+    await journal.claim_dispatch(pending())
+    # Another writer takes the next offset, behind this process's back.
+    with sqlite3.connect(path) as other:
+        other.execute(
+            'INSERT INTO entries (run_id, "offset", kind, payload_json, payload_hash, prev_hash, '
+            "ts) VALUES ('01RUN', 1, 'policy_event', '{}', 'h', 'p', 't')"
+        )
+    with pytest.raises(JournalConcurrencyError, match="another writer"):
+        await journal.settle_dispatch(
+            run_id="01RUN",
+            nkey="nk-1",
+            status="dispatched",
+            ack={},
+            attempt=1,
+            kind="effect_dispatched",
+            payload=dispatched_payload(),
+        )

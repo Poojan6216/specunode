@@ -21,7 +21,14 @@ from pathlib import Path
 import typer
 
 from specunode import __version__
-from specunode.config import DEFAULT_CONFIG_NAME, Config, ConfigError, load_config
+from specunode.config import (
+    DEFAULT_CONFIG_NAME,
+    DEFAULT_JOURNAL_PATH,
+    Config,
+    ConfigError,
+    find_config,
+    load_config,
+)
 from specunode.journal.journal import Journal, JournalError, is_postgres_dsn
 from specunode.journal.ledger import (
     build_ledger,
@@ -44,6 +51,7 @@ JOURNAL_HELP = (
     "Journal: a SQLite file or a postgresql:// DSN. Defaults to the config's journal, and "
     "without one to ./.specunode/journal.db."
 )
+CONFIG_HELP = f"The config whose journal to read. Defaults to ./{DEFAULT_CONFIG_NAME}."
 
 
 def _load_or_exit(config: Path | None) -> Config:
@@ -63,8 +71,16 @@ def _load_or_exit(config: Path | None) -> Config:
         raise typer.Exit(2) from exc
 
 
-def _journal_location(journal: str | None, loaded: Config | None = None) -> str:
-    """Where a command's journal is: ``--journal``, else the config's ``journal`` section.
+def _journal_location(
+    journal: str | None, config: Path | None = None, loaded: Config | None = None
+) -> str:
+    """Where a command's journal is: ``--journal``, else the ``journal`` section of the config.
+
+    The config is ``--config``, or the one the usual search finds -- the same one ``resume`` and
+    ``replay`` build the run from, so every command reads one journal. A relative ``path`` is
+    taken from the config file's folder, and ``~`` is expanded: left as written, a path in a
+    config read from elsewhere named a journal nobody had written, relative to wherever the
+    command was run.
 
     A string, never a ``Path``: a Postgres DSN is a location too, and ``Path`` folds its ``//``
     into ``/``, which turned ``postgresql://host/db`` into a SQLite file named ``postgresql:``.
@@ -73,10 +89,24 @@ def _journal_location(journal: str | None, loaded: Config | None = None) -> str:
     """
     if journal:
         return journal
-    settings = (loaded if loaded is not None else _load_or_exit(None)).journal
+    source = config if config is not None else find_config()
+    if source is None:
+        return str(DEFAULT_JOURNAL_PATH)
+    if loaded is None:
+        if not source.is_file():
+            typer.echo(f"no config at {source}", err=True)
+            raise typer.Exit(2)
+        try:
+            loaded = load_config(source)
+        except ConfigError as exc:
+            hint = "(the journal is named there; --journal names it directly)"
+            typer.echo(f"{exc}\n{hint}", err=True)
+            raise typer.Exit(2) from exc
+    settings = loaded.journal
     if settings.kind == "postgres":
         return settings.dsn or os.environ.get("SPECUNODE_JOURNAL_DSN", "")
-    return str(settings.path)
+    path = settings.path.expanduser()
+    return str(path if path.is_absolute() else source.parent / path)
 
 
 def _version_callback(value: bool) -> None:
@@ -126,9 +156,10 @@ def init(
 @app.command()
 def runs(
     journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
+    config: Path = typer.Option(None, "--config", help=CONFIG_HELP),
 ) -> None:
     """List the runs this journal holds."""
-    for run_id in Journal(_journal_location(journal)).runs():
+    for run_id in Journal(_journal_location(journal, config)).runs():
         typer.echo(run_id)
 
 
@@ -136,6 +167,7 @@ def runs(
 def ledger(
     run_id: str = typer.Argument(..., help="The run to render."),
     journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
+    config: Path = typer.Option(None, "--config", help=CONFIG_HELP),
     short: bool = typer.Option(False, "--short", help="Abbreviate ids."),
     normalised: bool = typer.Option(
         False, "--normalised", help="Render only what the equivalence relation compares."
@@ -143,7 +175,7 @@ def ledger(
     as_json: bool = typer.Option(False, "--json", help="Emit the rows as JSON."),
 ) -> None:
     """Print a run's effect ledger: what reached the world, and what authorised it."""
-    built = build_ledger(Journal(_journal_location(journal)), run_id)
+    built = build_ledger(Journal(_journal_location(journal, config)), run_id)
     if as_json:
         typer.echo(
             json.dumps(
@@ -190,7 +222,7 @@ def resume(
     from specunode.buffer.dispatcher import Dispatcher
     from specunode.buffer.store_buffer import StoreBuffer
     from specunode.core.model import JournaledModel
-    from specunode.core.scheduler import Scheduler
+    from specunode.core.scheduler import Scheduler, SchedulerError
 
     loaded = _load_or_exit(config)
     try:
@@ -200,7 +232,7 @@ def resume(
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc
 
-    book = Journal(_journal_location(journal, loaded))
+    book = Journal(_journal_location(journal, config, loaded))
     scheduler = Scheduler(
         graph=adapter,
         registry=registry,
@@ -213,12 +245,18 @@ def resume(
     )
     try:
         result = asyncio.run(scheduler.resume(run_id))
-    except JournalError as exc:  # RunBusy: another process is driving this run
+    except (JournalError, SchedulerError) as exc:
+        # RunBusy: another process is driving this run. A SchedulerError before anything ran:
+        # an unknown run id, or one that never started -- a message, not a traceback, and not
+        # exit 1, which says the run did not complete.
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc
     typer.echo(render_ledger(result.ledger))
     if not result.ok:
         typer.echo(f"run did not complete: {result.error}", err=True)
+        if "specunode resolve" in (result.error or "") and journal is None:
+            # The halt names the command to run next; it must reach the same journal.
+            typer.echo(f"(this run's journal: --journal {book.location})", err=True)
         raise typer.Exit(1)
 
 
@@ -238,6 +276,7 @@ def resolve(
         None, "--ack", help="With --landed: the upstream's result, as JSON, handed to the node."
     ),
     journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
+    config: Path = typer.Option(None, "--config", help=CONFIG_HELP),
 ) -> None:
     """Record what happened to an effect the runtime could not settle on its own.
 
@@ -251,7 +290,7 @@ def resolve(
         raise typer.Exit(2)
     # The ledger shortens keys with an ellipsis; a key pasted from it keeps one.
     key = key.rstrip("…").rstrip(".")
-    book = Journal(_journal_location(journal))
+    book = Journal(_journal_location(journal, config))
     # Either key names the effect: the ledger prints the idempotency key the tool was handed,
     # and the dedupe key is what the claim is filed under. Both lead to the dedupe key.
     names: dict[str, str] = {}
@@ -317,7 +356,7 @@ def replay(
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc
 
-    location = _journal_location(journal, loaded)
+    location = _journal_location(journal, config, loaded)
     source = Journal(location)
     recovery = recover(source, run_id)
     # A replay re-drives the run from its *beginning*, so it starts from the inputs the
@@ -387,6 +426,7 @@ def signature_path(journal: Path | str, run_id: str, explicit: Path | None = Non
 def verify_ledger_command(
     run_id: str = typer.Argument(..., help="The run to verify."),
     journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
+    config: Path = typer.Option(None, "--config", help=CONFIG_HELP),
     keystore: Path = typer.Option(Path("./.specunode/keys"), "--keystore"),
     signature: Path = typer.Option(
         None, "--signature", help="Signature file. Defaults to <journal dir>/ledgers/<run>.sig."
@@ -399,7 +439,7 @@ def verify_ledger_command(
     """
     from dataclasses import replace as _replace
 
-    location = _journal_location(journal)
+    location = _journal_location(journal, config)
     store = Journal(location)
     built = build_ledger(store, run_id)
     envelope_path = signature_path(location, run_id, signature)
@@ -417,6 +457,7 @@ def verify_ledger_command(
 def sign_ledger_command(
     run_id: str = typer.Argument(..., help="The run to sign."),
     journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
+    config: Path = typer.Option(None, "--config", help=CONFIG_HELP),
     keystore: Path = typer.Option(Path("./.specunode/keys"), "--keystore"),
     out: Path = typer.Option(
         None, "--out", help="Where to write it. Defaults to <journal dir>/ledgers/<run>.sig."
@@ -428,7 +469,7 @@ def sign_ledger_command(
     nowhere, so ``verify-ledger`` rebuilt an unsigned ledger and reported ``unsigned`` on every
     run that had been signed.
     """
-    location = _journal_location(journal)
+    location = _journal_location(journal, config)
     store = Journal(location)
     key = load_or_create_key(keystore)
     signed = sign_ledger(build_ledger(store, run_id), key)
@@ -444,9 +485,10 @@ def sign_ledger_command(
 def verify(
     run_id: str = typer.Argument(..., help="The run whose chain to walk."),
     journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
+    config: Path = typer.Option(None, "--config", help=CONFIG_HELP),
 ) -> None:
     """Walk a run's hash chain and report the first break, if any."""
-    result = Journal(_journal_location(journal)).verify_chain(run_id)
+    result = Journal(_journal_location(journal, config)).verify_chain(run_id)
     if result.ok:
         typer.echo(f"ok: {result.entries} entries, chain verified")
         return
@@ -458,9 +500,10 @@ def verify(
 def status(
     run_id: str = typer.Argument(..., help="The run to inspect."),
     journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
+    config: Path = typer.Option(None, "--config", help=CONFIG_HELP),
 ) -> None:
     """Say what a run left behind, and what a resume would build on."""
-    recovery = recover(Journal(_journal_location(journal)), run_id)
+    recovery = recover(Journal(_journal_location(journal, config)), run_id)
     typer.echo(f"run {run_id}")
     typer.echo(f"  finished: {recovery.finished}")
     typer.echo(f"  entries through offset: {recovery.last_offset}")

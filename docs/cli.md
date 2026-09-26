@@ -4,10 +4,12 @@
 finish. No subcommand decides anything: the journal decides, and these read it.
 
 Every command that reads a run takes `--journal`: a SQLite file, or a `postgresql://` DSN.
-Without it, the journal is the one the config's `journal` section names -- its `path`, or for
-`kind: postgres` its `dsn` (or `SPECUNODE_JOURNAL_DSN`) -- and without a config,
-`./.specunode/journal.db`. `--version` (or `-V`) prints the version; `specunode` alone prints
-this list.
+Without it, the journal is the one the config's `journal` section names -- its `path`, relative
+to the config file's folder and with `~` expanded, or for `kind: postgres` its `dsn` (or
+`SPECUNODE_JOURNAL_DSN`) -- and without a config, `./.specunode/journal.db`. Every such command
+also takes `--config`, so each can read the journal a `resume --config` used; a config that does
+not load is an error, exit 2, and `--journal` names the journal directly. `--version` (or `-V`)
+prints the version; `specunode` alone prints this list.
 
 Commands that need a config (`resume`, `replay`, `mcp-proxy`) take `--config PATH`. Without the
 option the search is `./specunode.yaml`, then `$XDG_CONFIG_HOME/specunode/config.yaml` (or
@@ -71,10 +73,14 @@ that may or may not have taken effect is asked about through its tool's `reconci
 redelivered if its tool declared a repeat harmless, or dead-lettered until someone records what
 happened with `specunode resolve`. A node that runs again is served any model answer that may
 already have sent something, rather than asked for it again. This needs a live target, because
-an answer the journal does not hold, or one that sent nothing, is asked for. A run is driven by
-one process at a time: resuming one that another process is running exits 2. Prints the ledger;
-exits 1 if the run did not complete and 2 if the config is missing, unreadable, or cannot build
-the graph or the target. Options: `--journal`; `--config PATH`.
+an answer the journal does not hold, or one that sent nothing, is asked for. A model turn that
+failed -- cut off, refused, overloaded -- is recorded as the failure it was and served again as
+that failure, so a node that caught it and asked again is matched with its second question. A run
+is driven by one process at a time: resuming one that another process is running exits 2, as
+does an unknown run, one that never recorded its start, and a LangGraph run, which cannot be
+resumed in this version. Prints the ledger; exits 1 if the run did not complete and 2 if the
+config is missing, unreadable, or cannot build the graph or the target. Options: `--journal`;
+`--config PATH`.
 
 ### `specunode resolve RUN_ID KEY`
 

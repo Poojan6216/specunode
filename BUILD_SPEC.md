@@ -1052,6 +1052,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [2.5] DEFECTS (fixed), found by the ninth review: (1, critical) a claim taken up for a retry after it never left stayed marked not_sent, so a crash during the retry made the next resume send it again -- `_claim` now re-arms it to in_flight/unknown in one compare-and-set; (2) a failed call_turn restored the open-turn count from a snapshot -- the turn now closes itself (`partial_turns_discarded`); (3) it also discarded other tasks' writes, and a concurrent drain could send a confirmed guess mid-stream -- adoption now waits for the journaled turn, and a failed turn discards only its confirmed guesses; (4) resolve matched only the dedupe key; (5) two dead letters for one key showed as two rows; (6) resolve read and settled separately, and a settle could overwrite a claim settled as sent -- `_settle` now refuses it; (7) any `sent` but "no" counts as maybe. tests/integration/test_turns_at_once.py is new; each fix fails under its own planted bug. — 2026-09-25
 [2.5] DEFECTS (fixed), found by the tenth review: two resumes of one run at once sent a charge twice -- `Journal.hold_run` (in-process registry; flock, or a Postgres advisory lock, released when the holder dies) now holds a run for the length of `run`/`resume`/`resolve`, and a second driver gets RunBusy; a read after a write in the same reply was issued early and saw the pre-write value -- it now waits (`_reads_a_pending_write`); a stream without TurnComplete is a failed turn; call_turn closes its stream deterministically; adoption sits inside the failure cleanup; the ledger checks dispatch against program order; resolve accepts the printed key. tests/integration/test_one_driver_per_run.py is new; each fix fails under its own planted bug. — 2026-09-25
 [2.5] DEFECTS (fixed), found by the eleventh review: (1, critical) the Anthropic adapter built a finished turn from a stream that dropped mid-reply, and nothing read `stop_reason`, so a tool call cut off mid-argument -- "amount": 150.0 cut after the 1 -- was sent as a charge of 1; a reply that did not finish, or stopped at `max_tokens` or by a refusal with a call in it, is now refused before it is journaled; (2) a guess confirmed at the end of a reply joined the branch when the turn ended, so the drain that sent the reply's first write sent it too, ahead of a read the model had asked for between them -- each guess now joins at its place in the reply; (3) the LangGraph wrapper shared one Scheduler across every call, and two requests at once ran as one -- each call gets its own, a Scheduler drives one run, a buffer serves one run at a time, and `run` refuses a run id the journal already holds; (4) the SQLite run lock was keyed by the path as given and named after the run id -- it is keyed by the real path and named by a hash, and an OSError is a JournalError; (5) the Postgres run lock used a 32-bit key on the shared writer connection -- 64 bits, on its own connection, checked before every send; (6) a dead letter took its stage index as its place in the send order -- it records where it was tried, and the order check counts sent effects only; (7) an adoption moved the guess's write before journaling the move -- a failed append left it to be sent; the record now comes first; (8) `--journal` was a Path, which mangled a Postgres DSN -- as did `specunode.Runtime`; and the config's `journal` section, read by nothing, is now the CLI's default. Each fix fails under its own planted bug. — 2026-09-25
+[2.5] DEFECTS (fixed), found by the twelfth review: (1, critical) a turn that failed -- a reply cut off and refused, an overloaded model -- left no outcome on disk, so a node that caught the failure and asked again, then crashed after its charge went out, was not served on resume: every question after the failed one went to the live model, which could charge a second time, and replay refused the same run; a failed turn is recorded as the failure it was and served and replayed as that failure, and the Anthropic adapter raises its SDK's API errors as ModelError; (2, critical) the Postgres run lock was checked once, before the claim, and a process that lost it during a retry's backoff sent the retry while another sent the same charge -- it is checked before every attempt, and a settle that finds its offset taken is a JournalConcurrencyError; (3, critical) a crash after a policy_event and before run_started left a run `run` refused and `resume` drove from empty state, charging the wrong customer -- run_started is first, and a run that never recorded its start is started, not resumed; (4) the eleventh review's per-slot adoption moved a guess's reads with its writes, after the stale-read check -- reads move when the turn ends; (5) the documented recovery of a crashed LangGraph run did not exist -- documented as unsupported, `resume` says so, and LangGraph's own config is passed through; (6) agent_loop reported a reply cut off without a call as end_turn; (7) ledgers signed before the dispatch-order change were reported as edited -- format 1 is recognised; (8) the CLI read a config's journal path from the wrong folder and without `~` -- fixed, and every command takes --config; (9) wrap(run_id=) made a wrapped graph single-use -- removed; (10) resuming an unknown run printed a traceback. And three it suspected but could not reproduce, all real: a confirmed guess discarded with its turn made a failed run look resumable; a run cancelled from outside journaled its nodes' cleanup after letting go of the run; the Postgres run lock was taken on the event loop. Each fix fails under its own planted bug. — 2026-09-25
 [3.3] Four tests settled a guess inside a 15–25 ms block delay, which a journal append on a slow CI disk could miss. Found all at once by running the suite with every append 40 ms slower (`tests/slow_journal.py`); each now holds the settling block until the event it needs has happened, and passes at 40, 100 and 250 ms of added latency. The `slow-disk` CI job runs the tests that guess that way on every push. — 2026-09-25
 ```
 
@@ -1062,17 +1063,17 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**961 tests pass, 24 skip — 15 of the passes against a real Postgres 16 server.** `ruff check`,
+**985 tests pass, 24 skip — 17 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Eleven independent adversarial reviews have found 130 defects here, 17 of them critical.** The
-counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8.** All are fixed but one, kept on purpose
+**Twelve independent adversarial reviews have found 140 defects here, 20 of them critical.** The
+counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8, 10.** All are fixed but one, kept on purpose
 and documented: a node's writes are refused while any model turn it started is unjournaled, even
 one that did not decide the write. That number is the most useful thing in this report, so it
 is at the top rather than buried: the version of this document written a day earlier described
-a finished project. The eleventh to sixth reviews (2026-09-25) and the fifth (2026-09-23) are
+a finished project. The twelfth to sixth reviews (2026-09-25) and the fifth (2026-09-23) are
 summarised below; the fourth is in commit `c8802ec`.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
@@ -1192,6 +1193,41 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (4 guesses forked, 4 squashed, 4 charges staged and discarded, the
 alpha gate closed once, 0 wasted tokens — a pattern-index guess costs no model tokens — and 0
 leaks) and 7.8 replay under model drift (both cases diverge at step 0).
+
+### What the twelfth review found
+
+Ten findings, three critical -- two of them in the eleventh review's repairs, again.
+
+- **Critical: asking again after a failed turn broke the resume.** The eleventh review's fix
+  refused a cut-off reply before it was journaled, and its message said to ask again. A node
+  that did, and crashed after the charge the second answer asked for, left a question with no
+  outcome on disk; on resume that question matched nothing, and every question after it went
+  to the live model, which could decide differently and charge again. The same was true of any
+  failed turn a node retried -- an overloaded model -- and replay refused the run. A failed
+  turn is now recorded as the failure it was, and served and replayed as that failure.
+- **Critical: a process that had lost its Postgres run lock sent a retry.** The lock was
+  checked once, before the claim; a process that lost it during a retry's backoff sent the
+  retry while the process that had taken the run up sent the same charge. It is checked before
+  every attempt now.
+- **Critical: a crash in the run's first moment lost its inputs.** With the default policy a
+  `policy_event` was written before `run_started`; a crash between them left a run that `run`
+  refused and `resume` drove from empty state, and the support agent charged the wrong
+  customer. The start is the first entry now, and a run that never recorded it is started, not
+  resumed.
+- A guess confirmed after a write in its reply moved its reads with its writes -- after the
+  stale-read check had run -- so a stale guessed read let a charge out that the same run
+  without guessing refused. Its reads move when the turn ends.
+- The docs described recovering a crashed LangGraph run from its checkpointer, and no such path
+  worked. It is documented as unsupported in this version, `resume` says so, and `wrap()`
+  passes LangGraph's own config through. `agent_loop` reported a reply cut off with no call in it
+  as the model finishing; ledgers signed before the dispatch-order change verified as edited;
+  the CLI read a config's journal path relative to the shell, not the config; `wrap(run_id=)`
+  made a wrapped graph single-use; and resuming an unknown run printed a traceback. All fixed.
+
+It also listed four things it suspected and could not reproduce. Three were real: a guess
+confirmed in a turn that then failed stayed "confirmed", and a failed run that sent nothing was
+reported resumable; a run cancelled from outside journaled its nodes' cleanup after it had let go
+of the run; and the Postgres run lock was taken on the event loop. All fixed and tested.
 
 ### What the eleventh review found
 

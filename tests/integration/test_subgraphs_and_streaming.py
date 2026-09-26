@@ -101,7 +101,6 @@ def wrapped(tmp_path: Path, db: str = "nested.db") -> tuple[Any, World, Journal,
             provider="scripted",
         ),
         dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
-        run_id=run_id,
     )
     return graph, world, journal, run_id
 
@@ -131,7 +130,7 @@ def test_a_nested_node_carries_its_parents_path(tmp_path: Path) -> None:
 
 async def test_each_inner_node_retires_its_own_branch(tmp_path: Path) -> None:
     graph, world, journal, run_id = wrapped(tmp_path)
-    result = await graph.run({})
+    result = await graph.run({}, run_id=run_id)
     assert result.ok, result.error
 
     forks = list(journal.read(run_id, kinds=["branch_forked"]))
@@ -143,7 +142,7 @@ async def test_each_inner_node_retires_its_own_branch(tmp_path: Path) -> None:
 async def test_the_leak_invariant_holds_inside_a_subgraph(tmp_path: Path) -> None:
     """The reason the container is not wrapped: attribution has to reach the inner effects."""
     graph, world, journal, run_id = wrapped(tmp_path, db="leak.db")
-    await graph.run({})
+    await graph.run({}, run_id=run_id)
 
     retired = {
         str(entry.payload["branch_id"])

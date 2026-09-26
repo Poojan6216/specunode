@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
@@ -78,6 +78,20 @@ __all__ = ["BranchOutcome", "RunResult", "Scheduler", "SchedulerError", "Specula
 
 class SchedulerError(RuntimeError):
     """The run cannot continue."""
+
+
+#: How long a run ended from outside waits for its node bodies' own cleanup to be journaled.
+_STOP_GRACE_S = 5.0
+
+
+#: Why a graph that drives itself -- LangGraph -- has no resume in this version. Rebuilding its
+#: state is its checkpointer's job, and a resumed run would have to reproduce the crashed one's
+#: program positions exactly for the dedupe table to know what went out; nothing does that yet.
+_NOT_RESUMABLE = (
+    "A graph that drives itself (LangGraph) cannot be resumed in this version, and running it "
+    "again -- under a new id, from its checkpointer -- may send the writes of a node the crash "
+    "interrupted a second time. See docs/limitations.md."
+)
 
 
 class BranchOutcome(Enum):
@@ -492,11 +506,15 @@ class Scheduler:
         Held for its whole length (``Journal.hold_run``): a run is driven by one process, and
         one task in it, at a time.
         """
-        with self._driving(run_id):
+        async with self._driving(run_id):
             return await self._run(run_id, inputs)
 
-    @contextlib.contextmanager
-    def _driving(self, run_id: str) -> Iterator[None]:
+    def _has_started(self, run_id: str) -> bool:
+        """Whether the journal records ``run_id``'s start. Nothing is sent before it does."""
+        return next(iter(self.journal.read(run_id, kinds=["run_started"])), None) is not None
+
+    @contextlib.asynccontextmanager
+    async def _driving(self, run_id: str) -> AsyncIterator[None]:
         """Drive ``run_id`` with this Scheduler, its buffer and the run held -- or raise.
 
         A Scheduler keeps the run it drives on itself: its id, its counters, the turns and the
@@ -504,8 +522,9 @@ class Scheduler:
         built one per wrapped graph, and two requests at once -- how a web handler calls it --
         shared it: the second run took over the first's, both runs' charges were journaled
         under the second, and the first never finished. So a Scheduler drives one run, and a
-        buffer serves one run at a time. No ``await`` between the checks and the claims, so two
-        tasks cannot both pass them.
+        buffer serves one run at a time. Both are claimed before the first ``await``, so two
+        tasks cannot both pass the checks; a Scheduler that then could not hold the run drove
+        nothing, and may try again.
         """
         if self._driven is not None:
             raise SchedulerError(
@@ -518,22 +537,31 @@ class Scheduler:
                 f"this Scheduler's StoreBuffer is in use by run {self.buffer.driving!r}. A buffer "
                 "holds one run's staged effects: give each Scheduler its own."
             )
-        with self.journal.hold_run(run_id):
-            self._driven = run_id
-            self.buffer.driving = run_id
-            try:
+        self._driven = run_id
+        self.buffer.driving = run_id
+        held = False
+        try:
+            async with self.journal.hold_run_async(run_id):
+                held = True
                 yield
-            finally:
-                self.buffer.driving = None
+        finally:
+            self.buffer.driving = None
+            if not held:
+                self._driven = None
 
     async def _run(self, run_id: str, inputs: JsonValue) -> RunResult:
-        if self.journal.last_offset(run_id) is not None:
+        if await asyncio.to_thread(self._has_started, run_id):
             # A run started again from its beginning asks the model everything afresh, and any
             # call that comes out different goes out under a key nothing has seen -- a second
             # charge, with nothing to connect it to the first. ``resume`` is the way back in.
             raise SchedulerError(
-                f"run {run_id!r} already has entries in this journal. To continue it, resume "
-                "it: a resume knows what already went out, and starting it again does not."
+                f"run {run_id!r} has already started in this journal. "
+                + (
+                    _NOT_RESUMABLE
+                    if self.graph.capabilities().drives_itself
+                    else "To continue it, resume it: a resume knows what already went out, "
+                    "and starting it again does not."
+                )
             )
         self.run_id = run_id
         # One source of truth for the run id. Letting the buffer carry its own lets the two
@@ -620,7 +648,7 @@ class Scheduler:
         except Exception as exc:  # a run fault, journaled rather than swallowed
             ok, error = False, f"{type(exc).__name__}: {exc}"
         except BaseException:
-            self._stop_node_tasks()
+            await self._stop_node_tasks()
             raise
 
         await self._close_gate_if_spent(steps)
@@ -640,7 +668,7 @@ class Scheduler:
         Held for its whole length, like :meth:`run`: two resumes of one run at once each took up
         the same claim, and between them sent a charge twice.
         """
-        with self._driving(run_id):
+        async with self._driving(run_id):
             return await self._resume(run_id)
 
     async def _resume(self, run_id: str) -> RunResult:
@@ -666,7 +694,9 @@ class Scheduler:
         so the node decides again what it decided the first time -- which is what lets the
         dedupe table recognise any effect of that decision that already went out.
         """
-        recovery = recover(self.journal, run_id)
+        if self.graph.capabilities().drives_itself:
+            raise SchedulerError(f"run {run_id!r} cannot be resumed. {_NOT_RESUMABLE}")
+        recovery = await asyncio.to_thread(recover, self.journal, run_id)
         if not recovery.exists:
             # A run id the journal has never seen. Driving the graph from empty state here
             # dispatches every write the workload contains, under brand-new idempotency keys
@@ -676,6 +706,13 @@ class Scheduler:
                 f"run {run_id!r} has no entries in this journal, so there is nothing to "
                 "resume. Check the run id with `specunode runs`; resuming an unknown run "
                 "would start a fresh one and dispatch its writes."
+            )
+        if not recovery.started:
+            # Its process died before recording the start -- and with it the inputs a resume
+            # rebuilds state from. Nothing is sent before that entry, so nothing was.
+            raise SchedulerError(
+                f"run {run_id!r} never recorded its start, so it sent nothing and there is "
+                "nothing to resume; start it again with `run`, under the same id."
             )
         self.run_id = run_id
         self.buffer.run_id = run_id
@@ -747,7 +784,7 @@ class Scheduler:
         except Exception as exc:
             ok, error = False, f"{type(exc).__name__}: {exc}"
         except BaseException:
-            self._stop_node_tasks()
+            await self._stop_node_tasks()
             raise
 
         await self._close_gate_if_spent(self._steps)
@@ -1213,20 +1250,28 @@ class Scheduler:
     def _forget_node_task(self, task: asyncio.Task[Decision]) -> None:
         self._node_tasks.pop(task, None)
 
-    def _stop_node_tasks(self) -> None:
+    async def _stop_node_tasks(self) -> None:
         """End every node body a run left running when it ended by an uncaught exception.
 
         Its caller cancelled it -- a timeout, a shutdown -- and its node bodies went on without
         it: reading upstream and staging writes for a run that was over. Each body's branch is
         closed first, so a ``finally`` that writes is refused rather than parked on an ack no
-        drain will ever complete, and then it is cancelled. Nothing is journaled: a run ended
-        this way is resumed, as a crashed one is, and what is durable is what it had written.
+        drain will ever complete, and then it is cancelled. Nothing is journaled here: a run
+        ended this way is resumed, as a crashed one is, and what is durable is what it wrote.
+
+        And waited for, briefly. A body's own cleanup journals -- a guess squashed, a write
+        discarded -- and left to finish after the run returned, it wrote after the run's lock
+        was released, into a journal a resume may already have been driving.
         """
+        stopping: list[asyncio.Task[Decision]] = []
         for task, branch in list(self._node_tasks.items()):
             if task.done():
                 continue
             self.buffer.close(branch)
             task.cancel()
+            stopping.append(task)
+        if stopping:
+            await asyncio.wait(stopping, timeout=_STOP_GRACE_S)
 
     async def _quiesce(self, branch: Branch, task: asyncio.Task[Decision]) -> BranchOutcome:
         """Wait until the branch's task finishes, or parks on a value only the drain supplies.
@@ -1689,21 +1734,10 @@ class Scheduler:
 
     async def _journal_run_started(self, inputs: JsonValue) -> None:
         capabilities = self.graph.capabilities()
-        if self.policy.speculation and self.policy.alpha_floor is None:
-            # The ledger already knows how to render this event; nothing ever emitted it.
-            await self.journal.append_async(
-                self.run_id,
-                "policy_event",
-                {
-                    "v": 1,
-                    "event": "alpha_floor_unmeasured",
-                    "reason": (
-                        "no break-even alpha has been measured for this workload, so the "
-                        "alpha gate is inactive; the other budgets still apply"
-                    ),
-                    "step": 0,
-                },
-            )
+        # First, before any other entry. It holds the run's inputs, and a resume rebuilds state
+        # from them. Written second, a crash between the two left a run with an entry and no
+        # inputs: ``run`` refused it as started, and ``resume`` drove it from empty state -- a
+        # node that defaulted the missing input charged the wrong customer.
         await self.journal.append_async(
             self.run_id,
             "run_started",
@@ -1721,6 +1755,21 @@ class Scheduler:
                 "inputs": inputs,
             },
         )
+        if self.policy.speculation and self.policy.alpha_floor is None:
+            # The ledger already knows how to render this event; nothing ever emitted it.
+            await self.journal.append_async(
+                self.run_id,
+                "policy_event",
+                {
+                    "v": 1,
+                    "event": "alpha_floor_unmeasured",
+                    "reason": (
+                        "no break-even alpha has been measured for this workload, so the "
+                        "alpha gate is inactive; the other budgets still apply"
+                    ),
+                    "step": 0,
+                },
+            )
 
     async def _close_gate_if_spent(self, step: int) -> None:
         """Journal a closure that nothing will get round to announcing.
@@ -1866,6 +1915,10 @@ class SpeculativeTurn:
 
         # Any speculation still open when the turn ended predicted a call the model never made.
         await self._squash_open("turn_ended")
+        # The reads of every guess the turn confirmed join the branch now, before any write is
+        # sent: the check that they are still fresh runs when the node parks on one.
+        for child in self._confirmed.values():
+            scheduler.buffer.adopt_reads(child, branch)
         try:
             results = await self._settle_turn(tools, slots)
         except BaseException:
@@ -1978,6 +2031,22 @@ class SpeculativeTurn:
             scheduler.counters.effects_discarded += await scheduler.buffer.discard_and_journal(
                 child, "turn_failed"
             )
+            # Confirmed, and now never to retire -- said so. Left at "confirmed", recovery read
+            # it as a drain in flight when the process died: a failed run that sent nothing
+            # was reported resumable, with a branch that might have sent something.
+            child.squash("turn_failed")
+            scheduler.counters.branches_squashed += 1
+            await scheduler.journal.append_async(
+                scheduler.run_id,
+                "branch_resolved",
+                {
+                    "v": 1,
+                    "branch_id": child.id,
+                    "step": child.fork_step,
+                    "status": "squashed",
+                    "reason": "turn_failed",
+                },
+            )
         self._confirmed.clear()
 
     def _reads_a_pending_write(self, spec: ToolSpec, call: ToolCall) -> bool:
@@ -1997,6 +2066,7 @@ class SpeculativeTurn:
         for ordinal, emitted in enumerate(self.decisions):
             task = slots[ordinal]
             child = self._confirmed.get(ordinal)
+            confirmed = child
             if child is not None:
                 # The guess confirmed by this block joins the branch now, in program order: any
                 # earlier write has been sent and any earlier read made. Adopted when the turn
@@ -2014,6 +2084,9 @@ class SpeculativeTurn:
                     # them in the order the model asked for.
                     scheduler.mark_parked(branch)
                 results.append(await task)
+                if confirmed is not None:
+                    # A read the guess finished after the turn ended is checked like the rest.
+                    scheduler.buffer.adopt_reads(confirmed, branch)
                 continue
             results.append(
                 await tools.call(emitted.name, emitted.args, step=self._base + ordinal + 1)

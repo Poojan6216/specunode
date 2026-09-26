@@ -378,3 +378,102 @@ async def test_an_unreadable_probe_is_visible_even_when_the_policy_proceeds(
     assert all(int(p["fresh"]) == 0 for p in validated), (
         "an unchecked read was counted as a checked one"
     )
+
+
+@pytest.mark.parametrize("speculation", [False, True])
+async def test_a_guessed_read_after_a_write_is_rechecked_like_an_early_one(
+    tmp_path: Path, speculation: bool
+) -> None:
+    """One reply: charge, then look at the stock -- a read issued early with speculation off,
+    and guessed with it on. The stock changes before the turn ends, so the read is stale.
+    Speculation off, the node parks on the charge, the check finds the read stale, and nothing
+    is sent. Speculation on, the guess's reads joined the branch only at its place in the reply
+    -- after that check -- and the charge went out. Found by the twelfth review."""
+    import asyncio
+    from collections.abc import AsyncIterator
+
+    from specunode.core.decision import Decision, ToolCall
+    from specunode.core.effects import EffectClass
+    from specunode.core.graph import RunSession
+    from specunode.core.model import (
+        JournaledModel,
+        Message,
+        RequestEnvelope,
+        StreamEvent,
+        TextBlock,
+        ToolUseComplete,
+        TurnComplete,
+    )
+    from specunode.drafters.base import Prediction
+    from specunode.integrations.plain import PlainAdapter, node, registry_of, tool
+    from specunode.journal.ledger import build_ledger
+    from specunode.testing.models import tool_turn
+
+    charge_call = ("charge", {"customer_id": "cus-1", "amount": 5.0})
+    stock_call = ("get_stock", {"item": "item-7"})
+    version = {"item-7": 1}
+    reads: list[str] = []
+    sent: list[str] = []
+
+    @tool(effect=EffectClass.READ, witness=True, forward_keys="item:{args.item}")
+    async def get_stock(item: str) -> JsonValue:
+        reads.append(item)
+        return {"value": {"item": item, "stock": 3}, "witness": version[item]}
+
+    @tool(effect=EffectClass.WRITE, forward_keys="customer:{args.customer_id}")
+    async def charge(customer_id: str, amount: float) -> JsonValue:
+        sent.append(customer_id)
+        return {"charge_id": "ch_1"}
+
+    class GuessesTheStock:
+        async def predict(self, context: object) -> list[Prediction]:
+            history = getattr(context, "history", ())
+            if history and history[-1].name == "charge":
+                return [Prediction(decision=ToolCall(*stock_call), tier=1, score=0.9)]
+            return []
+
+    class Model:
+        async def complete(self, envelope: RequestEnvelope) -> object:
+            raise NotImplementedError
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            reply = tool_turn(charge_call, stock_call)
+            yield ToolUseComplete(index=0, block=reply.content[0])  # type: ignore[arg-type]
+            yield ToolUseComplete(index=1, block=reply.content[1])  # type: ignore[arg-type]
+            for _ in range(5000):  # the read has run, early or guessed
+                if reads:
+                    break
+                await asyncio.sleep(0.001)
+            version["item-7"] += 1  # and the stock changes before the turn ends
+            yield TurnComplete(response=reply)
+
+    @node(name="act")
+    async def act(session: RunSession) -> Decision:
+        await session.call_turn(  # type: ignore[misc]
+            RequestEnvelope(
+                model="m",
+                messages=(Message(role="user", content=(TextBlock(text="charge, stock"),)),),
+                stream=True,
+            )
+        )
+        session.state["done"] = True
+        return ToolCall("x", {})
+
+    registry = registry_of([get_stock, charge])
+    journal = Journal(tmp_path / "journal.db")
+    scheduler = Scheduler(
+        graph=PlainAdapter.of([act], lambda s: None if s.get("done") else "act"),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(Model(), journal),  # type: ignore[arg-type]
+        policy=Policy(speculation=speculation),
+        predictor=GuessesTheStock() if speculation else None,  # type: ignore[arg-type]
+    )
+    result = await scheduler.run(new_ulid(), {})
+    turn = scheduler._turns[0]
+    assert (turn.adopted, turn.reads_issued_early) == ((1, 0) if speculation else (0, 1))
+    assert not result.ok and "went stale" in (result.error or ""), result.error
+    assert sent == [], "a charge went out on a read that had gone stale"
+    assert build_ledger(journal, result.run_id).reads_validated.stale == 1

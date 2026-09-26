@@ -29,6 +29,7 @@ degrading if a future version moves it.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -186,8 +187,14 @@ class LangGraphAdapter:
         raise RoutingIsInternal("a self-driving adapter runs its own nodes")
 
     async def drive(self, session: RunSession, inputs: JsonValue) -> JsonValue:
-        result = await self.compiled.ainvoke(inputs)
+        # The call's own LangGraph config -- a checkpointer's ``thread_id``, a recursion limit.
+        # Per run, in a context variable, because this adapter is shared by every run at once.
+        result = await self.compiled.ainvoke(inputs, _config.get())
         return result if isinstance(result, (Mapping, list, str, int, float, bool)) else None
+
+
+#: The LangGraph config of the run this task is driving; see ``LangGraphAdapter.drive``.
+_config: ContextVar[dict[str, Any] | None] = ContextVar("specunode_langgraph_config", default=None)
 
 
 def _make_shim(name: str, original: Any) -> Callable[..., Awaitable[JsonValue]]:
@@ -221,20 +228,39 @@ class SpecuNodeGraph:
     adapter: LangGraphAdapter
     #: Builds the Scheduler for one run.
     new_scheduler: Callable[[], Any]
-    default_run_id: str | None = None
 
     def _run_id(self, run_id: str | None) -> str:
+        # Each call is its own run: a fresh id unless the caller names one. ``wrap`` took a
+        # default id for every call, and since a run id starts one run, the wrapped graph ran
+        # once and then refused every call after.
         from specunode.ids import new_ulid
 
-        return run_id or self.default_run_id or new_ulid()
+        return run_id or new_ulid()
 
-    async def ainvoke(self, inputs: JsonValue, run_id: str | None = None) -> Any:
-        result = await self.new_scheduler().run(self._run_id(run_id), inputs)
+    async def _run(self, run_id: str, inputs: JsonValue, config: Mapping[str, Any] | None) -> Any:
+        token = _config.set(dict(config) if config is not None else None)
+        try:
+            return await self.new_scheduler().run(run_id, inputs)
+        finally:
+            _config.reset(token)
+
+    async def ainvoke(
+        self, inputs: JsonValue, run_id: str | None = None, config: Mapping[str, Any] | None = None
+    ) -> Any:
+        """Run the graph to the end, as ``compiled.ainvoke`` would, and return its state.
+
+        ``config`` is LangGraph's own -- ``{"configurable": {"thread_id": ...}}`` for a graph
+        compiled with a checkpointer. A crashed run is not resumed from it in this version:
+        see docs/limitations.md.
+        """
+        result = await self._run(self._run_id(run_id), inputs, config)
         if not result.ok and result.error:
             raise RuntimeError(result.error)
         return result.state
 
-    async def astream(self, inputs: JsonValue, run_id: str | None = None) -> Any:
+    async def astream(
+        self, inputs: JsonValue, run_id: str | None = None, config: Mapping[str, Any] | None = None
+    ) -> Any:
         """Yield the canonical path's output, and nothing a speculation produced.
 
         A speculative branch's model output may be squashed, so streaming it to a user would
@@ -242,17 +268,18 @@ class SpecuNodeGraph:
         it is on their screen, which is why this yields after each node retires rather than as
         each branch produces something.
         """
-        resolved = self._run_id(run_id)
-        result = await self.new_scheduler().run(resolved, inputs)
+        result = await self._run(self._run_id(run_id), inputs, config)
         if not result.ok and result.error:
             raise RuntimeError(result.error)
         for row in result.ledger.rows:
             yield {"effect": row.call.name, "args": dict(row.call.args), "status": row.status}
         yield {"state": result.state}
 
-    async def run(self, inputs: JsonValue, run_id: str | None = None) -> Any:
+    async def run(
+        self, inputs: JsonValue, run_id: str | None = None, config: Mapping[str, Any] | None = None
+    ) -> Any:
         """Like :meth:`ainvoke` but returns the whole result, ledger included."""
-        return await self.new_scheduler().run(self._run_id(run_id), inputs)
+        return await self._run(self._run_id(run_id), inputs, config)
 
 
 def wrap(
@@ -261,7 +288,6 @@ def wrap(
     registry: Any,
     journal: Any,
     target: Any,
-    run_id: str | None = None,
     policy: Any = None,
     dispatcher: Any = None,
     speculable: frozenset[str] = frozenset(),
@@ -271,6 +297,8 @@ def wrap(
     The graph definition is not rewritten: its nodes keep their bodies, its edges keep their
     routing, and LangGraph keeps its reducers. What changes is that each node runs inside a
     branch, its routed tool calls are classified and staged, and its model calls are journaled.
+
+    Each call of the result is one run, under the ``run_id`` it is given or a fresh one.
     """
     from specunode.buffer.dispatcher import Dispatcher
     from specunode.buffer.store_buffer import StoreBuffer
@@ -293,7 +321,7 @@ def wrap(
             policy=policy or Policy(speculation=False),
         )
 
-    return SpecuNodeGraph(adapter=adapter, new_scheduler=new_scheduler, default_run_id=run_id)
+    return SpecuNodeGraph(adapter=adapter, new_scheduler=new_scheduler)
 
 
 def as_tool_call(name: str, args: Mapping[str, JsonValue]) -> ToolCall:

@@ -562,6 +562,25 @@ class RecordedTurn:
     response: ModelResponse
     #: Offset of the ``model_response`` entry the turn was first recorded in.
     offset: int
+    #: The error the turn ended in, if it failed -- raised again when it is served, so a node
+    #: that caught it and asked again is matched with what it asked the second time.
+    failed: str | None = None
+
+
+def _failure_text(exc: BaseException) -> str:
+    """What a failed turn's outcome says: a ModelError's message, anything else's type too."""
+    return str(exc) if isinstance(exc, ModelError) else f"{type(exc).__name__}: {exc}"
+
+
+def _partial_response(
+    envelope: RequestEnvelope, blocks: Mapping[int, ContentBlock], texts: Mapping[int, list[str]]
+) -> ModelResponse:
+    """What of a failed stream reached the caller, in block order."""
+    content: list[ContentBlock] = []
+    for index in sorted(set(blocks) | set(texts)):
+        block = blocks.get(index)
+        content.append(block if block is not None else TextBlock(text="".join(texts[index])))
+    return ModelResponse(model=envelope.model, content=tuple(content), stop_reason="error")
 
 
 class RecordedTurnSource(Protocol):
@@ -688,8 +707,25 @@ class JournaledModel:
         digest: str,
         latency_ms: int,
         recorded: RecordedTurn | None = None,
+        *,
+        failed: str | None = None,
     ) -> None:
-        decisions = decisions_of(response)
+        if failed is None:
+            decisions = decisions_of(response)
+            decided: dict[str, JsonValue] = {
+                "decision": decision_payload(decisions[0]),
+                "decisions": [decision_payload(d) for d in decisions],
+                "decision_hash": decision_key(decisions[0]),
+                "end_of_turn": True,
+            }
+        else:
+            # A failed turn decides nothing. Its outcome is recorded all the same: a node that
+            # catches the failure and asks again asks a second question, and on a resume or a
+            # replay the first has to fail again for the second to be matched with its answer.
+            # Unrecorded, the first had no answer, and every question the node asked after it
+            # went to the live model -- whose answer could differ from one that already sent
+            # something.
+            decided = {"decision": None, "decisions": [], "end_of_turn": False, "failed": failed}
         await self._journal.append_async(
             scope.run_id,
             "model_response",
@@ -703,13 +739,10 @@ class JournaledModel:
                 "provider": self._provider,
                 "speculative": scope.speculative,
                 "response": response_to_json(response),
-                "decision": decision_payload(decisions[0]),
-                "decisions": [decision_payload(d) for d in decisions],
-                "decision_hash": decision_key(decisions[0]),
+                **decided,
                 # The literal text whose hash is FreeText.content_hash. A FreeText decision
                 # carries only a digest, so without this the run would not be replayable.
                 "text": response.text or None,
-                "end_of_turn": True,
                 "latency_ms": latency_ms,
                 # Served from the journal, not asked: no model call was made for this entry.
                 **({"recorded_from": recorded.offset} if recorded is not None else {}),
@@ -726,13 +759,25 @@ class JournaledModel:
             track(1)
         try:
             if recorded is not None:
+                served = recorded.response
                 await self._journal_response(
-                    recorded.response, scope, request_id, digest, 0, recorded
+                    served, scope, request_id, digest, 0, recorded, failed=recorded.failed
                 )
-                return recorded.response
+                if recorded.failed is not None:
+                    raise ModelError(recorded.failed)
+                return served
             started = time.monotonic()
-            response = await self._inner.complete(envelope)
-            refuse_cut_off(response)
+            response: ModelResponse | None = None
+            try:
+                response = await self._inner.complete(envelope)
+                refuse_cut_off(response)
+            except Exception as exc:
+                failed = response or ModelResponse(model=envelope.model, stop_reason="error")
+                latency_ms = int((time.monotonic() - started) * 1000)
+                await self._journal_response(
+                    failed, scope, request_id, digest, latency_ms, failed=_failure_text(exc)
+                )
+                raise
             latency_ms = int((time.monotonic() - started) * 1000)
             await self._journal_response(response, scope, request_id, digest, latency_ms)
             return response
@@ -775,7 +820,11 @@ class JournaledModel:
                     elif isinstance(block, TextBlock):
                         handed_over = True
                         yield TextDelta(index=index, text=block.text)
-                await self._journal_response(response, scope, request_id, digest, 0, recorded)
+                await self._journal_response(
+                    response, scope, request_id, digest, 0, recorded, failed=recorded.failed
+                )
+                if recorded.failed is not None:
+                    raise ModelError(recorded.failed)
                 if track is not None:
                     track(-1)
                     track = None
@@ -783,25 +832,48 @@ class JournaledModel:
                 return
             started = time.monotonic()
             completed = False
-            async for event in self._inner.stream(envelope):
-                if isinstance(event, TurnComplete):
-                    refuse_cut_off(event.response)
+            blocks: dict[int, ContentBlock] = {}
+            texts: dict[int, list[str]] = {}
+            final: ModelResponse | None = None
+            try:
+                async for event in self._inner.stream(envelope):
+                    if isinstance(event, TurnComplete):
+                        final = event.response
+                        refuse_cut_off(event.response)
+                        latency_ms = int((time.monotonic() - started) * 1000)
+                        await self._journal_response(
+                            event.response, scope, request_id, digest, latency_ms
+                        )
+                        completed = True
+                        if track is not None:
+                            track(-1)
+                            track = None
+                    elif isinstance(event, ToolUseComplete):
+                        blocks[event.index] = event.block
+                    elif isinstance(event, TextDelta):
+                        texts.setdefault(event.index, []).append(event.text)
+                    handed_over = True
+                    yield event
+                if not completed:
+                    # A stream that simply stops -- a dropped connection the client did not
+                    # report -- ended a turn that was never journaled. Treated as what it is,
+                    # a failure: read as a complete turn, it let a confirmed guess's write go
+                    # out with no decision on disk.
+                    raise ModelError("the model's stream ended without completing its turn")
+            except Exception as exc:
+                if not completed:
+                    # What of the reply reached the caller is recorded with the failure, and
+                    # served again before it, so a resumed node sees what this one saw.
                     latency_ms = int((time.monotonic() - started) * 1000)
                     await self._journal_response(
-                        event.response, scope, request_id, digest, latency_ms
+                        final or _partial_response(envelope, blocks, texts),
+                        scope,
+                        request_id,
+                        digest,
+                        latency_ms,
+                        failed=_failure_text(exc),
                     )
-                    completed = True
-                    if track is not None:
-                        track(-1)
-                        track = None
-                handed_over = True
-                yield event
-            if not completed:
-                # A stream that simply stops -- a dropped connection the client did not report
-                # -- ended a turn that was never journaled. Treated as what it is, a failure:
-                # read as a complete turn, it let a confirmed guess's write go out with no
-                # decision on disk.
-                raise ModelError("the model's stream ended without completing its turn")
+                raise
         except BaseException:
             # A turn that failed before the caller saw any of it left nothing to act on, and
             # neither did one read by call_turn, which hands a failed turn to nobody. One a

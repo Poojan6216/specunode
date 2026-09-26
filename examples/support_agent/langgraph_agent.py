@@ -115,7 +115,7 @@ def build_registry(world: World) -> ToolRegistry:
     return registry
 
 
-def build_graph(world: World, model: ModelClient) -> Any:
+def build_graph(world: World, model: ModelClient, checkpointer: Any = None) -> Any:
     """An ordinary compiled StateGraph. Nothing here knows about speculation."""
     from langgraph.graph import END, StateGraph
 
@@ -175,4 +175,4 @@ def build_graph(world: World, model: ModelClient) -> Any:
     graph.add_edge("lookup", "decide")
     graph.add_edge("decide", "charge")
     graph.add_edge("charge", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)

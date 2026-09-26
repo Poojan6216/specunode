@@ -107,10 +107,13 @@ crashed run can always be resumed:
   lock is not taken on Windows, where only the in-process half applies.
 - **Postgres:** an advisory lock on a connection of its own, which lives exactly as long as that
   connection. A server restart, a failover or a dropped connection ends it while the process
-  drives on, and another process could then take the run up -- so before each effect is sent
-  the connection is checked, and a run whose lock has gone stops with `RunBusy` rather than
-  send. Behind a connection pooler this needs session pooling: in transaction pooling nothing
-  holds the lock at all.
+  drives on, and another process could then take the run up -- so before each attempt to send
+  an effect (the first, a retry after a backoff, a send again once the upstream said the first
+  never arrived) the connection is checked, and a run whose lock has gone stops with `RunBusy`
+  rather than send. The check comes before the request: a lock lost while a request is in flight
+  is noticed at the next one, and only an upstream that honours the idempotency key closes that
+  last gap. Behind a connection pooler this needs session pooling: in transaction pooling
+  nothing holds the lock at all.
 
 And one run per `Scheduler`. A Scheduler keeps the run it drives on itself -- its counters, the
 branches in flight, its buffer's staged effects -- so it drives one run: a second `run` or
@@ -119,7 +122,9 @@ wrapper shared one Scheduler across every call until the eleventh review, and tw
 once ran as one; each call now gets its own. `specunode.Runtime` builds one per call too. And
 `run` refuses a run id the journal already holds: started again from its beginning, a run asks
 the model everything afresh, and a call that comes out different goes out under a key nothing
-has seen. `resume` is the way back into a run.
+has seen. `resume` is the way back into a run. A run is started when its `run_started` entry is
+on disk, the first thing it writes; one whose process died before that sent nothing, and is
+started again rather than resumed.
 
 There is no setting that makes a model answer a changed question the same way, and on the
 current models there is not even one that narrows it: `temperature`, `top_p` and `top_k` are
@@ -137,9 +142,13 @@ that would decide differently if asked -- including a node that asks and charges
 and holds each to the outcome what the kill left on disk requires. The case left over, a call
 shaped by something that changed, it does not exercise.
 
-Serving applies to runs continued with `resume`. On the LangGraph path a crashed run is continued
-from LangGraph's checkpointer by running the graph again, and an unfinished node asks the model
-again, as it did before any of this.
+Serving applies to runs continued with `resume`, and in this version only a graph the runtime
+drives -- plain Python -- can be resumed. **A crashed LangGraph run cannot be.** Rebuilding its
+state is its checkpointer's job, and a resumed run would have to reproduce the crashed one's
+program positions exactly for the dedupe table to recognise what had already gone out; nothing
+does that yet. `run` refuses a LangGraph run's id a second time and `resume` says why. Running the
+graph again under a new id, from its checkpointer, asks the model again -- and may send the writes
+of a node the crash interrupted a second time.
 
 The ambiguous window itself -- the upstream took the call, the reply never came back -- is
 closed only by the upstream. A tool that declares a `reconcile` is asked, on resume, whether the
@@ -319,8 +328,10 @@ equivalence test fail in a supported configuration.
 
 The plain-Python integration journals its state deltas, so a resume rebuilds state from the
 journal alone. LangGraph owns its own reducers and channel semantics, and a second copy in the
-journal would be a second answer to what the run's state is — so on that path, resume needs a
-LangGraph checkpointer, and the journal's hash chain does not cover the state it holds.
+journal would be a second answer to what the run's state is — so the journal's hash chain does
+not cover the state LangGraph holds, and a LangGraph run cannot be resumed in this version (see
+above). `wrap()` passes LangGraph's own `config` through, so a graph compiled with a
+checkpointer runs as it would unwrapped.
 
 ## A node that escapes the ports is invisible
 

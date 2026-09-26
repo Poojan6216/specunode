@@ -148,6 +148,8 @@ class StoreBuffer:
     #: prediction was confirmed. Kept so a late stage on an adopted child lands where
     #: it will actually be drained rather than in a list nothing reads.
     _adopted_into: dict[str, str] = field(default_factory=dict)
+    #: How many of each confirmed guess's reads have been moved to its parent (``adopt_reads``).
+    _reads_adopted: dict[str, int] = field(default_factory=dict)
     #: What the last :meth:`discard` actually dropped, so the journal can name them.
     _last_discarded: tuple[StagedEffect, ...] = ()
     _closed: set[str] = field(default_factory=set)
@@ -434,13 +436,8 @@ class StoreBuffer:
         self._adopted_into[child.id] = parent.id
         self._lineages[parent.id] = parent.lineage
 
-        # The child's *reads* move too, and this is not bookkeeping. A confirmed speculation
-        # never retires, so ``validate_reads`` never runs over it -- and the reads it made are
-        # by definition the ones issued on a guess, which are the only reads lattice rule E3
-        # exists to re-check. Leaving them behind meant E3 validated the canonical branch's own
-        # reads (which need no validation by the module's own doctrine) and skipped the genuine
-        # guesses, so turning speculation *on* disabled the check that makes speculation safe.
-        parent.read_set.extend(child.own_reads())
+        # Its reads too, any not already moved (``adopt_reads``).
+        self.adopt_reads(child, parent)
 
         moved = self._staged.pop(child.id, [])
         if not moved:
@@ -453,6 +450,30 @@ class StoreBuffer:
         ]
         target.extend(adopted)
         return len(adopted)
+
+    def adopt_reads(self, child: Branch, parent: Branch) -> int:
+        """Move the reads a confirmed guess has made, and not yet moved, to ``parent``.
+
+        This is not bookkeeping. A confirmed speculation never retires, so ``validate_reads``
+        never runs over it -- and the reads it made are by definition the ones issued on a
+        guess, which are the only reads lattice rule E3 exists to re-check. Leaving them behind
+        meant E3 validated the canonical branch's own reads (which need no validation by the
+        module's own doctrine) and skipped the genuine guesses, so turning speculation *on*
+        disabled the check that makes speculation safe.
+
+        And not only when the guess's writes move (:meth:`adopt`). The scheduler moves a guess's
+        reads as soon as the turn that confirmed it ends: moved with its writes, at the guess's
+        place in the reply, they arrived after a write the model asked for earlier had parked
+        the node and the check had run -- a stale read let a charge out with speculation on that
+        speculation off refused. And again once the guess's own call returns, so a read still
+        running when the turn ended lands on the branch as the same read issued early would.
+        """
+        reads = child.own_reads()
+        already = self._reads_adopted.get(child.id, 0)
+        fresh = list(reads[already:])
+        parent.read_set.extend(fresh)
+        self._reads_adopted[child.id] = len(reads)
+        return len(fresh)
 
     def adopted_into(self, branch_id: str) -> str | None:
         """The branch a confirmed speculation's effects were moved to, if any."""
@@ -653,6 +674,10 @@ class StoreBuffer:
         settled = self._settled.setdefault(branch.id, set())
         attempted: set[str] = set()
 
+        async def still_held() -> None:
+            # Before every attempt, not only before the claim: see Journal.check_run_lock.
+            await self.journal.check_run_lock(self.run_id)
+
         # The list is read live and never snapshotted: completing one effect's ack can resume a
         # node body that stages the next write from the value it just received, and that write
         # has to be picked up by this same drain.
@@ -746,6 +771,7 @@ class StoreBuffer:
                 dict(effect.call.args),
                 idempotency_key=effect.nkey,
                 branch_id=branch.id,
+                before_attempt=still_held,
             )
             if not result.ok and result.sent == "maybe" and not effect.idempotent:
                 # This process sent it and did not hear back: the lost reply a crash leaves,
@@ -774,6 +800,7 @@ class StoreBuffer:
                         dict(effect.call.args),
                         idempotency_key=effect.nkey,
                         branch_id=branch.id,
+                        before_attempt=still_held,
                     )
                 else:
                     result = replace(result, error=f"{result.error}; {why}")

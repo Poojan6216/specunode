@@ -25,7 +25,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Literal
 
 from specunode.core.graph import RunSession
 from specunode.core.model import (
@@ -38,8 +37,11 @@ from specunode.core.model import (
 
 __all__ = ["LoopResult", "agent_loop"]
 
-#: Why the loop stopped. ``end_turn`` is the model's own decision that it was finished.
-StopReason = Literal["end_turn", "max_turns"]
+#: Why the loop stopped: ``max_turns``, or the stop reason of the reply that asked for no tools.
+#: ``end_turn`` is the model's own decision that it was finished; ``max_tokens``, ``refusal``
+#: and the rest mean it did not get to finish, and its last reply is not an answer to rely on.
+#: A reply cut off with a tool call in it never gets here: the runtime refuses it.
+StopReason = str
 
 
 @dataclass(frozen=True)
@@ -55,7 +57,7 @@ class LoopResult:
     @property
     def calls_per_turn(self) -> float:
         """Tool calls per turn that asked for any. One means nothing ran side by side."""
-        tool_turns = self.turns - (1 if self.stopped == "end_turn" else 0)
+        tool_turns = self.turns - (0 if self.stopped == "max_turns" else 1)
         return self.calls / tool_turns if tool_turns else 0.0
 
 
@@ -84,7 +86,9 @@ async def agent_loop(
         final = response
         uses = response.tool_uses
         if not uses:
-            return LoopResult(turn, calls, final, tuple(messages), "end_turn")
+            # The reply's own stop reason, not "end_turn" for any reply without a call: one that
+            # ran out of tokens part-way through its answer was reported as the model finishing.
+            return LoopResult(turn, calls, final, tuple(messages), response.stop_reason)
         if len(uses) != len(results):
             raise RuntimeError(
                 f"the reply asked for {len(uses)} call(s) and {len(results)} result(s) came back"

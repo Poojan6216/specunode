@@ -26,6 +26,7 @@ from specunode.core.branch import StepCursor
 from specunode.core.model import (
     CallScope,
     Message,
+    ModelError,
     ModelResponse,
     RecordedTurn,
     RequestEnvelope,
@@ -90,6 +91,8 @@ class JournaledTurn:
     request: Mapping[str, JsonValue]
     response: ModelResponse
     speculative: bool
+    #: The error the turn ended in, if it failed; a replay raises it again at the same point.
+    failed: str | None = None
 
 
 def _describe(value: JsonValue, limit: int = 120) -> str:
@@ -213,6 +216,7 @@ class ReplayModel:
                 continue
             projected = request.get("request")
             key = (str(request.get("node_id") or ""), step)
+            failed = payload.get("failed")
             self._turns.setdefault(key, []).append(
                 JournaledTurn(
                     step=step,
@@ -221,6 +225,7 @@ class ReplayModel:
                     request=projected if isinstance(projected, Mapping) else {},
                     response=response_from_json(response_payload),
                     speculative=speculative,
+                    failed=failed if isinstance(failed, str) else None,
                 )
             )
 
@@ -251,7 +256,10 @@ class ReplayModel:
         return turn
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
-        return self._turn_for(envelope, current_scope()).response
+        turn = self._turn_for(envelope, current_scope())
+        if turn.failed is not None:
+            raise ModelError(turn.failed)
+        return turn.response
 
     async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
         """Re-emit the journaled turn's blocks, with no delay.
@@ -260,10 +268,14 @@ class ReplayModel:
         replay take as long as the original run and would make its result depend on a number
         that has nothing to do with correctness.
         """
-        response = self._turn_for(envelope, current_scope()).response
+        turn = self._turn_for(envelope, current_scope())
+        response = turn.response
         for index, block in enumerate(response.content):
             if isinstance(block, ToolUseBlock):
                 yield ToolUseComplete(index=index, block=block)
+        if turn.failed is not None:
+            # The turn failed in the run being replayed, after what it had streamed so far.
+            raise ModelError(turn.failed)
         yield TurnComplete(response=response)
 
     # -- introspection for tests and the CLI -----------------------------------------------------
@@ -350,7 +362,14 @@ class RecordedTurns:
             origin = payload.get("recorded_from")
             offset = origin if isinstance(origin, int) else entry.offset
             key = (str(request.get("node_id") or ""), step)
-            turn = RecordedTurn(response=response_from_json(response), offset=offset)
+            # A turn that failed is served as the same failure, so the question the node asked
+            # next is matched with its own answer.
+            failed = payload.get("failed")
+            turn = RecordedTurn(
+                response=response_from_json(response),
+                offset=offset,
+                failed=failed if isinstance(failed, str) else None,
+            )
             attempts.setdefault(key, {}).setdefault(branch, []).append(
                 (asked_at, str(payload.get("request_hash", "")), request_id, turn)
             )
@@ -528,6 +547,9 @@ class Recovery:
     #: A Parallel group the run was in the middle of, if any. A resume finishes it rather than
     #: asking the router again.
     open_group: OpenGroup | None = None
+    #: Whether the run recorded its start. Nothing is sent before it does, so a run that did not
+    #: sent nothing -- and its inputs are recorded there, so it cannot be resumed without them.
+    started: bool = False
 
     @property
     def exists(self) -> bool:
@@ -544,7 +566,7 @@ class Recovery:
 
     @property
     def resumable(self) -> bool:
-        return self.exists and (not self.finished or bool(self.confirmed_not_retired))
+        return self.started and (not self.finished or bool(self.confirmed_not_retired))
 
 
 def _cursor_from(payload: JsonValue, fallback: StepCursor) -> StepCursor:
@@ -630,6 +652,9 @@ def recover(journal: Journal, run_id: str) -> Recovery:
                             groups[group_id].steps.append(cursor.step_index)
                 elif status == "confirmed":
                     confirmed.add(branch_id)
+                elif status == "squashed":
+                    # A confirmed guess whose turn then failed: closed, and nothing drained.
+                    confirmed.discard(branch_id)
         elif entry.kind == "state_delta_applied":
             branch_id = payload.get("branch_id")
             patch = payload.get("patch")
@@ -681,6 +706,7 @@ def recover(journal: Journal, run_id: str) -> Recovery:
         last_offset=last_offset,
         finished=finished,
         open_group=open_group,
+        started=started,
     )
 
 

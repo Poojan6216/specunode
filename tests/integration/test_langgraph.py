@@ -107,7 +107,6 @@ async def test_the_wrapped_run_attributes_every_effect_to_a_retired_branch(
         journal=journal,
         target=JournaledModel(scripted(), journal, provider="scripted"),
         dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
-        run_id=run_id,
     )
     await graph.run({"customer_id": "cus-1"}, run_id=run_id)
 
@@ -149,7 +148,6 @@ async def test_a_node_runs_under_its_own_branch(tmp_path: Path) -> None:
         journal=journal,
         target=JournaledModel(scripted(), journal, provider="scripted"),
         dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
-        run_id=run_id,
     )
     await graph.run({"customer_id": "cus-1"}, run_id=run_id)
     forks = list(journal.read(run_id, kinds=["branch_forked"]))
@@ -260,3 +258,64 @@ async def test_two_runs_of_one_wrapped_graph_at_once_stay_apart(tmp_path: Path) 
         ]
         assert len(list(journal.read(run, kinds=["run_finished"]))) == 1
     assert sorted(m.tool for m in world.mutations) == ["charge_card"] * 2 + ["send_receipt"] * 2
+
+
+async def test_a_graph_with_a_checkpointer_runs_with_its_config(tmp_path: Path) -> None:
+    """``ainvoke`` and ``run`` took no LangGraph config, so a graph compiled with a checkpointer
+    failed at once: "Checkpointer requires ... thread_id". Found by the twelfth review."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    world = standard_world()
+    journal = Journal(tmp_path / "journal.db")
+    registry = build_registry(world)
+    graph = wrap(
+        build_graph(world, scripted(), checkpointer=InMemorySaver()),
+        registry=registry,
+        journal=journal,
+        target=JournaledModel(scripted(), journal, provider="scripted"),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),
+    )
+    config = {"configurable": {"thread_id": "support-1"}}
+    result = await graph.run({"customer_id": "cus-1"}, config=config)
+    assert result.ok, result.error
+    assert [m.tool for m in world.mutations] == ["charge_card", "send_receipt"]
+
+
+async def test_a_langgraph_run_says_it_cannot_be_resumed(tmp_path: Path) -> None:
+    """The docs described continuing a crashed LangGraph run from its checkpointer; ``run``
+    refused the id ("resume it") and ``resume`` failed on LangGraph's internal routing. Neither
+    works in this version, and both now say so. Found by the twelfth review."""
+    from specunode.core.scheduler import SchedulerError
+
+    world = standard_world()
+    journal = Journal(tmp_path / "journal.db")
+    registry = build_registry(world)
+    graph = wrap(
+        build_graph(world, scripted()),
+        registry=registry,
+        journal=journal,
+        target=JournaledModel(scripted(), journal, provider="scripted"),
+    )
+    run_id = new_ulid()
+    await graph.run({"customer_id": "cus-1"}, run_id=run_id)
+    with pytest.raises(SchedulerError, match="cannot be resumed in this version"):
+        await graph.run({"customer_id": "cus-1"}, run_id=run_id)
+    with pytest.raises(SchedulerError, match="cannot be resumed in this version"):
+        await graph.new_scheduler().resume(run_id)
+
+
+async def test_one_wrapped_graph_runs_any_number_of_times(tmp_path: Path) -> None:
+    """``wrap(run_id=...)`` gave every call one run id, and a run id starts one run: the second
+    call was refused. Each call is its own run. Found by the twelfth review."""
+    world = standard_world()
+    journal = Journal(tmp_path / "journal.db")
+    registry = build_registry(world)
+    graph = wrap(
+        build_graph(world, scripted()),
+        registry=registry,
+        journal=journal,
+        target=JournaledModel(ScriptedModel(turns=[tool_turn(CHARGE)] * 2), journal),
+    )
+    first = await graph.run({"customer_id": "cus-1"})
+    second = await graph.run({"customer_id": "cus-1"})
+    assert first.ok and second.ok and first.run_id != second.run_id
