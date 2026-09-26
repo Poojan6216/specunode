@@ -175,10 +175,13 @@ among the turn's own, at another place on a resume, under another key. Await the
 ask the model on the side, use `session.model.complete()`, which takes no position. A turn that
 does not complete -- it fails, or the node stops waiting for it -- takes no positions at all,
 however many of its blocks had arrived. And once a node returns, what it left running takes no
-more positions and makes no more calls: a turn still under way makes none of its calls, has the
-guess it had open squashed, and gives back the positions its blocks took unless the model's
-whole answer had already arrived; a call or a question not yet begun is refused with
-`TurnAbandoned`; and a write already begun is refused where it would be staged. What was already
+more positions and makes no more calls: a turn still under way makes none of its calls; what of
+its guesses was being written as the node returned -- a fork, a confirmation, an adoption -- is
+finished first, a guessed write already being adopted going out with the node's own; its open
+guess is squashed and one confirmed but not adopted discarded; and it gives back the positions
+its blocks took -- or, had the model's whole answer arrived, keeps one for each call in it. A
+call or a question not yet begun is refused with `TurnAbandoned`, and a write already begun is
+refused where it would be staged. What was already
 begun goes out and finishes -- a read, or a question to the model, whose request was being
 written as the node returned, as well as one already sent -- and a write staged before the return
 goes out with the node's own. How far work left running got by the return is a matter of timing,

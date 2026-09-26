@@ -381,7 +381,7 @@ class ReplayModel:
             # The turn failed in the run being replayed, after what it had streamed so far.
             raise ModelError(turn.failed)
         if self.role == "target":
-            _tell_answer_arrived()
+            _tell_answer_arrived(response)
         yield TurnComplete(response=response)
 
     # -- introspection for tests and the CLI -----------------------------------------------------

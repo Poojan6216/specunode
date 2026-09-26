@@ -55,6 +55,7 @@ from specunode.core.scheduler import Scheduler
 from specunode.ids import new_ulid
 from specunode.integrations.plain import PlainAdapter, node, registry_of, tool
 from specunode.journal.journal import Journal
+from specunode.journal.replay import recover
 from specunode.testing.world import standard_world
 
 
@@ -2153,3 +2154,364 @@ async def test_a_question_left_running_is_not_put_once_its_node_returned(tmp_pat
     assert result.ok, result.error
     assert asked == [], "a question was put after its node returned"
     assert refused and "has returned" in refused[0], refused
+
+
+# -- the twenty-seventh review -------------------------------------------------------------------
+
+
+class SlowOnTheWriterThread(Journal):
+    """A disk slow to take an entry of ``kind`` -- in the writer thread, ahead of the write, so
+    every write submitted after it waits behind it, as on a real disk. ``writing`` is set as it
+    is submitted."""
+
+    def __init__(self, path: Path, kind: str, writing: asyncio.Event, seconds: float) -> None:
+        super().__init__(path)
+        self.kind = kind
+        self.writing = writing
+        self.seconds = seconds
+
+    async def append_async(self, run_id: str, kind: str, payload: Mapping[str, JsonValue]) -> int:
+        slow = kind == self.kind and (
+            kind != "policy_event" or payload.get("event") == "alpha_observed"
+        )
+        if slow:
+            import time
+
+            self._writer._executor.submit(time.sleep, self.seconds)
+            written = asyncio.ensure_future(super().append_async(run_id, kind, payload))
+            self.writing.set()
+            return await written
+        return await super().append_async(run_id, kind, payload)
+
+
+class SlowToSubmit(Journal):
+    """A disk slow to take a guess's resolution -- delayed before it is submitted, as
+    tests/slow_journal.py delays every write -- with ``writing`` set as it is asked for."""
+
+    def __init__(self, path: Path, writing: asyncio.Event) -> None:
+        super().__init__(path)
+        self.writing = writing
+
+    async def append_async(self, run_id: str, kind: str, payload: Mapping[str, JsonValue]) -> int:
+        if kind == "policy_event" and payload.get("event") == "alpha_observed":
+            self.writing.set()
+            await asyncio.sleep(0.1)
+        return await super().append_async(run_id, kind, payload)
+
+
+class NotesThenCharges:
+    """``note_order`` at 10 ms, ``charge_card`` at 30 ms; the turn's end at ``ends_at``."""
+
+    def __init__(self, ends_at: float = 0.04) -> None:
+        self.ends_at = ends_at
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        return ModelResponse(model="scripted", content=(TextBlock(text="25"),))
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        note = ToolUseBlock(id="t0", name="note_order", args={"customer_id": "cus-1"})
+        charge = ToolUseBlock(
+            id="t1", name="charge_card", args={"customer_id": "cus-1", "amount": 25.0}
+        )
+        await asyncio.sleep(0.01)
+        yield ToolUseComplete(index=0, block=note)
+        await asyncio.sleep(0.02)
+        yield ToolUseComplete(index=1, block=charge)
+        await asyncio.sleep(self.ends_at - 0.03)
+        yield TurnComplete(
+            ModelResponse(model="scripted", content=(note, charge), stop_reason="tool_use")
+        )
+
+
+def left_running_with_guesses(
+    sent: list[str],
+    left: list[asyncio.Task[object]],
+    collected: list[str],
+    returns: asyncio.Event,
+    *,
+    collects: bool = True,
+) -> tuple[PlainAdapter, object]:
+    """``plan`` leaves a turn running and returns when ``returns`` is set; ``finish`` then waits
+    up to 2 s for that turn -- its results, or why it did not finish -- or, not ``collects``,
+    ends the run 0.3 s later without it."""
+
+    @tool(effect="write", idempotent=False)
+    async def note_order(customer_id: str) -> JsonValue:
+        sent.append("note_order")
+        return {"noted": True}
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        sent.append(f"charge_card {amount}")
+        return {"charge_id": "ch"}
+
+    @node(name="plan")
+    async def plan(session: RunSession) -> Decision:
+        turn = session.call_turn(TURN_FOR_ORDERS)  # type: ignore[misc]
+        left.append(asyncio.get_running_loop().create_task(turn))  # never awaited here
+        await returns.wait()
+        session.state["planned"] = True
+        return ToolCall("note_order", {})
+
+    @node(name="finish")
+    async def finish(session: RunSession) -> Decision:
+        try:
+            if not collects:
+                await asyncio.sleep(0.3)
+                session.state["finished"] = True
+                return ToolCall("note_order", {})
+            await asyncio.wait_for(asyncio.shield(left[0]), timeout=2.0)
+            collected.append("its results")
+        except TimeoutError:
+            collected.append("still waiting after 2 s")
+        except BaseException as exc:
+            collected.append(type(exc).__name__)
+        session.state["finished"] = True
+        return ToolCall("note_order", {})
+
+    def route(state: Mapping[str, JsonValue]) -> str | None:
+        if not state.get("planned"):
+            return "plan"
+        return None if state.get("finished") else "finish"
+
+    return PlainAdapter.of([plan, finish], route), registry_of([note_order, charge_card])
+
+
+def guessing(journal: Journal, adapter: object, registry: object, model: object) -> Scheduler:
+    return Scheduler(
+        graph=adapter,  # type: ignore[arg-type]
+        registry=registry,  # type: ignore[arg-type]
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),  # type: ignore[arg-type]
+        target=JournaledModel(model, journal, provider="scripted"),  # type: ignore[arg-type]
+        policy=Policy(speculation=True, speculate_writes=True),
+        predictor=FixedDrafter(  # type: ignore[arg-type]
+            ToolCall("charge_card", {"customer_id": "cus-1", "amount": 25.0})
+        ),
+    )
+
+
+def neither_sent_nor_discarded(db: Path, run_id: str) -> set[object]:
+    entries = list(Journal(db).read(run_id))
+    staged = {e.payload.get("effect_id") for e in entries if e.kind == "effect_staged"}
+    dispatched = {e.payload.get("effect_id") for e in entries if e.kind == "effect_dispatched"}
+    discarded = {
+        effect
+        for e in entries
+        if e.kind == "effect_discarded"
+        for effect in e.payload.get("effect_ids") or []  # type: ignore[union-attr]
+    }
+    return staged - dispatched - discarded
+
+
+async def test_a_guess_being_adopted_as_its_node_returns_goes_out_with_it(tmp_path: Path) -> None:
+    """A node returned while a turn it left running was adopting a confirmed guess's charge --
+    the adoption's entry still being written. The node's retirement drained before the charge
+    moved over: it was neither sent nor discarded, and the turn waited on its ack for ever. The
+    node's return waits for an adoption under way now, and the charge goes out with the node's
+    own. Found by the twenty-seventh review."""
+    sent: list[str] = []
+    left: list[asyncio.Task[object]] = []
+    collected: list[str] = []
+    adopting = asyncio.Event()
+    adapter, registry = left_running_with_guesses(sent, left, collected, adopting)
+    db = tmp_path / "run.db"
+    run_id = new_ulid()
+    journal = SlowOnTheWriterThread(db, "effect_adopted", adopting, 0.15)
+    result = await asyncio.wait_for(
+        guessing(journal, adapter, registry, NotesThenCharges()).run(run_id, {}), timeout=30
+    )
+    for task in left:
+        task.cancel()
+    assert result.ok, result.error
+    assert collected != ["still waiting after 2 s"], "the turn waited on its ack for ever"
+    assert not neither_sent_nor_discarded(db, run_id), "a charge was neither sent nor discarded"
+    assert not recover(Journal(db), run_id).resumable
+
+
+async def test_a_guess_confirmed_as_its_node_returns_leaves_the_run_finished(
+    tmp_path: Path,
+) -> None:
+    """A guess of a turn a node left running was confirmed as the node returned, and waited to
+    be adopted until the turn ended -- after the run. Its discard was then never written, and a
+    finished run read as resumable for ever. The node's return waits for the confirmation to be
+    written, and discards what it confirmed. Found by the twenty-seventh review."""
+    sent: list[str] = []
+    left: list[asyncio.Task[object]] = []
+    collected: list[str] = []
+    resolving = asyncio.Event()
+    adapter, registry = left_running_with_guesses(sent, left, collected, resolving, collects=False)
+    db = tmp_path / "run.db"
+    run_id = new_ulid()
+    result = await asyncio.wait_for(
+        guessing(SlowToSubmit(db, resolving), adapter, registry, NotesThenCharges(1.0)).run(
+            run_id, {}
+        ),
+        timeout=30,
+    )
+    await asyncio.sleep(1.2)  # the turn ends, after the run
+    for task in left:
+        task.cancel()
+    assert result.ok, result.error
+    assert not neither_sent_nor_discarded(db, run_id), "a charge was neither sent nor discarded"
+    assert not recover(Journal(db), run_id).resumable, "a finished run reads as resumable"
+
+
+class SlowToHaveNoGuess:
+    """A drafter -- a tier-2 model, say -- that takes 300 ms to say it has no second guess."""
+
+    tier = 2
+
+    async def predict(self, context: object) -> list[object]:
+        if len(context.history) >= 2:  # type: ignore[attr-defined]
+            await asyncio.sleep(0.3)
+        return []
+
+
+async def test_a_turn_left_running_is_judged_by_its_answer_arriving_not_being_read(
+    tmp_path: Path,
+) -> None:
+    """The answer to a turn a node left running arrived at 30 ms, and the node returned at 150
+    ms -- but the turn's own task was inside a drafter's 300 ms guess, and was judged by when it
+    got round to the answer: unanswered, its positions given back. A replay, which guesses
+    nothing, judged it answered, placed the next node elsewhere, and a finished run did not
+    replay. Found by the twenty-seventh review."""
+    charged: list[str] = []
+
+    def build() -> tuple[PlainAdapter, object]:
+        @tool(effect="write", idempotent=False)
+        async def note_order(customer_id: str) -> JsonValue:
+            charged.append("note_order")
+            return {"noted": True}
+
+        @tool(effect="write", idempotent=False)
+        async def charge_card(customer_id: str, amount: float) -> JsonValue:
+            charged.append(f"charge {amount}")
+            return {"charge_id": "ch"}
+
+        async def summarise(session: RunSession) -> None:
+            with contextlib.suppress(BaseException):
+                await session.call_turn(TURN_FOR_ORDERS)  # type: ignore[misc]
+
+        @node(name="plan")
+        async def plan(session: RunSession) -> Decision:
+            asyncio.get_running_loop().create_task(summarise(session))  # never awaited
+            await asyncio.sleep(0.15)
+            session.state["planned"] = True
+            return ToolCall("note_order", {})
+
+        @node(name="bill")
+        async def bill(session: RunSession) -> Decision:
+            assert session.model is not None
+            await asyncio.sleep(0.5)
+            price = await session.model.complete(PRICE_TURN)
+            await session.call_tool(
+                "charge_card", {"customer_id": "cus-1", "amount": float(price.text)}
+            )
+            session.state["billed"] = True
+            return ToolCall("charge_card", {})
+
+        def route(state: Mapping[str, JsonValue]) -> str | None:
+            if not state.get("planned"):
+                return "plan"
+            return None if state.get("billed") else "bill"
+
+        return PlainAdapter.of([plan, bill], route), registry_of([note_order, charge_card])
+
+    db = tmp_path / "run.db"
+    journal = Journal(db)
+    run_id = new_ulid()
+    adapter, registry = build()
+    result = await asyncio.wait_for(
+        Scheduler(
+            graph=adapter,  # type: ignore[arg-type]
+            registry=registry,  # type: ignore[arg-type]
+            journal=journal,
+            buffer=StoreBuffer(journal=journal, run_id=""),
+            dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),  # type: ignore[arg-type]
+            target=JournaledModel(NotesThenCharges(0.03), journal, provider="scripted"),
+            policy=Policy(speculation=True),
+            predictor=SlowToHaveNoGuess(),  # type: ignore[arg-type]
+        ).run(run_id, {}),
+        timeout=30,
+    )
+    await asyncio.sleep(0.6)
+    assert result.ok, result.error
+    adapter, registry = build()
+    replay_db = tmp_path / "replay.db"
+    replay_run = new_ulid()
+    replayed = await asyncio.wait_for(  # as `specunode replay` drives it: no drafter
+        scheduler(Journal(replay_db), adapter, registry, replay_of(Journal(db), run_id)).run(
+            replay_run, {}
+        ),
+        timeout=30,
+    )
+    await asyncio.sleep(0.6)
+    assert replayed.ok, replayed.error
+    assert cursors_after(Journal(db), run_id) == cursors_after(Journal(replay_db), replay_run)
+
+
+async def test_a_question_being_written_as_its_node_returns_goes_out(tmp_path: Path) -> None:
+    """A question a task put to the model, still being written when its node returned, was
+    refused once written -- where the docs say what was already begun goes out. Found by the
+    twenty-seventh review."""
+    asked: list[str] = []
+    outcome: list[str] = []
+    asking = asyncio.Event()
+
+    class SlowToAsk(Journal):
+        async def append_async(
+            self, run_id: str, kind: str, payload: Mapping[str, JsonValue]
+        ) -> int:
+            if kind == "model_request":
+                asking.set()  # being written: the node returns now
+                await asyncio.sleep(0.1)
+            return await super().append_async(run_id, kind, payload)
+
+    class Counts:
+        async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+            asked.append("complete")
+            return ModelResponse(model="scripted", content=(TextBlock(text="25"),))
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            raise NotImplementedError
+            yield  # pragma: no cover
+
+    async def ask(session: RunSession) -> None:
+        assert session.model is not None
+        try:
+            answer = await session.model.complete(PRICE_TURN)
+            outcome.append(f"answered {answer.text}")
+        except TurnAbandoned:
+            outcome.append("refused")
+
+    @node(name="plan")
+    async def plan(session: RunSession) -> Decision:
+        asyncio.get_running_loop().create_task(ask(session))  # begun; never awaited
+        await asking.wait()
+        session.state["planned"] = True
+        return ToolCall("noop", {})
+
+    @node(name="wait")
+    async def wait(session: RunSession) -> Decision:
+        await asyncio.sleep(0.3)
+        session.state["waited"] = True
+        return ToolCall("noop", {})
+
+    def route(state: Mapping[str, JsonValue]) -> str | None:
+        if not state.get("planned"):
+            return "plan"
+        return None if state.get("waited") else "wait"
+
+    result = await asyncio.wait_for(
+        scheduler(
+            SlowToAsk(tmp_path / "j.db"),
+            PlainAdapter.of([plan, wait], route),
+            registry_of([]),
+            Counts(),
+        ).run(new_ulid(), {}),
+        timeout=30,
+    )
+    assert result.ok, result.error
+    assert asked == ["complete"] and outcome == ["answered 25"], (asked, outcome)

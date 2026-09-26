@@ -1392,11 +1392,16 @@ class Scheduler:
         here, while the run is still driven.
         """
         for turn in self._turns:
-            if turn.branch is branch and turn.under_way and not turn.answered:
-                branch.rewind_to(turn.base)
+            if turn.branch is branch and turn.under_way:
+                if turn.answered:
+                    # One position for each call in the answer, as a finished turn takes --
+                    # however many of its blocks the turn had got round to.
+                    branch.reserve_step(turn.base + turn.answered_calls)
+                else:
+                    branch.rewind_to(turn.base)
         for turn in self._turns:
             if turn.branch is branch:
-                await turn.squash_open("node_returned")
+                await turn.let_go("node_returned")
 
     def _forget_node_task(self, task: asyncio.Task[Decision]) -> None:
         self._node_tasks.pop(task, None)
@@ -2191,9 +2196,15 @@ class SpeculativeTurn:
         self._cost_tokens: int = 0
         #: Between ``call_turn`` asking for it and handing its results over, or failing.
         self.under_way = False
-        #: The model's whole answer has arrived -- told before it is written, and at the same
-        #: point on a resume or in a replay (``answer_arrival``).
+        #: The model's whole answer has arrived -- told as it arrives, before it is written, and
+        #: at the same point on a resume or in a replay (``answer_arrival``) -- and how many calls
+        #: are in it.
         self.answered = False
+        self.answered_calls = 0
+        #: A confirmed guess being adopted into the node's branch, while it is; and a guess's
+        #: confirmation, while it is being journaled.
+        self._adopting: asyncio.Future[int] | None = None
+        self._confirming: asyncio.Future[None] | None = None
         #: The open guess's fork, while it is being written; and the last squash, once begun --
         #: what a squash made as the node returns waits for, whichever task began it.
         self._forking: asyncio.Future[None] | None = None
@@ -2311,8 +2322,9 @@ class SpeculativeTurn:
         with partial_turns_discarded(), answer_arrival(self._answer_arrived):
             await self._read(envelope, tools, slots)
 
-    def _answer_arrived(self) -> None:
+    def _answer_arrived(self, calls: int) -> None:
         self.answered = True
+        self.answered_calls = calls
 
     async def _read(
         self,
@@ -2388,7 +2400,11 @@ class SpeculativeTurn:
     async def _discard_confirmed(self) -> None:
         """Discard what the guesses this turn confirmed, and nothing adopted yet, staged."""
         scheduler = self._scheduler
-        for child in self._confirmed.values():
+        # Taken off first: the node's return (``let_go``) and the turn's own failure can both get
+        # here, and each discards only what it took.
+        confirmed = list(self._confirmed.values())
+        self._confirmed.clear()
+        for child in confirmed:
             scheduler.counters.effects_discarded += await scheduler._discard(child, "turn_failed")
             # Confirmed, and now never to retire -- said so. Left at "confirmed", recovery read
             # it as a drain in flight when the process died: a failed run that sent nothing
@@ -2405,7 +2421,6 @@ class SpeculativeTurn:
                     "reason": "turn_failed",
                 },
             )
-        self._confirmed.clear()
 
     def _reads_a_pending_write(self, spec: ToolSpec, call: ToolCall) -> bool:
         """Whether ``call`` may read what a write the model emitted earlier this turn changes."""
@@ -2437,16 +2452,26 @@ class SpeculativeTurn:
                     f"node {self._node_id} returned before this turn ended; its calls are not made"
                 )
             task = slots[ordinal]
-            child = self._confirmed.get(ordinal)
+            child = self._confirmed.pop(ordinal, None)
             confirmed = child
             if child is not None:
                 # The guess confirmed by this block joins the branch now, in program order: any
                 # earlier write has been sent and any earlier read made. Adopted when the turn
                 # ended instead, it was drained with the first write this loop parked on --
                 # before a read the model asked for ahead of it, which then saw its effect.
-                # Forgotten only once adopted: an adoption that fails is discarded with the rest.
-                await scheduler.buffer.adopt(child, branch)
-                del self._confirmed[ordinal]
+                # Taken off while it is adopted, and put back if the adoption fails, to be
+                # discarded with the rest. Watched while it is under way: a node returning
+                # meanwhile waits for it (``let_go``) -- adopted after its node retired, the write
+                # was never drained, never discarded, and the turn waited on its ack for ever.
+                adopting = asyncio.ensure_future(scheduler.buffer.adopt(child, branch))
+                self._adopting = adopting
+                try:
+                    await adopting
+                except BaseException:
+                    self._confirmed[ordinal] = child
+                    raise
+                finally:
+                    self._adopting = None
             if task is not None:
                 if task in self._adopted_tasks and not task.done():
                     # The only slot this branch cannot finish on its own: an adopted
@@ -2692,11 +2717,14 @@ class SpeculativeTurn:
             if opened is not None:
                 self._adopted_tasks.add(opened)
             confirming = asyncio.ensure_future(self._journal_confirmed(child))
+            self._confirming = confirming
             try:
                 await asyncio.shield(confirming)
             except asyncio.CancelledError:
                 await _let_finish(confirming)
                 raise
+            finally:
+                self._confirming = None
             return
 
         await self._squash_open("mismatch")
@@ -2725,19 +2753,26 @@ class SpeculativeTurn:
         """The position the turn began at: its calls sit after it."""
         return self._base
 
-    async def squash_open(self, reason: str) -> None:
-        """Squash the guess this turn has open, and see it done -- for a node that has returned.
+    async def let_go(self, reason: str) -> None:
+        """For a node that has returned: finish what of its guesses is in flight, drop the rest.
 
-        A guess whose fork is still being written is resolved after it, not before; and a squash
-        the turn's own task began is waited for too, so it is on disk before the node retires.
+        A guess whose fork is being written is resolved after it, not before; one being adopted is
+        adopted, and its write drained with the node's own; the open guess is squashed, and one
+        confirmed but not yet adopted discarded -- all while the run is still driven, and seen done
+        before the node retires. Left to the turn, a guess confirmed as its node returned was
+        journaled after the node retired and never discarded, and a finished run read as
+        resumable.
         """
-        forking = self._forking
-        if forking is not None:
-            await asyncio.wait({forking})
+        # A confirmation being journaled is waited for too: discarded before it landed, the
+        # guess's last word on disk was "confirmed", and a finished run read as resumable.
+        for underway in (self._forking, self._confirming, self._adopting):
+            if underway is not None:
+                await asyncio.wait({underway})
         await self._squash_open(reason)
         squashing = self._squashing
         if squashing is not None:
             await asyncio.wait({squashing})
+        await self._discard_confirmed()
 
     async def _squash_open(self, reason: str) -> None:
         """Cancellation *is* the squash. The buffer is closed before the task is cancelled.

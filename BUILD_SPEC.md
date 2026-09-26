@@ -1067,6 +1067,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [2.5] DEFECTS (fixed), found by the twenty-fourth review -- three, none critical, one serious in the twenty-third's repair: (1, serious) a turn a node left running gave its positions back at the node's return if it was still under way -- and one answered just before the return was still under way live, its answer being written, and done in a replay, which writes nothing: the next node asked at a position the journal had no turn for, and a finished run did not replay. It is judged now by whether its answer had arrived, which a resume and a replay pace the same, and the rule is 4; (2) adapters.md said what a node left running reaches the world no further, and a read already sent, or a question already asked, finishes -- it says so; (3) the twenty-third's change of where a left-over turn leaves the cursor kept the rule at 3 -- it is 4. The fix fails under its own planted bug. — 2026-09-26
 [2.5] DEFECTS (fixed), found by the twenty-fifth review -- four, none critical, two serious, both the twenty-fourth's fix falling short: whether a turn a node left running kept its positions was judged at the node's return, and the return is not where a replay's is -- (1) a node that returned once a question it asked on the side was answered returned a write sooner in a replay, which writes no answers; (2) a turn cancelled as its node returned, while its answer was written, was judged answered and recorded as cancelled, which a replay serves as never answered. Either way the next node asked at a position the journal had no turn for, and a finished run did not replay; (3) with a programmatic predictor, the turn read its answer late, after writing a guess's fork. A replay now carries on after each node from where the recorded run did -- its journaled `cursor_after` -- whatever its own timing. (4) The docs said a call a node left running is refused once it returns; a read or a question already begun still goes out -- they say so. The fix fails under its own planted bug. — 2026-09-26
 [2.5] DEFECTS, found by the twenty-sixth review -- six, two critical, three serious: (1, 2, critical) a replay hands a model's answer over as it arrived, and a resume after writing it on its own disk, where the run's node had it only once its journal had written it: a node racing a deadline within that write decided otherwise -- a replay sent a charge the run never made under `--dispatch`, and a resume on a quicker disk a second one. Not fixed in code: the answer's own write is not in the record, so a replay cannot wait it out; the docs, which said an answer comes back no sooner than it did, now say it comes as it arrived, sooner or later by up to a write of it, and that a deadline deciding between effects needs room past one. (3, serious) the twenty-fifth review's fix -- a replay carrying on from the recorded run's cursor -- hid any divergence, and a replay down another path reported ok: withdrawn; a replay stops again where a node's calls sit elsewhere, and a turn left running that makes it so is a documented limit. (4, serious) a turn left running, still settling as its node returned, adopted a guessed charge into the retired node and waited on its ack for ever -- the node's return is looked at before each block. (5, serious, older) LangGraph nodes run side by side lost each other's visits, a node id was minted twice and a write deduped away -- the run's cursor is merged, not overwritten. (6) a question a task left running put after its node returned was asked -- it is refused. Each code fix fails under its own planted bug. — 2026-09-26
+[2.5] DEFECTS (fixed), found by the twenty-seventh review -- four, none critical, one serious, all in a turn a node left running, with guesses: (1, serious) a node that returned while such a turn was adopting a confirmed guess's charge left it neither sent nor discarded, and the turn waiting on its ack for ever -- the twenty-sixth's fix looked before the adoption, not during it; (4) a guess confirmed as its node returned was journaled after the node retired and never discarded, so a finished run read as resumable; (3) such a turn was judged by when its task got round to its answer -- behind a drafter's guess -- not when it arrived, and a replay, which guesses nothing, placed the next node elsewhere. A node's return now finishes what of its turns' guesses is being written -- a fork, a confirmation, an adoption -- then squashes the open guess and discards a confirmed one (`SpeculativeTurn.let_go`); a turn is told its answer arrived as it arrives, with how many calls are in it, and keeps a position for each. (A first try -- not guessing on a turn in a task of its own -- was dropped: on Python 3.11 `asyncio.wait_for` runs what it waits for in a task of its own.) (2) A question already being written as its node returned was refused, where the docs say it goes out: the node's return is looked at before the write only. Each fix fails under its own planted bug. — 2026-09-26
 [3.3] Four tests settled a guess inside a 15–25 ms block delay, which a journal append on a slow CI disk could miss. Found all at once by running the suite with every append 40 ms slower (`tests/slow_journal.py`); each now holds the settling block until the event it needs has happened, and passes at 40, 100 and 250 ms of added latency. The `slow-disk` CI job runs the tests that guess that way on every push. — 2026-09-25
 ```
 
@@ -1077,13 +1078,13 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**1110 tests pass, 24 skip — 18 of the passes against a real Postgres 16 server.** `ruff check`,
+**1114 tests pass, 24 skip — 18 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed -- mypy checking as
 the interpreter it runs under, 3.11 in CI and 3.12 here -- which is a stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Twenty-six independent adversarial reviews have found 234 defects here, 45 of them critical.**
-The counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8, 10, 6, 7, 7, 6, 12, 7, 5, 7, 12, 8, 4, 3, 4, 6.** All are fixed but three, kept and
+**Twenty-seven independent adversarial reviews have found 238 defects here, 45 of them critical.**
+The counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8, 10, 6, 7, 7, 6, 12, 7, 5, 7, 12, 8, 4, 3, 4, 6, 4.** All are fixed but three, kept and
 documented: a node's writes are refused while any model turn it started is unjournaled, even one
 that did not decide the write; a resume or a replay keeps the model's time but not the
 machine's -- an answer comes back as it arrived from the model, where the run's node had it only
@@ -1093,7 +1094,7 @@ deadline on that edge can decide otherwise; and work a node leaves running races
 a replay of a node that left a model turn running can place the next node's calls elsewhere, and
 stops. That number is the most useful thing in this report, so it
 is at the top rather than buried: the version of this document written a day earlier described
-a finished project. The twenty-sixth to sixth reviews (2026-09-25 and -26) and the fifth (2026-09-23) are
+a finished project. The twenty-seventh to sixth reviews (2026-09-25 and -26) and the fifth (2026-09-23) are
 summarised below; the fourth is in commit `c8802ec`.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
@@ -1213,6 +1214,23 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (4 guesses forked, 4 squashed, 4 charges staged and discarded, the
 alpha gate closed once, 0 wasted tokens — a pattern-index guess costs no model tokens — and 0
 leaks) and 7.8 replay under model drift (both cases diverge at step 0).
+
+### What the twenty-seventh review found
+
+Four findings, none critical, and nothing that sends an effect twice or invents one. All four in
+one seam: a turn a node left running, with guesses.
+
+- **Serious: the twenty-sixth review's fix for a turn settling across its node's return was
+  incomplete.** It looked at the node's return before adopting a confirmed guess, not during:
+  a node that returned while the adoption was being written left the guessed charge neither sent
+  nor discarded, and the turn waiting on its ack for ever. With it, two minor: a guess confirmed
+  as its node returned was journaled after the node retired and never discarded, so a finished
+  run read as resumable; and such a turn was judged by when its task got round to its answer --
+  behind a drafter's guess -- not when it arrived. A node's return now finishes what of its
+  turns' guesses is being written, then squashes and discards the rest, and a turn is told its
+  answer arrived as it arrives.
+- And one in the docs' favour: a question already being written as its node returned was
+  refused, where the docs say it goes out. The node's return is looked at before the write only.
 
 ### What the twenty-sixth review found
 
