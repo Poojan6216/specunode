@@ -165,6 +165,16 @@ reading, or that failed, after blocks had reached it -- those stay unjournaled f
 that node writes nothing more; let it fail and resume. A `complete()` or `call_turn` that fails
 hands the node nothing of the turn, and does not block it.
 
+### A model call that fails raises `ModelError`
+
+Whatever the client raised -- the SDK's own error, a dropped connection, a reply cut off -- a
+node sees `specunode.ModelError`, with the client's error as its cause. That is what a resume
+serves back, and what a replay raises, at the same point: the failure is journaled as the turn's
+outcome, so a node that catches it and asks again is matched with its second question. Catch
+`ModelError`, not the client's own type: a node that catches the client's type is not the same
+node on resume. A turn the node stops waiting for -- its timeout, a cancel -- is journaled as
+cancelled too, and served as one that never answers, until the node stops waiting again.
+
 ## Speculation and node bodies
 
 **A speculative branch does not run your node bodies by default.** A node body is unbounded

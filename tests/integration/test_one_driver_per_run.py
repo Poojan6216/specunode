@@ -268,3 +268,24 @@ async def test_a_run_cancelled_while_taking_its_lock_is_not_left_held(tmp_path: 
         await holding
     with Journal(tmp_path / "journal.db").hold_run(RUN):
         pass
+
+
+async def test_a_run_cancelled_twice_while_taking_its_lock_gives_it_back(tmp_path: Path) -> None:
+    """The second cancel was swallowed and the lock left to the garbage collector. Found by the
+    thirteenth review."""
+    journal = SlowLock(tmp_path / "journal.db")
+
+    async def hold() -> None:
+        async with journal.hold_run_async(RUN):
+            await asyncio.Event().wait()
+
+    holding = asyncio.create_task(hold())
+    await asyncio.sleep(0.05)
+    holding.cancel()
+    await asyncio.sleep(0.05)
+    holding.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await holding
+    from specunode.journal.journal import _held_runs
+
+    assert not any(run == RUN for _location, run in _held_runs), "the run is still held"

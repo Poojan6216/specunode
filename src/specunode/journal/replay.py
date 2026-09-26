@@ -18,6 +18,7 @@ and feeding one back as an input would replay a decision the run never actually 
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -93,6 +94,9 @@ class JournaledTurn:
     speculative: bool
     #: The error the turn ended in, if it failed; a replay raises it again at the same point.
     failed: str | None = None
+    #: Its caller stopped waiting for it; a replay does not answer it either.
+    cancelled: bool = False
+    request_id: str = ""
 
 
 def _describe(value: JsonValue, limit: int = 120) -> str:
@@ -217,17 +221,24 @@ class ReplayModel:
             projected = request.get("request")
             key = (str(request.get("node_id") or ""), step)
             failed = payload.get("failed")
-            self._turns.setdefault(key, []).append(
-                JournaledTurn(
-                    step=step,
-                    branch_id=branch_id,
-                    request_hash=str(request.get("request_hash", "")),
-                    request=projected if isinstance(projected, Mapping) else {},
-                    response=response_from_json(response_payload),
-                    speculative=speculative,
-                    failed=failed if isinstance(failed, str) else None,
-                )
+            turn = JournaledTurn(
+                step=step,
+                branch_id=branch_id,
+                request_hash=str(request.get("request_hash", "")),
+                request=projected if isinstance(projected, Mapping) else {},
+                response=response_from_json(response_payload),
+                speculative=speculative,
+                failed=failed if isinstance(failed, str) else None,
+                cancelled=payload.get("cancelled") is True,
+                request_id=str(request_id),
             )
+            turns = self._turns.setdefault(key, [])
+            if turns and turns[-1].request_id == turn.request_id:
+                # A second outcome for one request -- the caller stopped waiting while the first
+                # was written -- is the last word on it.
+                turns[-1] = turn
+            else:
+                turns.append(turn)
 
     # -- the ModelClient surface ---------------------------------------------------------------
 
@@ -257,6 +268,8 @@ class ReplayModel:
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
         turn = self._turn_for(envelope, current_scope())
+        if turn.cancelled:
+            await asyncio.Event().wait()  # never answered; the caller stops waiting again
         if turn.failed is not None:
             raise ModelError(turn.failed)
         return turn.response
@@ -273,6 +286,8 @@ class ReplayModel:
         for index, block in enumerate(response.content):
             if isinstance(block, ToolUseBlock):
                 yield ToolUseComplete(index=index, block=block)
+        if turn.cancelled:
+            await asyncio.Event().wait()  # never finished; the caller stops waiting again
         if turn.failed is not None:
             # The turn failed in the run being replayed, after what it had streamed so far.
             raise ModelError(turn.failed)
@@ -333,8 +348,9 @@ class RecordedTurns:
     def __post_init__(self) -> None:
         pinned_before = self._last_send_per_branch()
         requests: dict[str, tuple[int, Mapping[str, JsonValue]]] = {}
-        # (node, position) -> branch -> [(asked at, request hash, request id, turn)]
-        attempts: dict[tuple[str, int], dict[str, list[tuple[int, str, str, RecordedTurn]]]] = {}
+        # Per request, its last outcome: an answer the caller stopped waiting for is followed by
+        # a second outcome saying so, and that is the one that counts.
+        outcomes: dict[str, tuple[tuple[str, int], str, int, str, RecordedTurn]] = {}
         for entry in self.journal.read(self.run_id, kinds=["model_request", "model_response"]):
             payload = entry.payload
             if payload.get("role") != self.role or payload.get("speculative"):
@@ -369,9 +385,20 @@ class RecordedTurns:
                 response=response_from_json(response),
                 offset=offset,
                 failed=failed if isinstance(failed, str) else None,
+                cancelled=payload.get("cancelled") is True,
             )
+            outcomes[request_id] = (
+                key,
+                branch,
+                asked_at,
+                str(payload.get("request_hash", "")),
+                turn,
+            )
+        # (node, position) -> branch -> [(asked at, request hash, request id, turn)]
+        attempts: dict[tuple[str, int], dict[str, list[tuple[int, str, str, RecordedTurn]]]] = {}
+        for request_id, (key, branch, asked_at, digest, turn) in outcomes.items():
             attempts.setdefault(key, {}).setdefault(branch, []).append(
-                (asked_at, str(payload.get("request_hash", "")), request_id, turn)
+                (asked_at, digest, request_id, turn)
             )
         pinned: set[str] = set()
         branches: set[str] = set()

@@ -395,3 +395,5 @@ async def test_a_run_that_lost_its_lock_between_attempts_sends_nothing_more(path
         outcome = str(exc)
     assert attempts == ["cus-1"], "a process that had lost the run sent it again"
     assert "lost its lock" in outcome, outcome
+    # Nor does it write that it finished: another process may be driving the run by now.
+    assert not list(journal.read(run_id, kinds=["run_finished"]))

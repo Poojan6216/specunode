@@ -562,6 +562,36 @@ class StoreBuffer:
             )
         return count
 
+    async def discard_unsent_and_journal(self, branch: Branch, reason: str) -> int:
+        """Discard what this branch staged and has not sent -- leaving what it sent alone.
+
+        For a branch part-way through its drains whose later writes can no longer go: what it
+        already sent is in the world and in the journal as sent, and is not "discarded".
+        """
+        settled = self._settled.get(branch.id, set())
+        live = self._staged.get(branch.id, [])
+        dropped = [effect for effect in live if effect.id not in settled]
+        live[:] = [effect for effect in live if effect.id in settled]
+        self._closed.add(branch.id)
+        for effect in dropped:
+            ack = self._acks.pop(effect.id, None)
+            if ack is not None and not ack.done():
+                ack.cancel()
+        if dropped:
+            await self.journal.append_async(
+                self.run_id,
+                "effect_discarded",
+                {
+                    "v": 1,
+                    "branch_id": branch.id,
+                    "step": branch.cursor.step_index,
+                    "effect_ids": [effect.id for effect in dropped],
+                    "count": len(dropped),
+                    "reason": reason,
+                },
+            )
+        return len(dropped)
+
     def pending(self, branch_id: str) -> tuple[StagedEffect, ...]:
         return tuple(self._staged.get(branch_id, ()))
 

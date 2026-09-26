@@ -541,3 +541,150 @@ async def test_replay_reproduces_a_turn_that_failed(tmp_path: Path) -> None:
     ).run(new_ulid(), {})
     assert replayed.ok, replayed.error
     assert charged == [25.0] and _again == [25.0]
+
+
+# -- a turn the node stopped waiting for -------------------------------------------------------
+
+
+class AnswersLate:
+    """Asked with little room, it is slow (``slow``) or answers at once; asked with more, it
+    answers with a charge of ``amount``."""
+
+    def __init__(self, amount: float, *, slow: bool) -> None:
+        self.amount = amount
+        self.slow = slow
+        self.asked: list[int | None] = []
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        raise NotImplementedError
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        self.asked.append(envelope.max_tokens)
+        if envelope.max_tokens == 64:
+            if self.slow:
+                await asyncio.Event().wait()
+            reply = charge(150.0)
+        else:
+            reply = charge(self.amount)
+        yield ToolUseComplete(index=0, block=reply.content[0])  # type: ignore[attr-defined]
+        yield TurnComplete(response=reply)  # type: ignore[arg-type]
+
+
+class SlowToWriteAnswers(CrashingJournal):
+    """The first answer takes a while to reach the disk -- an fsync under load."""
+
+    def __init__(self, path: Path, should_crash: Callable[[str, Mapping[str, JsonValue]], bool]):
+        super().__init__(path, should_crash)
+        self.slowed = False
+
+    async def append_async(self, run_id: str, kind: str, payload: Mapping[str, JsonValue]) -> int:
+        if kind == "model_response" and not self.slowed:
+            self.slowed = True
+            await asyncio.sleep(0.4)
+        return await super().append_async(run_id, kind, payload)
+
+
+def times_out() -> tuple[PlainAdapter, ToolRegistry, list[float]]:
+    charged: list[float] = []
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        charged.append(amount)
+        return {"charge_id": f"ch_{len(charged)}"}
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        try:
+            await asyncio.wait_for(session.call_turn(SMALL), timeout=0.2)  # type: ignore[misc]
+        except TimeoutError:  # the model is slow: ask again, with more room
+            await session.call_turn(ROOMY)  # type: ignore[misc]
+        session.state["billed"] = True
+        return ToolCall("charge_card", {})
+
+    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
+    return adapter, registry_of([charge_card]), charged
+
+
+@pytest.mark.parametrize("where", ["while_the_model_thinks", "while_the_answer_is_written"])
+async def test_a_turn_the_node_stopped_waiting_for_is_served_as_one(
+    tmp_path: Path, where: str
+) -> None:
+    """The node's timeout fires on its first question -- while the model is slow, or while the
+    answer is being written to disk -- and it asks again; the charge goes out, and the process
+    dies. A timed-out turn left no outcome, so a resume sent every later question to the live
+    model; and an answer written after the node gave up was on disk as though the node had
+    seen it, and a resume acted on it. Either way a second, different charge. The turn is
+    recorded as cancelled, and served as one that never answers. Found by the thirteenth
+    review."""
+    db = tmp_path / "source.db"
+    adapter, registry, charged = times_out()
+    run_id = new_ulid()
+    slow_model = where == "while_the_model_thinks"
+    journal_class = CrashingJournal if slow_model else SlowToWriteAnswers
+    with pytest.raises(Crash):
+        await scheduler(
+            journal_class(db, before_commit_of("bill#0")),
+            adapter,
+            registry,
+            AnswersLate(25.0, slow=slow_model),
+        ).run(run_id, {})
+    await bury_the_dead_process()
+    assert charged == [25.0]
+    cancelled = [
+        e.payload
+        for e in Journal(db).read(run_id, kinds=["model_response"])
+        if e.payload.get("cancelled")
+    ]
+    assert cancelled, "the question the node gave up on has no outcome"
+
+    changed_its_mind = AnswersLate(30.0, slow=False)
+    resumed = await scheduler(Journal(db), adapter, registry, changed_its_mind).resume(run_id)
+    assert resumed.ok, resumed.error
+    assert changed_its_mind.asked == [], "the resume asked the model what the journal answers"
+    assert charged == [25.0], "a second, different charge went out"
+
+
+async def test_replay_waits_out_a_turn_the_node_stopped_waiting_for(tmp_path: Path) -> None:
+    journal = Journal(tmp_path / "source.db")
+    adapter, registry, charged = times_out()
+    result = await scheduler(journal, adapter, registry, AnswersLate(25.0, slow=True)).run(
+        new_ulid(), {}
+    )
+    assert result.ok, result.error
+    adapter, registry, again = times_out()
+    replayed = await scheduler(
+        Journal(tmp_path / "replay.db"), adapter, registry, replay_of(journal, result.run_id)
+    ).run(new_ulid(), {})
+    assert replayed.ok, replayed.error
+    assert charged == [25.0] and again == [25.0]
+
+
+async def test_a_client_error_reaches_the_node_as_a_model_error(tmp_path: Path) -> None:
+    """A served failure is a ModelError, and the live one was the client's own error: a node
+    that caught the client's type ran differently on resume and in replay. Both are a
+    ModelError now, caused by the client's error. Found by the thirteenth review."""
+
+    class Resets:
+        async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+            raise ConnectionError("connection reset by peer")
+
+        def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            raise NotImplementedError
+
+    seen: list[BaseException] = []
+
+    @node(name="ask")
+    async def ask(session: RunSession) -> Decision:
+        try:
+            await session.model.complete(SMALL)  # type: ignore[union-attr]
+        except ModelError as exc:
+            seen.append(exc)
+        session.state["asked"] = True
+        return ToolCall("noop", {})
+
+    adapter = PlainAdapter.of([ask], lambda s: None if s.get("asked") else "ask")
+    result = await scheduler(Journal(tmp_path / "j.db"), adapter, registry_of([]), Resets()).run(
+        new_ulid(), {}
+    )
+    assert result.ok, result.error
+    assert len(seen) == 1 and isinstance(seen[0].__cause__, ConnectionError)

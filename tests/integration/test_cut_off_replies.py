@@ -246,3 +246,30 @@ async def test_an_api_error_is_a_model_error(streamed: bool) -> None:
         else:
             await model.complete(replace(ASK, stream=False))
     assert isinstance(raised.value.__cause__, anthropic.APIError)
+
+
+async def test_a_connection_dropped_mid_reply_is_a_model_error() -> None:
+    """A reset connection while the reply streams is raised by the HTTP client, not wrapped by
+    the SDK, so it went straight past a node catching ``ModelError``. Found by the thirteenth
+    review."""
+    from specunode.integrations.anthropic import AnthropicModel
+
+    class Resets(httpx.AsyncByteStream):  # type: ignore[misc,name-defined]
+        async def __aiter__(self):  # type: ignore[no-untyped-def]
+            yield START.encode()
+            yield call(0, '{"customer_id": "cus-1"', stopped=False).encode()
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+    def handler(request: object) -> object:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Resets())
+
+    sdk = anthropic.AsyncAnthropic(
+        api_key="offline",
+        base_url="http://offline.invalid",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(ModelError, match="RemoteProtocolError") as raised:
+        async for _event in AnthropicModel(client=sdk, cache=False).stream(ASK):
+            pass
+    assert isinstance(raised.value.__cause__, httpx.RemoteProtocolError)

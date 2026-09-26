@@ -317,3 +317,24 @@ def test_a_config_that_does_not_load_says_how_to_name_the_journal(
     assert refused.exit_code == 2 and "--journal" in refused.output, refused.output
     named = CliRunner().invoke(app, ["runs", "--journal", str(tmp_path / "j.db")])
     assert named.exit_code == 0 and named.output.split() == ["01NAMED"], named.output
+
+
+def test_a_config_that_names_no_journal_leaves_it_where_runs_write_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user-level config with no ``journal`` section sent every command to an empty journal
+    beside it, created as it was read, while ``Runtime`` writes ``./.specunode/journal.db``.
+    Only a path the config names is taken from the config's folder. Found by the thirteenth
+    review."""
+    xdg = tmp_path / "xdg"
+    (xdg / "specunode").mkdir(parents=True)
+    (xdg / "specunode" / "config.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+    work = tmp_path / "work"
+    (work / ".specunode").mkdir(parents=True)
+    event = {"v": 1, "event": "e", "reason": "r"}
+    Journal(work / ".specunode" / "journal.db").append("01HERE", "policy_event", event)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.chdir(work)
+    listed = CliRunner().invoke(app, ["runs"])
+    assert listed.output.split() == ["01HERE"], listed.output
+    assert not (xdg / "specunode" / ".specunode").exists()

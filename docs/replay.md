@@ -146,7 +146,10 @@ time. An answer that sent nothing is asked for again; there is nothing to protec
 failed -- a reply cut off or refused, a model that was overloaded -- is recorded as the failure
 it was and served again as that failure, and a replay raises it again at the same point: a node
 that caught it and asked again then asks its second question, and is matched with the answer to
-that. What a resume cannot keep the same is anything else that shapes a call: a read made again
+that. A turn the node stopped waiting for -- its timeout fired, or it was cancelled, even while
+the answer was being written -- is recorded as cancelled, and served as one that never answers,
+until the node stops waiting again. What a resume cannot keep the same is anything else that
+shapes a call: a read made again
 that returns something new, a timestamp, code that changed. Then a different call at the same
 position gets a different key, and the world receives it as well.
 

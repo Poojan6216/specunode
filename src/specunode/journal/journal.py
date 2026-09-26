@@ -1106,8 +1106,12 @@ class Journal:
         try:
             await asyncio.shield(taking)
         except asyncio.CancelledError:
-            with contextlib.suppress(BaseException):
-                await taking
+            # However many times the caller is cancelled meanwhile: the attempt is let finish,
+            # and what it took is given back -- not left to the garbage collector.
+            while not taking.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait({taking})
+            if not taking.cancelled() and taking.exception() is None:
                 held.__exit__(None, None, None)
             raise
         try:

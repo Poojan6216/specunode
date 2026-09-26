@@ -32,6 +32,8 @@ still change the hash even though the id itself changes no token the model condi
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
@@ -565,6 +567,14 @@ class RecordedTurn:
     #: The error the turn ended in, if it failed -- raised again when it is served, so a node
     #: that caught it and asked again is matched with what it asked the second time.
     failed: str | None = None
+    #: The caller stopped waiting before it had the whole turn -- a timeout, a cancel. Served
+    #: as a turn that never finishes: what the caller saw of it, then nothing, until it stops
+    #: waiting again.
+    cancelled: bool = False
+
+
+#: The outcome recorded for a turn its caller stopped waiting for.
+CANCELLED = "cancelled: the caller stopped waiting before the turn was handed over"
 
 
 def _failure_text(exc: BaseException) -> str:
@@ -709,6 +719,7 @@ class JournaledModel:
         recorded: RecordedTurn | None = None,
         *,
         failed: str | None = None,
+        cancelled: bool = False,
     ) -> None:
         if failed is None:
             decisions = decisions_of(response)
@@ -726,6 +737,8 @@ class JournaledModel:
             # went to the live model -- whose answer could differ from one that already sent
             # something.
             decided = {"decision": None, "decisions": [], "end_of_turn": False, "failed": failed}
+            if cancelled:
+                decided["cancelled"] = True
         await self._journal.append_async(
             scope.run_id,
             "model_response",
@@ -749,6 +762,75 @@ class JournaledModel:
             },
         )
 
+    async def _outcome(
+        self,
+        response: ModelResponse,
+        scope: CallScope,
+        request_id: str,
+        digest: str,
+        latency_ms: int,
+        recorded: RecordedTurn | None = None,
+        *,
+        failed: str | None = None,
+    ) -> None:
+        """Journal a turn's outcome -- and if the caller stops waiting while it is written, say so.
+
+        The write runs on the journal's own thread and finishes whatever the caller does: a
+        node whose timeout fired during it never saw the answer, and it was on disk as though
+        it had. A resume then served that answer to the question the node had given up on, and
+        the node acted on it as well as on the answer it asked for next. So the write is let
+        finish, and a second outcome records that the turn was never handed over.
+        """
+        writing = asyncio.ensure_future(
+            self._journal_response(
+                response, scope, request_id, digest, latency_ms, recorded, failed=failed
+            )
+        )
+        try:
+            await asyncio.shield(writing)
+        except asyncio.CancelledError:
+            with contextlib.suppress(BaseException):
+                await writing
+            await self._cancelled(response, scope, request_id, digest, latency_ms, recorded)
+            raise
+
+    async def _cancelled(
+        self,
+        response: ModelResponse,
+        scope: CallScope,
+        request_id: str,
+        digest: str,
+        latency_ms: int,
+        recorded: RecordedTurn | None = None,
+    ) -> None:
+        """Record that the caller stopped waiting -- a timeout, a cancel -- before it had the turn.
+
+        Left unrecorded, the question had no outcome: on resume it matched nothing, and every
+        question the node asked after it went to the live model, which could decide
+        differently and charge again. Written to the end even if the caller is cancelled again.
+        """
+        writing = asyncio.ensure_future(
+            self._journal_response(
+                response,
+                scope,
+                request_id,
+                digest,
+                latency_ms,
+                recorded,
+                failed=CANCELLED,
+                cancelled=True,
+            )
+        )
+        with contextlib.suppress(BaseException):
+            await asyncio.shield(writing)
+        if not writing.done():
+            with contextlib.suppress(BaseException):
+                await writing
+
+    async def _never_answers(self) -> None:
+        """A served turn that never finished the first time does not finish now either."""
+        await asyncio.Event().wait()
+
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
         scope = current_scope()
         digest = request_hash(envelope)
@@ -760,7 +842,13 @@ class JournaledModel:
         try:
             if recorded is not None:
                 served = recorded.response
-                await self._journal_response(
+                if recorded.cancelled:
+                    try:
+                        await self._never_answers()
+                    except asyncio.CancelledError:
+                        await self._cancelled(served, scope, request_id, digest, 0, recorded)
+                        raise
+                await self._outcome(
                     served, scope, request_id, digest, 0, recorded, failed=recorded.failed
                 )
                 if recorded.failed is not None:
@@ -771,15 +859,23 @@ class JournaledModel:
             try:
                 response = await self._inner.complete(envelope)
                 refuse_cut_off(response)
+            except asyncio.CancelledError:
+                empty = ModelResponse(model=envelope.model, stop_reason="error")
+                latency_ms = int((time.monotonic() - started) * 1000)
+                await self._cancelled(response or empty, scope, request_id, digest, latency_ms)
+                raise
             except Exception as exc:
                 failed = response or ModelResponse(model=envelope.model, stop_reason="error")
                 latency_ms = int((time.monotonic() - started) * 1000)
-                await self._journal_response(
-                    failed, scope, request_id, digest, latency_ms, failed=_failure_text(exc)
-                )
-                raise
+                failure = _failure_text(exc)
+                await self._outcome(failed, scope, request_id, digest, latency_ms, failed=failure)
+                if isinstance(exc, ModelError):
+                    raise
+                # What a served failure raises, so a node that catches it does so the same way
+                # live, on resume and in replay; the client's own error is its cause.
+                raise ModelError(failure) from exc
             latency_ms = int((time.monotonic() - started) * 1000)
-            await self._journal_response(response, scope, request_id, digest, latency_ms)
+            await self._outcome(response, scope, request_id, digest, latency_ms)
             return response
         finally:
             # Nothing of the turn reaches the caller before its response is on disk.
@@ -813,14 +909,21 @@ class JournaledModel:
                 # The recorded turn's blocks, in order and with no delay, as a live stream
                 # would emit them -- so early issue sees a served turn as it saw the original.
                 response = recorded.response
-                for index, block in enumerate(response.content):
-                    if isinstance(block, ToolUseBlock):
-                        handed_over = True
-                        yield ToolUseComplete(index=index, block=block)
-                    elif isinstance(block, TextBlock):
-                        handed_over = True
-                        yield TextDelta(index=index, text=block.text)
-                await self._journal_response(
+                try:
+                    for index, block in enumerate(response.content):
+                        if isinstance(block, ToolUseBlock):
+                            handed_over = True
+                            yield ToolUseComplete(index=index, block=block)
+                        elif isinstance(block, TextBlock):
+                            handed_over = True
+                            yield TextDelta(index=index, text=block.text)
+                    if recorded.cancelled:
+                        await self._never_answers()
+                except (asyncio.CancelledError, GeneratorExit):
+                    if recorded.cancelled:
+                        await self._cancelled(response, scope, request_id, digest, 0, recorded)
+                    raise
+                await self._outcome(
                     response, scope, request_id, digest, 0, recorded, failed=recorded.failed
                 )
                 if recorded.failed is not None:
@@ -832,6 +935,8 @@ class JournaledModel:
                 return
             started = time.monotonic()
             completed = False
+            #: An outcome is on disk, or will be: a turn has exactly one, the last word.
+            recorded_outcome = False
             blocks: dict[int, ContentBlock] = {}
             texts: dict[int, list[str]] = {}
             final: ModelResponse | None = None
@@ -841,9 +946,8 @@ class JournaledModel:
                         final = event.response
                         refuse_cut_off(event.response)
                         latency_ms = int((time.monotonic() - started) * 1000)
-                        await self._journal_response(
-                            event.response, scope, request_id, digest, latency_ms
-                        )
+                        recorded_outcome = True
+                        await self._outcome(event.response, scope, request_id, digest, latency_ms)
                         completed = True
                         if track is not None:
                             track(-1)
@@ -860,20 +964,32 @@ class JournaledModel:
                     # a failure: read as a complete turn, it let a confirmed guess's write go
                     # out with no decision on disk.
                     raise ModelError("the model's stream ended without completing its turn")
-            except Exception as exc:
-                if not completed:
-                    # What of the reply reached the caller is recorded with the failure, and
-                    # served again before it, so a resumed node sees what this one saw.
+            except (asyncio.CancelledError, GeneratorExit):
+                # The caller stopped waiting -- its timeout, or it stopped reading -- before the
+                # turn was handed over. What it saw of the reply is recorded with that.
+                if not recorded_outcome:
                     latency_ms = int((time.monotonic() - started) * 1000)
-                    await self._journal_response(
-                        final or _partial_response(envelope, blocks, texts),
-                        scope,
-                        request_id,
-                        digest,
-                        latency_ms,
-                        failed=_failure_text(exc),
-                    )
+                    seen = final or _partial_response(envelope, blocks, texts)
+                    await self._cancelled(seen, scope, request_id, digest, latency_ms)
                 raise
+            except Exception as exc:
+                if recorded_outcome:
+                    raise
+                # What of the reply reached the caller is recorded with the failure, and
+                # served again before it, so a resumed node sees what this one saw.
+                latency_ms = int((time.monotonic() - started) * 1000)
+                failure = _failure_text(exc)
+                await self._outcome(
+                    final or _partial_response(envelope, blocks, texts),
+                    scope,
+                    request_id,
+                    digest,
+                    latency_ms,
+                    failed=failure,
+                )
+                if isinstance(exc, ModelError):
+                    raise
+                raise ModelError(failure) from exc
         except BaseException:
             # A turn that failed before the caller saw any of it left nothing to act on, and
             # neither did one read by call_turn, which hands a failed turn to nobody. One a

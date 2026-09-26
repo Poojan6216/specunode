@@ -477,3 +477,118 @@ async def test_a_guessed_read_after_a_write_is_rechecked_like_an_early_one(
     assert not result.ok and "went stale" in (result.error or ""), result.error
     assert sent == [], "a charge went out on a read that had gone stale"
     assert build_ledger(journal, result.run_id).reads_validated.stale == 1
+
+
+@pytest.mark.parametrize("speculation", [False, True])
+async def test_a_read_made_after_the_nodes_first_write_is_rechecked(
+    tmp_path: Path, speculation: bool
+) -> None:
+    """A deposit first; then, in a later turn, a note and a stock read -- issued early, or
+    guessed -- that goes stale before the turn ends; then the final charge. The re-check ran
+    once, when the node first parked, so the final charge went out on the stale read and the
+    ledger said 0 stale. Reads are re-checked before each later write now: the deposit stays
+    sent, what the node staged since -- the note, parked on when the read was already stale --
+    is discarded unsent, and the run stops for a resume to decide again. Found by the
+    thirteenth review."""
+    import asyncio
+    from collections.abc import AsyncIterator
+
+    from specunode.core.decision import Decision, ToolCall
+    from specunode.core.graph import RunSession
+    from specunode.core.model import (
+        Message,
+        RequestEnvelope,
+        StreamEvent,
+        TextBlock,
+        ToolUseComplete,
+        TurnComplete,
+    )
+    from specunode.drafters.base import Prediction
+    from specunode.integrations.plain import PlainAdapter, node, registry_of, tool
+    from specunode.journal.ledger import build_ledger
+
+    deposit = ("charge", {"customer_id": "cus-1", "amount": 1.0})
+    note = ("post_note", {"channel": "#ops", "text": "checking stock"})
+    stock = ("get_stock", {"item": "item-7"})
+    final = ("charge", {"customer_id": "cus-1", "amount": 9.0})
+    turns = [(deposit,), (note, stock), (final,)]
+    version = {"item-7": 1}
+    reads: list[int] = []
+    sent: list[str] = []
+
+    @tool(effect=EffectClass.READ, witness=True, forward_keys="item:{args.item}")
+    async def get_stock(item: str) -> JsonValue:
+        reads.append(version[item])
+        return {"value": {"item": item, "stock": 3}, "witness": version[item]}
+
+    @tool(effect=EffectClass.WRITE, forward_keys="customer:{args.customer_id}")
+    async def charge(customer_id: str, amount: float) -> JsonValue:
+        sent.append(f"charge {amount}")
+        return {"charge_id": f"ch_{len(sent)}"}
+
+    @tool(effect=EffectClass.WRITE, forward_keys="channel:{args.channel}")
+    async def post_note(channel: str, text: str) -> JsonValue:
+        sent.append("note")
+        return {"posted": True}
+
+    class GuessesTheStock:
+        async def predict(self, context: object) -> list[Prediction]:
+            history = getattr(context, "history", ())
+            if history and history[-1].name == "post_note":
+                return [Prediction(decision=ToolCall(*stock), tier=1, score=0.9)]
+            return []
+
+    class Model:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def complete(self, envelope: RequestEnvelope) -> object:
+            raise NotImplementedError
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            calls = turns[self.turn]
+            self.turn += 1
+            reply = tool_turn(*calls)
+            for index, block in enumerate(reply.content):
+                yield ToolUseComplete(index=index, block=block)  # type: ignore[arg-type]
+            if stock in calls:
+                for _ in range(5000):  # this turn's read has run, early or guessed
+                    if reads:
+                        break
+                    await asyncio.sleep(0.001)
+                version["item-7"] += 1  # and the stock changes before the turn ends
+            yield TurnComplete(response=reply)
+
+    @node(name="act")
+    async def act(session: RunSession) -> Decision:
+        for index in range(len(turns)):
+            await session.call_turn(  # type: ignore[misc]
+                RequestEnvelope(
+                    model="m",
+                    messages=(Message(role="user", content=(TextBlock(text=f"{index}"),)),),
+                    stream=True,
+                )
+            )
+        session.state["done"] = True
+        return ToolCall("x", {})
+
+    registry = registry_of([get_stock, charge, post_note])
+    journal = Journal(tmp_path / "journal.db")
+    scheduler = Scheduler(
+        graph=PlainAdapter.of([act], lambda s: None if s.get("done") else "act"),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(Model(), journal),  # type: ignore[arg-type]
+        policy=Policy(speculation=speculation),
+        predictor=GuessesTheStock() if speculation else None,  # type: ignore[arg-type]
+    )
+    result = await scheduler.run(new_ulid(), {})
+    assert reads == [1, 2], reads  # the read, then the re-check that found it stale
+    assert not result.ok and "went stale" in (result.error or ""), result.error
+    assert sent == ["charge 1.0"], "a write went out on a read that had gone stale"
+    ledger = build_ledger(journal, result.run_id)
+    assert ledger.reads_validated.stale == 1
+    discarded = [e.payload for e in journal.read(result.run_id, kinds=["effect_discarded"])]
+    assert [d["reason"] for d in discarded] == ["stale_read"]

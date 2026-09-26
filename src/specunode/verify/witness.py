@@ -157,7 +157,9 @@ async def _probe(record: ReadRecord, spec: ToolSpec, branch: Branch) -> ReadVerd
     )
 
 
-async def validate_reads(branch: Branch, registry: ToolRegistry) -> ReadValidation:
+async def validate_reads(
+    branch: Branch, registry: ToolRegistry, *, skip: int = 0
+) -> ReadValidation:
     """Re-check every witnessed read this branch made while it was still a guess.
 
     The probes run **concurrently**. They used to run one after another, and each one is a real
@@ -177,7 +179,8 @@ async def validate_reads(branch: Branch, registry: ToolRegistry) -> ReadValidati
     reported ``unreadable`` -- counted, journaled and rendered, never assumed fresh -- and then
     handled by ``Policy.on_unverifiable_read``. Where that matters, set it to ``"squash"``.
     """
-    records = list(branch.reads_to_validate())
+    # ``skip``: the reads a check earlier in the same retirement already covered.
+    records = list(branch.reads_to_validate())[skip:]
     probes: list[tuple[int, ReadRecord, ToolSpec]] = []
     verdicts: list[ReadVerdict | None] = [None] * len(records)
 

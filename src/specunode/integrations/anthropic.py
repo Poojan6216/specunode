@@ -293,16 +293,28 @@ class AnthropicModel:
 
 
 def _api_errors() -> tuple[type[BaseException], ...]:
-    """The SDK's API errors -- a refused request, a rate limit, a dropped connection.
+    """The SDK's API errors -- a refused request, a rate limit -- and its transport's.
 
     Raised as :class:`ModelError`, the one type the runtime records a failed turn as and a
-    node catches to ask again, instead of whichever of the SDK's own types this was.
+    node catches to ask again, instead of whichever of the SDK's own types this was. The
+    transport's own: a connection dropped while the reply streams is raised by the HTTP
+    client, not wrapped by the SDK, and it is the commonest failure there is.
     """
+    errors: list[type[BaseException]] = []
     try:
         from anthropic import APIError
     except ImportError:  # pragma: no cover - the client could not have been built
         return ()
-    return (APIError,)
+    errors.append(APIError)
+    for transport in ("httpx2", "httpx"):
+        try:
+            module = __import__(transport)
+        except ImportError:
+            continue
+        http_error = getattr(module, "HTTPError", None)
+        if isinstance(http_error, type) and issubclass(http_error, BaseException):
+            errors.append(http_error)
+    return tuple(errors)
 
 
 def _stop_reason(message: object) -> str:

@@ -42,10 +42,13 @@ does not hide either number and does not net them off against the latency it sav
 ## Reads without a witness cannot be checked for staleness
 
 A branch reads, then time passes, then the model's decision confirms the branch. Between those
-two moments the value may have changed. A read that returns a version or ETag can be re-checked
-before the branch retires; a read that does not, cannot, and is reported as **unwitnessed**
-rather than as fresh. That distinction is the honest number, and the benchmark publishes the
-fraction of stale reads that were undetectable rather than only the fraction it caught.
+two moments the value may have changed. A read that returns a version or ETag is re-checked
+before each write the node sends -- the first, and every later one, against the reads made since
+the last check; one that went stale stops the node there, what it sent before stays sent, and
+what it staged since is discarded, unsent, for a resume to decide again. A read that does not
+return a witness cannot be re-checked, and is reported as **unwitnessed** rather than as fresh.
+That distinction is the honest number, and the benchmark publishes the fraction of stale reads
+that were undetectable rather than only the fraction it caught.
 
 ## Dispatch is at-least-once, and the ambiguous window is real
 

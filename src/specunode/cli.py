@@ -106,7 +106,12 @@ def _journal_location(
     if settings.kind == "postgres":
         return settings.dsn or os.environ.get("SPECUNODE_JOURNAL_DSN", "")
     path = settings.path.expanduser()
-    return str(path if path.is_absolute() else source.parent / path)
+    if path.is_absolute() or "path" not in settings.model_fields_set:
+        # A config that names no journal path means the default, where ``Runtime`` writes it:
+        # under the working directory, not under wherever the config was found -- a config in
+        # $XDG_CONFIG_HOME sent every command to an empty journal beside it.
+        return str(path)
+    return str(source.parent / path)
 
 
 def _version_callback(value: bool) -> None:

@@ -67,7 +67,7 @@ from specunode.core.state import (
 )
 from specunode.drafters.base import DraftContext, Drafter
 from specunode.ids import new_ulid
-from specunode.journal.journal import Journal
+from specunode.journal.journal import Journal, RunBusy
 from specunode.journal.ledger import Ledger, build_ledger
 from specunode.journal.replay import OpenGroup, RecordedTurns, recover
 from specunode.verify.gate import resolve_decision
@@ -1365,6 +1365,45 @@ class Scheduler:
         self.counters.context_divergences += 1
         return 0
 
+    async def _recheck_reads(self, branch: Branch, checked: int) -> tuple[int, str | None]:
+        """Check the reads a node made since its last check, before its next write is sent.
+
+        Returns how many reads are now checked, and -- if one went stale and the policy says
+        to refuse -- why, having discarded the writes the node staged since, unsent.
+        """
+        if len(branch.reads_to_validate()) <= checked:
+            return checked, None
+        later = await validate_reads(branch, self.registry, skip=checked)
+        checked += len(later.verdicts)
+        await self.journal.append_async(
+            self.run_id,
+            "read_validated",
+            {
+                "v": 1,
+                "branch_id": branch.id,
+                "step": branch.cursor.step_index,
+                "fresh": later.fresh,
+                "stale": later.stale,
+                "unwitnessed": later.unwitnessed,
+                "unreadable": later.unreadable,
+                "total": len(later.verdicts),
+                "probes": later.probes,
+            },
+        )
+        self.counters.reads_validated += later.fresh
+        self.counters.reads_stale += later.stale
+        refuse = later.stale and self.policy.on_stale_read == "squash"
+        refuse = refuse or (later.unreadable and self.policy.on_unverifiable_read == "squash")
+        if not refuse:
+            return checked, None
+        self.counters.effects_discarded += await self.buffer.discard_unsent_and_journal(
+            branch, "stale_read"
+        )
+        detail = f"{later.stale} witnessed read(s) went stale"
+        if later.unreadable:
+            detail = f"{later.stale} read(s) stale and {later.unreadable} unreadable"
+        return checked, detail
+
     async def _retire(
         self,
         branch: Branch,
@@ -1456,6 +1495,11 @@ class Scheduler:
         task = branch.task
         ok = True
         undrained: tuple[str, ...] = ()
+        # Reads checked so far. The check above ran when the node first parked; a node that
+        # reads again and parks on a later write has its new reads checked before that write
+        # goes -- once, it let a write decided on a stale read out, and the ledger said 0 stale.
+        checked = len(validation.verdicts)
+        went_stale: str | None = None
         while True:
             report = await self.buffer.drain(
                 branch,
@@ -1471,6 +1515,9 @@ class Scheduler:
                 break
             self._park_event(branch.id).clear()
             outcome = await self._quiesce(branch, task)
+            checked, went_stale = await self._recheck_reads(branch, checked)
+            if went_stale is not None:
+                break
             if outcome is not BranchOutcome.PARKED:
                 # The node finished. Anything it staged on the way out is picked up by one
                 # more pass, which then finds nothing new and stops.
@@ -1486,6 +1533,18 @@ class Scheduler:
                 self.counters.effects_dead_lettered += final.count(EffectOutcome.DEAD_LETTER)
                 break
 
+        if went_stale is not None:
+            # What it sent before stays sent; the write it staged since was discarded unsent,
+            # and the node is stopped. A resume runs it again, reading afresh.
+            self.buffer.close(branch)
+            if isinstance(task, asyncio.Task) and not task.done():
+                task.cancel()
+                await asyncio.wait({task})
+            raise SchedulerError(
+                f"node {node_id}: {went_stale} after its first write was sent, so the write "
+                "that followed was not sent -- discarded, for a resume to decide again on "
+                "fresh reads"
+            )
         if isinstance(task, asyncio.Task) and not task.done():
             # Refuse its next write before cancelling it, and wait for it to stop: a node left
             # running here outlived the run, and one whose ``finally`` writes would park on an
@@ -1786,6 +1845,12 @@ class Scheduler:
     async def _journal_run_finished(
         self, ok: bool, error: str | None, steps: int, committed: CommittedState
     ) -> None:
+        try:
+            await self.journal.check_run_lock(self.run_id)
+        except RunBusy:
+            # The run's lock went while it ran, and another process may be driving it now: a
+            # "finished" written from here would land in the middle of that process's run.
+            return
         await self.journal.append_async(
             self.run_id,
             "run_finished",
