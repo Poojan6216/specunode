@@ -100,30 +100,56 @@ class PositionRuleMismatch(RuntimeError):
     """
 
 
-def position_rule_problem(journal: Journal, run_id: str) -> str | None:
-    """Why ``run_id`` cannot be resumed or replayed under this position rule, if it cannot."""
-    rules: set[int] = set()
-    unplaced = False
-    for entry in journal.read(run_id, kinds=["run_started", "model_response"]):
+def position_rule_problem(journal: Journal, run_id: str, *, replay: bool = False) -> str | None:
+    """Why ``run_id`` cannot be resumed (or, with ``replay``, replayed) under this position rule.
+
+    Only a turn that could have taken positions matters: one the target model streamed -- as
+    ``call_turn`` does -- that did not complete, with a tool call in it, recorded while another
+    rule was in force (the ``run_started`` before it says which). And for a resume, only in a
+    node that has not retired: a retired one's positions are its journaled ``cursor_after``,
+    whatever rule counted them. Looked at over the whole run instead, a run whose later part
+    this version had recorded was refused -- and the version that recorded its start, followed
+    as advised, charged twice.
+    """
+    rule = 1  # in force until a ``run_started`` says otherwise: none recorded it before 2
+    asked: dict[str, bool] = {}  # request id -> the target model was asked with a stream
+    under_another: list[str] = []  # branches with such a turn, recorded under another rule
+    retired: set[str] = set()
+    for entry in journal.read(
+        run_id, kinds=["run_started", "model_request", "model_response", "branch_resolved"]
+    ):
         payload = entry.payload
         if entry.kind == "run_started":
-            rule = payload.get("positions")
-            rules.add(rule if isinstance(rule, int) and not isinstance(rule, bool) else 1)
-        elif payload.get("failed") is not None:
+            recorded = payload.get("positions")
+            rule = recorded if isinstance(recorded, int) and not isinstance(recorded, bool) else 1
+        elif entry.kind == "model_request":
+            asked[str(payload.get("request_id"))] = (
+                payload.get("role") == "target" and payload.get("stream") is True
+            )
+        elif entry.kind == "branch_resolved":
+            if payload.get("status") == "retired":
+                retired.add(str(payload.get("branch_id")))
+        elif (
+            rule != POSITION_RULE
+            and payload.get("failed") is not None
+            and asked.get(str(payload.get("request_id")), False)
+        ):
             response = payload.get("response")
             blocks = response.get("content") if isinstance(response, Mapping) else None
             if isinstance(blocks, Sequence) and any(
                 isinstance(block, Mapping) and block.get("kind") == "tool_use" for block in blocks
             ):
-                unplaced = True
-    if rules <= {POSITION_RULE} or not unplaced:
+                under_another.append(str(payload.get("branch_id")))
+    if not replay:
+        under_another = [branch for branch in under_another if branch not in retired]
+    if not under_another:
         return None
     return (
-        f"run {run_id} was recorded by an earlier version of SpecuNode (position rule "
-        f"{min(rules)}; this is {POSITION_RULE}), and it has a model turn that did not complete "
-        "with tool calls in it. The two place the calls after such a turn at different program "
-        "positions, so a write already sent could go out again under a new key: resume or "
-        "replay it with the version that recorded it."
+        f"run {run_id} has a model turn that did not complete, with tool calls in it, recorded by "
+        f"an earlier version of SpecuNode under another rule for where the calls after such a "
+        f"turn sit (this is rule {POSITION_RULE}). Placed under this rule, a write already sent "
+        "could go out again under a new key: resume or replay it with the version that "
+        "recorded that turn."
     )
 
 
@@ -144,7 +170,7 @@ class JournaledTurn:
     latency_ms: int = 0
     node_ms: int = 0
     pieces: tuple[tuple[int, int, int], ...] | None = None
-    ask_ms: int = 0
+    ask_ms: int = -1
     #: The entry its outcome was recorded in -- where it came back among its attempt's other
     #: turns. That attempt's own entry, not the one a turn it was served was first recorded in:
     #: those kept an earlier attempt's order while the turns it asked live took new offsets, so
@@ -223,7 +249,7 @@ class ReplayModel:
     _pacer: _Pacer = field(default_factory=_Pacer, init=False)
 
     def __post_init__(self) -> None:
-        problem = position_rule_problem(self.journal, self.run_id)
+        problem = position_rule_problem(self.journal, self.run_id, replay=True)
         if problem is not None:
             raise PositionRuleMismatch(problem)
         self._load()
@@ -297,7 +323,7 @@ class ReplayModel:
                 latency_ms=_as_latency(payload.get("latency_ms")),
                 node_ms=_as_latency(payload.get("node_ms")),
                 pieces=_as_pieces(payload.get("pieces")),
-                ask_ms=_as_latency(payload.get("ask_ms")),
+                ask_ms=_as_ms(payload.get("ask_ms")),
                 offset=entry.offset,
             )
             outcomes[str(request_id)] = (key, turn)
@@ -343,7 +369,7 @@ class ReplayModel:
         try:
             asked_at = await _asked(turn)
             if turn.cancelled:
-                await _served_never_answers(_recorded(turn), scope, REPLAY_HINT)
+                await _served_never_answers(_recorded(turn), scope, REPLAY_HINT, asked_at)
             await self._pacer.due(key, turn.offset, asked_at, turn.latency_ms, scope)
         finally:
             # However the call ended: a later answer of the node may be waiting for this one.
@@ -373,7 +399,7 @@ class ReplayModel:
                     await _sleep_until(asked_at + at / 1000.0)
                 yield event
             if turn.cancelled:
-                await _served_never_answers(_recorded(turn), scope, REPLAY_HINT)
+                await _served_never_answers(_recorded(turn), scope, REPLAY_HINT, asked_at)
             await self._pacer.due(key, turn.offset, asked_at, turn.latency_ms, scope)
         finally:
             # However the stream ended -- read to its end, closed part-way, abandoned.
@@ -486,7 +512,7 @@ class RecordedTurns:
                 latency_ms=_as_latency(payload.get("latency_ms")),
                 node_ms=_as_latency(payload.get("node_ms")),
                 pieces=_as_pieces(payload.get("pieces")),
-                ask_ms=_as_latency(payload.get("ask_ms")),
+                ask_ms=_as_ms(payload.get("ask_ms")),
                 attempt=branch,
                 order=entry.offset,
             )
@@ -610,6 +636,11 @@ def _pace_key(scope: CallScope, attempt: str) -> tuple[str, int, str]:
     before that point is over before any after it is asked -- the order is the node's own.
     """
     return (scope.node_id, scope.step, attempt)
+
+
+def _as_ms(value: JsonValue) -> int:
+    """A recorded duration in ms, or -1 where none was recorded."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else -1
 
 
 def _as_latency(value: JsonValue) -> int:

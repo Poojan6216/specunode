@@ -46,6 +46,7 @@ from specunode.core.graph import END, GraphAdapter, NodeRef, Parallel, RunSessio
 from specunode.core.hazards import Hazard, analyse, keys_conflict, keys_touched
 from specunode.core.model import (
     CallScope,
+    Drive,
     ModelClient,
     ModelError,
     ModelResponse,
@@ -249,6 +250,20 @@ class BranchTools:
             raise TurnAbandoned(
                 f"the run node {self._node_id} belonged to is over; its {name} is not made"
             )
+        if branch.status is BranchStatus.RETIRED:
+            # Its node is done, and the run has carried on from the position its retirement
+            # journaled: a call it left running would take a position no one accounts for.
+            raise TurnAbandoned(
+                f"node {self._node_id} has retired; a call it left running ({name}) is not made"
+            )
+        if step is None and branch.turns_in_flight:
+            raise SchedulerError(
+                f"node {self._node_id} called {name} while one of its model turns (call_turn) "
+                "was under way. A node's calls take program positions in order, and one made "
+                "during a turn took a position among the turn's own -- at another place on a "
+                "resume, under another key. Await the turn first; to ask the model on the "
+                "side, use session.model.complete(), which takes no position."
+            )
         if branch.abandoned:
             # Said plainly, not as the closed buffer's own refusal.
             raise TurnAbandoned(
@@ -372,7 +387,7 @@ class Scheduler:
     _driven: str | None = field(default=None, repr=False)
     #: This drive of it -- one run, or one resume -- as the calls it makes carry it: once it
     #: ends, the model writes nothing more for them (``JournaledModel.end_drive``).
-    _drive: str = field(default_factory=new_ulid, repr=False)
+    _drive: Drive = field(default_factory=Drive, repr=False)
 
     # -- bookkeeping the ports call back into ------------------------------------------------
 
@@ -515,6 +530,10 @@ class Scheduler:
             # branch), which attack 7.2 reports but which is not a guess -- charging those
             # closed the gate on runs that had no predictor at all.
             self.budget.record_speculative_read()
+        if drive_over(self._drive):
+            # Still running when the run ended: its result is not written into a run that is
+            # over, nor into a later resume of it.
+            raise TurnAbandoned(f"the run is over; the result of {call.name} is not recorded")
         await self.journal.append_async(
             self.run_id,
             "tool_result",
@@ -685,7 +704,9 @@ class Scheduler:
                     error = _not_retired(node.name, branch)
                 if updated is not None:
                     committed = updated
-                cursor = branch.cursor
+                # Where its retirement said the run carries on from -- not the cursor now: a
+                # turn the node never waited for could still move it.
+                cursor = branch.retired_cursor or branch.cursor
                 self._committed, self._cursor = committed, cursor
                 steps += 1
                 if not ok:
@@ -941,7 +962,7 @@ class Scheduler:
             raise SchedulerError(
                 f"node {node_id} did not retire: {branch.reason or 'no reason recorded'}"
             )
-        self._cursor = branch.cursor
+        self._cursor = branch.retired_cursor or branch.cursor
         self._steps += 1
         # LangGraph owns reducers and channel semantics, and a second copy in the journal would
         # be a second answer to what the run's state is. docs/replay.md says so.
@@ -1128,7 +1149,10 @@ class Scheduler:
                 error = _not_retired(node.name, branch)
                 await self._abandon_lanes(*rest, error)
                 return _GroupOutcome(False, error, committed, cursor_after(), index + 1)
-        return _GroupOutcome(True, None, committed, cursor_after(), len(lanes))
+        # The cursor the last lane's retirement journaled -- not one worked out again now, when a
+        # turn a lane left running may have moved a lane's cursor since.
+        journaled = branches[-1].retired_cursor if branches else None
+        return _GroupOutcome(True, None, committed, journaled or cursor_after(), len(lanes))
 
     async def _close_failed_lane(
         self, node: NodeRef, node_id: str, branch: Branch, exc: Exception
@@ -1726,6 +1750,8 @@ class Scheduler:
         if committed is not None:
             new_committed = await self._commit(branch, committed, reducers or {}, claimed)
 
+        journaled = cursor_after() if cursor_after is not None else branch.cursor
+        branch.retired_cursor = journaled
         branch.retire()
         self._retire_seq += 1
         self.counters.branches_retired += 1
@@ -1742,9 +1768,7 @@ class Scheduler:
                 # verbatim rather than inferring it from the highest step it can see: inferring
                 # lands the resumed run at a different position, so every key it derives differs
                 # from the pre-crash one, the dedupe table misses, and the effects go out twice.
-                "cursor_after": _cursor_payload(
-                    cursor_after() if cursor_after is not None else branch.cursor
-                ),
+                "cursor_after": _cursor_payload(journaled),
             },
         )
         return ok, new_committed
@@ -1810,9 +1834,22 @@ class Scheduler:
         async def call_turn(envelope: object) -> Sequence[JsonValue]:
             if not isinstance(envelope, RequestEnvelope):
                 raise SchedulerError("call_turn needs a RequestEnvelope")
+            if branch.status is BranchStatus.RETIRED or drive_over(self._drive):
+                raise TurnAbandoned(f"node {node_id} is done; a turn it left to start is not")
+            if branch.turns_in_flight:
+                raise SchedulerError(
+                    f"node {node_id} started a model turn (call_turn) while another was under "
+                    "way. Each takes the positions its calls sit at, in order, and two at once "
+                    "take them as they happen to interleave -- differently on a resume, under "
+                    "other keys. Await one turn before the next."
+                )
             turn = SpeculativeTurn(self, branch, node_id)
             self._turns.append(turn)
-            return await turn.run(envelope)
+            branch.turns_in_flight += 1
+            try:
+                return await turn.run(envelope)
+            finally:
+                branch.turns_in_flight -= 1
 
         return call_turn
 
@@ -2112,21 +2149,29 @@ class SpeculativeTurn:
             if self.response is None:
                 raise ModelError("the model's stream ended without completing its turn")
         except BaseException:
-            # A stream that raised, or a node task cancelled, with a guess still open: grade
-            # it, discard what it staged, cancel its task and journal the resolution before
-            # the exception continues. Without this the in-flight count leaked for the rest
-            # of the scheduler's life, the guess was never graded, and the journal held a
-            # ``branch_forked`` with no ``branch_resolved`` -- a branch that ended in none of
-            # the three ways branch.py says every branch ends.
-            await self._squash_open("turn_failed")
-            await self._abandon(slots)
-            # A guess the model confirmed before the stream failed was confirmed by a turn that
-            # never became durable, so what it staged is discarded, unsent. It was adopted
-            # mid-stream once, and a node that caught the failure and finished sent it.
-            await self._discard_confirmed()
-            # And the turn takes no positions: the node's next call is where it would be had
-            # none of the turn's blocks arrived (``Branch.rewind_to``, POSITION_RULE).
-            branch.rewind_to(self._base)
+            # The turn takes no positions: the node's next call is where it would be had none
+            # of its blocks arrived (``Branch.rewind_to``, POSITION_RULE) -- given back first,
+            # before any await, where no cancel can come between; and again once its reads
+            # are stopped, in case one started meanwhile.
+            self._give_back_positions()
+            # The rest is finished whatever the caller does meanwhile -- a deadline firing in
+            # it left a guess open, a confirmed guess's write undiscarded, and the positions
+            # taken. With a guess still open: grade it, discard what it staged, cancel its
+            # task and journal the resolution. A guess the model confirmed before the stream
+            # failed was confirmed by a turn that never became durable, so what it staged is
+            # discarded, unsent.
+            cleaning = asyncio.ensure_future(self._clean_up_after_failure(slots))
+            cancelled = False
+            try:
+                await asyncio.shield(cleaning)
+            except asyncio.CancelledError:
+                cancelled = True
+                await _let_finish(cleaning)
+                if not cleaning.cancelled() and cleaning.exception() is not None:
+                    raise cleaning.exception() from None  # type: ignore[misc]
+            self._give_back_positions()
+            if cancelled:
+                raise asyncio.CancelledError() from None
             raise
 
         # Any speculation still open when the turn ended predicted a call the model never made.
@@ -2148,6 +2193,17 @@ class SpeculativeTurn:
             await self._abandon(slots)
             raise
         return TurnResults(results, self.response)
+
+    def _give_back_positions(self) -> None:
+        """A turn that did not complete takes no positions -- unless its node has retired, whose
+        cursor is its retirement's and not a leftover turn's to move."""
+        if self._branch.status is not BranchStatus.RETIRED:
+            self._branch.rewind_to(self._base)
+
+    async def _clean_up_after_failure(self, slots: list[asyncio.Task[JsonValue] | None]) -> None:
+        await self._squash_open("turn_failed")
+        await self._abandon(slots)
+        await self._discard_confirmed()
 
     async def _abandon(self, slots: list[asyncio.Task[JsonValue] | None]) -> None:
         """Cancel and await every call this turn started, so none outlives the turn.
@@ -2220,7 +2276,8 @@ class SpeculativeTurn:
                 # early read start, a replay that writes nothing did not, and a guess adopted on
                 # another branch never took it at all -- and every call after it moved to
                 # another key.
-                self._branch.reserve_step(self._base + ordinal + 1)
+                if self._branch.status is not BranchStatus.RETIRED:
+                    self._branch.reserve_step(self._base + ordinal + 1)
                 if spec.effect is not EffectClass.READ:
                     self._pending_write_keys.append(keys_touched(spec, actual.args))
                 # Not a read of something a write earlier in this turn changes: issued now, it
@@ -2417,8 +2474,8 @@ class SpeculativeTurn:
             scheduler.counters.branches_stalled += 1
             return
 
-        await scheduler._journal_fork(child, self._node_id)
-        scheduler.counters.branches_forked += 1
+        # The turn's before its fork is journaled: a deadline firing during that write left a
+        # fork on disk that nothing ever resolved, and a guess counted nowhere.
         self._predicted = decision
         self._speculative = child
         self._tier = prediction.tier
@@ -2428,6 +2485,15 @@ class SpeculativeTurn:
         # Rule 10 names -- could not be reached and the BUDGET hazard's inflight clause was
         # unreachable.
         scheduler.budget.inflight_branches += 1
+        scheduler.counters.branches_forked += 1
+        # And journaled whatever the caller does: a fork cut off before it reached the disk
+        # left a resolution with no fork to resolve.
+        forking = asyncio.ensure_future(scheduler._journal_fork(child, self._node_id))
+        try:
+            await asyncio.shield(forking)
+        except asyncio.CancelledError:
+            await _let_finish(forking)
+            raise
         tools = BranchTools(scheduler, child, self._node_id)
         # The block this predicts would be the next one the model emits, so it occupies the
         # next ordinal. Reserving it here is what keeps a confirmed speculation's effect at the
@@ -2469,6 +2535,14 @@ class SpeculativeTurn:
         confirmed = status is BranchStatus.CONFIRMED
 
         if confirmed:
+            # Let go of first: a cancel at an await below reached the failure path with the
+            # guess still open, and it was squashed -- and counted in flight and in alpha -- a
+            # second time. Its journaling is then finished whatever the caller does.
+            opened = self._open
+            self._adopted = opened
+            self._open = None
+            self._predicted = None
+            self._speculative = None
             # Only the hit is recorded here. The miss is recorded by ``_squash_open``, which
             # this falls through to -- recording it in both places double-counted it, and
             # recording it only here left end-of-turn squashes out of the window entirely.
@@ -2476,7 +2550,6 @@ class SpeculativeTurn:
                 tier=self._tier, confirmed=True, tokens=self._cost_tokens
             )
             scheduler.budget.inflight_branches -= 1
-            await scheduler._journal_alpha_observed(child.fork_step, child.id)
             self.confirmed += 1
             child.confirm()
             # The guess was right, so the work stops being speculative and becomes the
@@ -2503,26 +2576,32 @@ class SpeculativeTurn:
             # there yet. The adopted call then reached the world before the call that preceded
             # it, and the order effects arrived depended on whether the runtime speculated.
             # The parent parks when it actually needs this ack, which is in the results loop.
-            if self._open is not None:
-                self._adopted_tasks.add(self._open)
-            await scheduler.journal.append_async(
-                scheduler.run_id,
-                "branch_resolved",
-                {
-                    "v": 1,
-                    "branch_id": child.id,
-                    "step": child.fork_step,
-                    "status": "confirmed",
-                    "adopted_by": self._branch.id,
-                },
-            )
-            self._adopted = self._open
-            self._open = None
-            self._predicted = None
-            self._speculative = None
+            if opened is not None:
+                self._adopted_tasks.add(opened)
+            confirming = asyncio.ensure_future(self._journal_confirmed(child))
+            try:
+                await asyncio.shield(confirming)
+            except asyncio.CancelledError:
+                await _let_finish(confirming)
+                raise
             return
 
         await self._squash_open("mismatch")
+
+    async def _journal_confirmed(self, child: Branch) -> None:
+        scheduler = self._scheduler
+        await scheduler._journal_alpha_observed(child.fork_step, child.id)
+        await scheduler.journal.append_async(
+            scheduler.run_id,
+            "branch_resolved",
+            {
+                "v": 1,
+                "branch_id": child.id,
+                "step": child.fork_step,
+                "status": "confirmed",
+                "adopted_by": self._branch.id,
+            },
+        )
 
     async def _squash_open(self, reason: str) -> None:
         """Cancellation *is* the squash. The buffer is closed before the task is cancelled.

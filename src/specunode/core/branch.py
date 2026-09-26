@@ -214,6 +214,13 @@ class Branch:
     abandoned: bool = False
     #: Why it was stopped: the first reason, whatever its ``finally`` then ran into.
     abandoned_reason: str = ""
+    #: Model turns (``call_turn``) under way on this branch: at most one, and while it runs the
+    #: node takes no other position -- a call made during a turn took a position among the
+    #: turn's own, at another place on a resume, under another key.
+    turns_in_flight: int = 0
+    #: The position its retirement journaled (``cursor_after``): where the run carries on
+    #: from, whatever a call its node left running does to the cursor afterwards.
+    retired_cursor: StepCursor | None = None
     #: How many entries of ``read_set`` were copied from the parent at fork time. Everything
     #: after that index is a read *this* branch made, which is what adoption has to hand back:
     #: a confirmed speculation never retires, so a read it made on a guess would otherwise be

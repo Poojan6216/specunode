@@ -165,6 +165,17 @@ reading, or that failed, after blocks had reached it -- those stay unjournaled f
 that node writes nothing more; let it fail and resume. A `complete()` or `call_turn` that fails
 hands the node nothing of the turn, and does not block it.
 
+### A node's turn runs alone
+
+A node's calls take program positions in order, and each call's idempotency key is derived from
+its position. A `call_turn` places its calls at the positions after where it began, one per
+block, so while it runs the node takes no other position: a second `call_turn`, or a
+`call_tool`, made during it is refused with a `SchedulerError` -- one made then took a position
+among the turn's own, at another place on a resume, under another key. Await the turn first; to
+ask the model on the side, use `session.model.complete()`, which takes no position. A turn that
+does not complete -- it fails, or the node stops waiting for it -- takes no positions at all,
+however many of its blocks had arrived.
+
 ### A model call that fails raises `ModelError`
 
 Whatever the client raised -- the SDK's own error, a dropped connection, a reply cut off -- a

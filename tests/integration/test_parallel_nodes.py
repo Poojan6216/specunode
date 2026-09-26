@@ -132,7 +132,7 @@ async def test_independent_nodes_overlap_their_model_calls(tmp_path: Path) -> No
     """The point of the feature, counted rather than timed."""
     world = standard_world()
     adapter, registry = build_fanout(world)
-    model = KeyedScriptedModel(think_ms=50.0)
+    model = KeyedScriptedModel(think_ms=50.0, meet=3)
     result, journal, run_id = await run_graph(
         tmp_path, adapter, registry, model=model, db="overlap.db"
     )

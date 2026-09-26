@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 
@@ -875,3 +875,263 @@ async def test_a_tool_is_not_called_after_the_run(tmp_path: Path) -> None:
     assert result.ok, result.error
     assert reached == [], "the upstream was reached after the run"
     assert after_the_first_end(db, run_id) == []
+
+
+# -- the twenty-first review ---------------------------------------------------------------------
+
+
+class NotesTheOrder:
+    """Asks to note the order, a second after the question."""
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        raise NotImplementedError
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        use = ToolUseBlock(id="t0", name="note_order", args={"customer_id": "cus-1"})
+        await asyncio.sleep(1.0)
+        yield ToolUseComplete(index=0, block=use)
+        yield TurnComplete(ModelResponse(model="scripted", content=(use,), stop_reason="tool_use"))
+
+
+class SlowerToAsk(Journal):
+    async def append_async(self, run_id: str, kind: str, payload: Mapping[str, JsonValue]) -> int:
+        if kind == "model_request":
+            await asyncio.sleep(0.9)
+        return await super().append_async(run_id, kind, payload)
+
+
+async def test_a_resume_slower_to_write_its_question_decides_as_the_run_did(
+    tmp_path: Path,
+) -> None:
+    """The node gives the model 1.6 s, its question's write included; the model answered in a
+    second. On a resume whose disk took 0.9 s to write the question, the served answer's clock
+    started after that write, the deadline fired, and the node charged a fallback the run never
+    had. Found by the twenty-first review. The deadline leaves room for every other write in the
+    turn to be slow, as a loaded CI disk is."""
+    world: list[str] = []
+
+    @tool(effect="write", idempotent=False)
+    async def note_order(customer_id: str) -> JsonValue:
+        world.append("note_order")
+        return {"noted": True}
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        world.append("charge_card")
+        return {"charge_id": "ch"}
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        try:
+            await asyncio.wait_for(session.call_turn(TURN_FOR_ORDERS), timeout=1.6)  # type: ignore[misc]
+        except (TimeoutError, ModelError):
+            await session.call_tool("charge_card", {"customer_id": "cus-1", "amount": 10.0})
+        session.state["billed"] = True
+        return ToolCall("note_order", {})
+
+    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
+    registry = registry_of([note_order, charge_card])
+
+    def driver(journal: Journal) -> Scheduler:
+        return Scheduler(
+            graph=adapter,  # type: ignore[arg-type]
+            registry=registry,
+            journal=journal,
+            buffer=StoreBuffer(journal=journal, run_id=""),
+            dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),
+            target=JournaledModel(NotesTheOrder(), journal, provider="scripted"),
+            policy=Policy(speculation=False),
+        )
+
+    db = tmp_path / "source.db"
+    run_id = new_ulid()
+    with pytest.raises(Crash):
+        await asyncio.wait_for(
+            driver(CrashingJournal(db, before_commit_of("bill#0"))).run(run_id, {}), timeout=30
+        )
+    await bury_the_dead_process()
+    assert world == ["note_order"]
+    resumed = await asyncio.wait_for(driver(SlowerToAsk(db)).resume(run_id), timeout=60)
+    assert resumed.ok, resumed.error
+    assert world == ["note_order"], f"the resume decided otherwise: {world}"
+
+
+TURN_FOR_ORDERS = RequestEnvelope(
+    model="scripted",
+    messages=(Message(role="user", content=(TextBlock(text="order for cus-1"),)),),
+    max_tokens=256,
+    stream=True,
+)
+
+
+def reads_left_running(fail_second: bool) -> tuple[PlainAdapter, object]:
+    @tool(effect="read")
+    async def lookup_plan(customer_id: str) -> JsonValue:
+        await asyncio.sleep(0.5)
+        return {"plan": "basic"}
+
+    @node(name="ask")
+    async def ask(session: RunSession) -> Decision:
+        # A lookup started and never awaited: still at the upstream when the run ends.
+        asyncio.get_running_loop().create_task(
+            session.call_tool("lookup_plan", {"customer_id": "cus-1"})
+        )
+        await asyncio.sleep(0.05)
+        session.state["asked"] = True
+        return ToolCall("noop", {})
+
+    @node(name="fail")
+    async def fail(session: RunSession) -> Decision:
+        if fail_second:
+            raise RuntimeError("the second node fails this time")
+        session.state["failed_once"] = True
+        return ToolCall("noop", {})
+
+    def route(state: Mapping[str, JsonValue]) -> str | None:
+        if not state.get("asked"):
+            return "ask"
+        return None if state.get("failed_once") else "fail"
+
+    return PlainAdapter.of([ask, fail], route), registry_of([lookup_plan])
+
+
+@pytest.mark.parametrize("resumed_at_once", [False, True])
+async def test_a_read_left_running_writes_nothing_after_its_run(
+    tmp_path: Path, resumed_at_once: bool
+) -> None:
+    """Checked only when it began, a read still at the upstream when its run ended wrote its
+    result after ``run_finished`` -- or into a resume of the same run the process had begun
+    meanwhile. Found by the twenty-first review."""
+    db = tmp_path / "j.db"
+    run_id = new_ulid()
+    adapter, registry = reads_left_running(fail_second=resumed_at_once)
+    await scheduler(Journal(db), adapter, registry, AnswersWhen(asyncio.Event())).run(run_id, {})
+    first_end = max(e.offset for e in Journal(db).read(run_id, kinds=["run_finished"]))
+    if resumed_at_once:
+        adapter, registry = reads_left_running(fail_second=False)
+        await scheduler(Journal(db), adapter, registry, AnswersWhen(asyncio.Event())).resume(run_id)
+    await asyncio.sleep(0.8)
+    late = [
+        (e.offset, e.kind)
+        for e in Journal(db).read(run_id, kinds=["tool_result"])
+        if e.offset > first_end
+    ]
+    assert late == [], late
+
+
+class TwoReads:
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        raise NotImplementedError
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        a = ToolUseBlock(id="t0", name="lookup_plan", args={"customer_id": "cus-1"})
+        b = ToolUseBlock(id="t1", name="lookup_plan", args={"customer_id": "cus-2"})
+        await asyncio.sleep(0.01)
+        yield ToolUseComplete(index=0, block=a)
+        await asyncio.sleep(0.09)
+        yield ToolUseComplete(index=1, block=b)
+        await asyncio.sleep(0.5)
+        yield TurnComplete(ModelResponse(model="scripted", content=(a, b), stop_reason="tool_use"))
+
+
+class SlowOn(Journal):
+    """A disk slow (400 ms) to take one kind of entry."""
+
+    def __init__(self, path: Path, slow: Callable[[str, Mapping[str, JsonValue]], bool]) -> None:
+        super().__init__(path)
+        self.slow = slow
+
+    async def append_async(self, run_id: str, kind: str, payload: Mapping[str, JsonValue]) -> int:
+        if self.slow(kind, payload):
+            await asyncio.sleep(0.4)
+        return await super().append_async(run_id, kind, payload)
+
+
+@pytest.mark.parametrize("slow_at", ["the guess is confirmed", "the guess is forked"])
+async def test_a_guess_a_deadline_lands_on_is_resolved_once(tmp_path: Path, slow_at: str) -> None:
+    """The node's deadline fired while a guess was being confirmed -- and it was squashed again
+    from the failure path, counted twice -- or while its fork was being written, and nothing
+    ever resolved it. Found by the twenty-first review."""
+    from tests.integration.test_speculation import FixedDrafter
+
+    def slow(kind: str, payload: Mapping[str, JsonValue]) -> bool:
+        if slow_at == "the guess is confirmed":
+            return kind == "branch_resolved" and bool(payload.get("adopted_by"))
+        return kind == "branch_forked" and bool(payload.get("predicted_hash"))
+
+    @tool(effect="read")
+    async def lookup_plan(customer_id: str) -> JsonValue:
+        return {"plan": "basic"}
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        return {"charge_id": "ch_1"}
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        with contextlib.suppress(TimeoutError, ModelError):
+            await asyncio.wait_for(session.call_turn(TURN_FOR_ORDERS), timeout=0.3)  # type: ignore[misc]
+        await session.call_tool("charge_card", {"customer_id": "cus-1", "amount": 10.0})
+        session.state["billed"] = True
+        return ToolCall("charge_card", {})
+
+    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
+    registry = registry_of([lookup_plan, charge_card])
+    journal = SlowOn(tmp_path / "j.db", slow)
+    driver = Scheduler(
+        graph=adapter,  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),
+        target=JournaledModel(TwoReads(), journal, provider="scripted"),
+        policy=Policy(speculation=True, max_speculation_depth=3),
+        predictor=FixedDrafter(ToolCall("lookup_plan", {"customer_id": "cus-2"})),  # type: ignore[arg-type]
+    )
+    run_id = new_ulid()
+    result = await asyncio.wait_for(driver.run(run_id, {}), timeout=30)
+    await asyncio.sleep(0.5)
+    assert result.ok, result.error
+    forked = {
+        e.payload.get("branch_id")
+        for e in Journal(tmp_path / "j.db").read(run_id, kinds=["branch_forked"])
+        if e.payload.get("predicted_hash")
+    }
+    resolved = [
+        e.payload.get("branch_id")
+        for e in Journal(tmp_path / "j.db").read(run_id, kinds=["branch_resolved"])
+        if e.payload.get("branch_id") in forked
+        and e.payload.get("status") in ("squashed", "retired", "stalled")
+    ]
+    assert driver.budget.inflight_branches == 0
+    assert driver.budget.window.samples == len(forked)
+    assert sorted(resolved) == sorted(forked), (resolved, forked)
+
+
+def test_status_says_what_resume_would(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``status`` called resumable a run ``resume`` refused. Found by the twenty-first review."""
+    from tests.integration.test_positions import billing, driving
+    from typer.testing import CliRunner
+
+    from specunode.cli import app
+    from specunode.core import scheduler as scheduler_module
+
+    async def crashed() -> str:
+        monkeypatch.setattr(scheduler_module, "POSITION_RULE", 1)
+        charged: list[float] = []
+        adapter, registry = billing(charged)
+        run_id = new_ulid()
+        with pytest.raises(Crash):
+            await driving(
+                CrashingJournal(tmp_path / "j.db", before_commit_of("bill#0")),
+                adapter,
+                registry,
+                speculation=False,
+            ).run(run_id, {})
+        await bury_the_dead_process()
+        monkeypatch.undo()
+        return run_id
+
+    run_id = asyncio.run(crashed())
+    shown = CliRunner().invoke(app, ["status", run_id, "--journal", str(tmp_path / "j.db")])
+    assert "resumable: False" in shown.output, shown.output

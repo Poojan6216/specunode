@@ -15,6 +15,7 @@ scheduler happened to interleave them.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -138,9 +139,15 @@ class KeyedScriptedModel:
     """
 
     think_ms: float = 0.0
+    #: Hold each request until this many are in flight at once, or two seconds pass: nodes that
+    #: overlap all meet whatever the disk's speed, and ones that do not are never all in flight.
+    #: Held only for ``think_ms``, three calls whose questions a slow disk wrote one after
+    #: another did not overlap, and a test of the overlap failed on a slow CI runner.
+    meet: int = 0
     in_flight: int = 0
     high_water: int = 0
     calls: list[str] = field(default_factory=list)
+    _all_in: asyncio.Event | None = field(default=None, repr=False)
 
     def _reply_for(self, envelope: RequestEnvelope) -> ModelResponse:
         text = "".join(
@@ -171,6 +178,13 @@ class KeyedScriptedModel:
         self.in_flight += 1
         self.high_water = max(self.high_water, self.in_flight)
         try:
+            if self.meet:
+                if self._all_in is None:
+                    self._all_in = asyncio.Event()
+                if self.in_flight >= self.meet:
+                    self._all_in.set()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._all_in.wait(), 2.0)
             await asyncio.sleep(self.think_ms / 1000.0)
         finally:
             self.in_flight -= 1

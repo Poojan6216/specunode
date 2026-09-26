@@ -490,6 +490,21 @@ def response_from_json(payload: Mapping[str, JsonValue]) -> ModelResponse:
 # -- who is calling ----------------------------------------------------------------------------
 
 
+class Drive:
+    """One drive of a run -- one run, or one resume -- as every call of it carries it.
+
+    Once it is over (``end_drive``), a call of it -- the target model's, a drafter's, a tool's --
+    asks nothing and writes nothing more. Carried by the calls rather than kept in a table:
+    kept by id in a process-wide set, the set grew by one entry for every run the process ever
+    drove, and nothing ever took one out.
+    """
+
+    __slots__ = ("over",)
+
+    def __init__(self) -> None:
+        self.over = False
+
+
 @dataclass(frozen=True)
 class CallScope:
     """The branch a model call belongs to.
@@ -522,9 +537,9 @@ class CallScope:
     #: :class:`TurnAbandoned` (``halted``). Called before a served turn is abandoned -- a node's
     #: ``finally`` went on writing, on the very path the runtime had just judged wrong.
     halt: Callable[[str], None] | None = None
-    #: The drive -- one run, or one resume -- this call belongs to; once it is over, the model
-    #: writes nothing more for the call (``JournaledModel.end_drive``). Empty outside a Scheduler.
-    drive: str = ""
+    #: The drive -- one run, or one resume -- this call belongs to; once it is over, the call asks
+    #: nothing and writes nothing more (``end_drive``). ``None`` outside a Scheduler.
+    drive: Drive | None = None
     halted: Callable[[], bool] | None = None
     #: When the node body began (``time.monotonic()``), so a turn it stopped waiting for can be
     #: served against the node's own clock, not only the call's.
@@ -559,21 +574,14 @@ def current_scope() -> CallScope:
     return scope
 
 
-#: Drives that are over, by id: every call of one -- the target model's, a drafter's, a tool's --
-#: asks nothing and writes nothing more. By drive, not by whether the run is still held: a call
-#: left over from one drive wrote into the next, a resume of the same run in the same process.
-_drives_over: set[str] = set()
+def end_drive(drive: Drive) -> None:
+    """The Scheduler's drive is over. Called before its ``run_finished`` is written."""
+    drive.over = True
 
 
-def end_drive(drive: str) -> None:
-    """The Scheduler's drive ``drive`` is over. Called before its ``run_finished`` is written."""
-    if drive:
-        _drives_over.add(drive)
-
-
-def drive_over(drive: str) -> bool:
-    """Whether ``drive`` is over; a call outside any Scheduler's drive (``""``) never is."""
-    return bool(drive) and drive in _drives_over
+def drive_over(drive: Drive | None) -> bool:
+    """Whether ``drive`` is over; a call outside any Scheduler's drive (``None``) never is."""
+    return drive is not None and drive.over
 
 
 @contextmanager
@@ -608,9 +616,9 @@ class RecordedTurn:
     #: tool call), in the order it had them. A served stream hands over exactly these, at that
     #: pace. ``None``: recorded before pieces were, and each block is handed over whole, at once.
     pieces: tuple[tuple[int, int, int], ...] | None = None
-    #: How long writing the question took the recorded caller: a replay, which writes none,
-    #: waits that long before its clock starts, so its answers arrive when the run's did.
-    ask_ms: int = 0
+    #: How long writing the question took the recorded caller (-1: not recorded): a resume
+    #: keeps its answer's clock from there, and a replay, which writes none, waits that long.
+    ask_ms: int = -1
     #: The attempt it is served from -- the branch that recorded this outcome -- and where the
     #: outcome came back among that attempt's others: the order a served turn is handed over in.
     #: Not ``offset``, which for a turn that attempt was itself served is where it was first
@@ -682,11 +690,18 @@ def _hold_until(recorded: RecordedTurn, scope: CallScope | None = None) -> float
     return time.monotonic() + _abandon_after_s(recorded, scope) + _ABANDON_MARGIN_S
 
 
-async def _wait_out(recorded: RecordedTurn, scope: CallScope | None = None) -> float:
-    """Wait as a turn that never answers: well past when the recorded caller stopped."""
-    wait = _abandon_after_s(recorded, scope)
-    await asyncio.sleep(wait)
-    return wait
+async def _wait_out(
+    recorded: RecordedTurn, scope: CallScope | None = None, asked_at: float | None = None
+) -> float:
+    """Wait as a turn that never answers: well past when the recorded caller stopped -- counted
+    from when the question counts as asked. Returns how long that was."""
+    began = time.monotonic() if asked_at is None else asked_at
+    deadline = began + 2 * recorded.latency_ms / 1000.0 + _ABANDON_MARGIN_S
+    if scope is not None and scope.node_started and recorded.node_ms:
+        node_deadline = scope.node_started + recorded.node_ms / 1000.0 + _ABANDON_MARGIN_S
+        deadline = max(deadline, node_deadline)
+    await _sleep_until(deadline)
+    return time.monotonic() - began
 
 
 def _abandoned(
@@ -709,10 +724,13 @@ def _abandoned(
 
 
 async def _served_never_answers(
-    recorded: RecordedTurn, scope: CallScope | None = None, hint: str = RESUME_HINT
+    recorded: RecordedTurn,
+    scope: CallScope | None = None,
+    hint: str = RESUME_HINT,
+    asked_at: float | None = None,
 ) -> None:
     """Wait well past when the recorded caller stopped; then stop the node, loudly."""
-    waited = await _wait_out(recorded, scope)
+    waited = await _wait_out(recorded, scope, asked_at)
     raise _abandoned(recorded, scope, waited, hint)
 
 
@@ -1207,7 +1225,7 @@ class JournaledModel:
                 "pieces": [list(piece) for piece in pieces],
                 **({"node_ms": node_ms} if node_ms else {}),
                 # How long writing the question took: a replay waits as long before its clock.
-                **({"ask_ms": ask_ms} if (ask_ms := self._ask_ms.get(request_id, 0)) else {}),
+                **({"ask_ms": self._ask_ms[request_id]} if request_id in self._ask_ms else {}),
                 # Served as abandoned, then asked live at the point it would have been -- its
                 # question says ``recorded_from``, and a model call was made all the same.
                 **({"asked_again": True} if asked_again else {}),
@@ -1348,6 +1366,19 @@ class JournaledModel:
         self._ask_ms[request_id] = int((time.monotonic() - began) * 1000)
         return request_id
 
+    def _clock(self, recorded: RecordedTurn | None, began: float, request_id: str) -> float:
+        """When a question counts as asked: the clock its answer's pace is kept by.
+
+        Served, from when this call began writing the question, plus as long as the recorded
+        caller's write took -- and that timeline is what the answer is recorded with again.
+        Started after this process's own write, a resume whose disk was slower to write it gave
+        its node less time for the answer than the run had, and the node decided otherwise.
+        """
+        if recorded is None or recorded.ask_ms < 0:
+            return time.monotonic()
+        self._ask_ms[request_id] = recorded.ask_ms
+        return began + recorded.ask_ms / 1000.0
+
     def _in_run(self, scope: CallScope) -> bool:
         """Whether this process still drives the scope's run -- a stream closed by the garbage
         collector after the run ended is not, and writes nothing into a run it let go of."""
@@ -1396,19 +1427,22 @@ class JournaledModel:
         digest = request_hash(envelope)
         source, recorded = self._recorded_for(digest, scope)
         request_id: str | None = None
+        # Open from the moment it is asked, its question's write included: counted only once
+        # that was on disk, a write the node made meanwhile was not refused.
+        track = scope.track_turn if self._role == "target" else None
+        if track is not None:
+            track(1)
         try:
+            began = time.monotonic()
             request_id = await self._ask(envelope, scope, digest, recorded)
-            asked_at = time.monotonic()
-            track = scope.track_turn if self._role == "target" else None
-            if track is not None:
-                track(1)
+            asked_at = self._clock(recorded, began, request_id)
             try:
                 asked_again = False
                 if source is not None and recorded is not None:
                     served = recorded.response
                     try:
                         if recorded.cancelled:
-                            waited = await _wait_out(recorded, scope)
+                            waited = await _wait_out(recorded, scope, asked_at)
                             if not source.ask_abandoned:
                                 raise _abandoned(recorded, scope, waited, RESUME_HINT)
                             # The operator's call: asked again, live, at the point where it
@@ -1494,10 +1528,11 @@ class JournaledModel:
                 )
                 return response
             finally:
-                # Nothing of the turn reaches the caller before its response is on disk.
-                if track is not None:
-                    track(-1)
+                pass
         finally:
+            # Nothing of the turn reaches the caller before its response is on disk.
+            if track is not None:
+                track(-1)
             # However the call ended -- answered, failed, cancelled, abandoned -- the turn it
             # was served is released: a later answer of its node may be waiting for it.
             if source is not None and recorded is not None:
@@ -1529,15 +1564,18 @@ class JournaledModel:
         digest = request_hash(envelope)
         source, recorded = self._recorded_for(digest, scope)
         request_id: str | None = None
+        # Open from the moment it is asked, its question's write included.
+        track = scope.track_turn if self._role == "target" else None
+        if track is not None:
+            track(1)
+        handed = _Handed(time.monotonic())
+        asked_again = False
         try:
-            request_id = await self._ask(envelope, scope, digest, recorded)
-            asked_at = time.monotonic()
-            track = scope.track_turn if self._role == "target" else None
-            if track is not None:
-                track(1)
-            handed = _Handed(asked_at)
-            asked_again = False
             try:
+                began = time.monotonic()
+                request_id = await self._ask(envelope, scope, digest, recorded)
+                asked_at = self._clock(recorded, began, request_id)
+                handed.asked_at = asked_at
                 if source is not None and recorded is not None:
                     # The recorded turn's pieces, in order and each no sooner than it first
                     # arrived -- so early issue, and a node that acts on what arrives first, see
@@ -1550,7 +1588,7 @@ class JournaledModel:
                             handed.add(event, at if at >= 0 else None)
                             yield event
                         if recorded.cancelled:
-                            waited = await _wait_out(recorded, scope)
+                            waited = await _wait_out(recorded, scope, asked_at)
                             if handed.pieces:
                                 raise _abandoned(recorded, scope, waited, PART_WAY_HINT)
                             if not source.ask_abandoned:

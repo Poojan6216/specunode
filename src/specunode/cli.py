@@ -42,6 +42,7 @@ from specunode.journal.replay import (
     PositionRuleMismatch,
     ReplayDivergence,
     ReplayModel,
+    position_rule_problem,
     recover,
 )
 from specunode.runner import RunnerError, build_graph, build_target
@@ -632,7 +633,12 @@ def status(
     typer.echo(f"  confirmed but not retired: {list(recovery.confirmed_not_retired)}")
     typer.echo(f"  dispatch claims still in flight: {len(recovery.unresolved_dispatches)}")
     typer.echo(f"  step index to continue above: {recovery.step_index}")
-    typer.echo(f"  resumable: {recovery.resumable}")
+    # What ``resume`` would say: a run it refuses is not called resumable here.
+    misplaced = position_rule_problem(book, run_id) if recovery.resumable else None
+    if misplaced is not None:
+        typer.echo(f"  resumable: False -- {misplaced}")
+    else:
+        typer.echo(f"  resumable: {recovery.resumable}")
 
 
 @app.command("mcp-proxy")
