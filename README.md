@@ -47,14 +47,14 @@ graphs: a crashed LangGraph run cannot be resumed yet.
 ## Quickstart
 
 ```
-pip install "specunode @ git+https://github.com/Poojan6216/specunode"     # PyPI release to come
+pip install specunode
 git clone https://github.com/Poojan6216/specunode && cd specunode
 python examples/quickstart.py
 ```
 
 Extras: `anthropic` (the Claude adapter), `langgraph` (wrap a compiled LangGraph graph), `mcp`
 (the MCP proxy), `postgres` (a Postgres journal) -- e.g.
-`pip install "specunode[anthropic,langgraph] @ git+https://github.com/Poojan6216/specunode"`.
+`pip install "specunode[anthropic,langgraph]"`.
 
 ```python
 import specunode

@@ -789,7 +789,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 
 - [x] **9.1 README** with: one-paragraph CPU analogy; the three demos with their printed outputs; the opportunity plot; the latency table with CIs; the break-even α per workload; "What beats it"; "What this is not" (not a durable-execution platform, not an authorization layer, not a context manager); credits to PASTE, Claude Code's executor, langchain-nvidia, ToolAhead, SagaLLM, ATP, SCOPEGATE, Temporal/DBOS/Restate.
 - [x] **9.2 Docs** (`docs/*.md`) complete; `specunode init` writes `specunode.yaml` + `.specunode/`.
-- [ ] **9.3 Release.** Tag `v0.1.0`, `uv build`, publish to PyPI as `specunode`, install from PyPI in a clean 3.11 venv on both OSes and run Demo 1 from the published wheel. Record the exact install command that failed, if any, in the docs the same day.
+- [x] **9.3 Release.** Tag `v0.1.0`, `uv build`, publish to PyPI as `specunode`, install from PyPI in a clean 3.11 venv on both OSes and run Demo 1 from the published wheel. Record the exact install command that failed, if any, in the docs the same day.
 - [x] **9.4 Report.** `bench/make_report_pdf.py` regenerates the technical report from `bench/results/*.json` — every number in the PDF is read from a file.
 
 **Phase Gate 9:** `pip install specunode` works on 3.11; demos run from the published wheel; `check_numbers.py` green against the published README.
@@ -807,7 +807,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 - [x] `RESULTS.md`, README numbers, and the PDF are generated; `check_numbers.py` and the vocabulary check are green
 - [x] "What beats it" section in README and report, before the wins
 - [x] Every prior-art project in §3 credited by name in the README
-- [ ] Published to PyPI; installed and demoed from the published wheel
+- [x] Published to PyPI; installed and demoed from the published wheel
 
 ---
 
@@ -2003,7 +2003,7 @@ The Progress Log has 130+ entries; these changed the shape of the build.
 | Wheel on 3.11/3.12/3.13, macOS **and Ubuntu** | Verified by CI on all six, with the test suite and a Postgres 16 job, since the repository went public (2026-09-25). |
 | The three tests on every workload, every tier, **every CI job** | They run, are never skipped, and cover all three sample apps at tiers 0 and 1. Tier 2 is a draft *model* behind an optional extra — requiring it would make a mandatory test skippable, which is the one property these files may never have, so it has its own tests. The open clause is **every CI job**. |
 | Offline ✓, overhead ✓, adversarial ✓, **online latency** | The runner exists and CI exercises all of it on every push with `--model scripted`. A real measurement needs an API key; a scripted report is stamped `is_real_model: false`. |
-| Published to PyPI; demoed from the published wheel | Needs credentials. |
+| Published to PyPI; demoed from the published wheel | Done, 2026-09-26: published through Trusted Publishing; the release workflow's `verify` job installed it from PyPI in a clean 3.11 venv on Ubuntu and macOS and ran Demo 1, the quickstart and the CLI against it. |
 
 **The Postgres journal backend now runs.** Postgres 16.15 was installed on this machine, so it
 was stood up and the journal driven against it: append, read with an exclusive `after`, the
@@ -2048,8 +2048,8 @@ accept that the clause holds only for clients that report node ids.
    `bench/online/` was an empty directory.** That was false, in the section of a project whose
    stated purpose is to make such a claim impossible. It is recorded here rather than quietly
    corrected.
-2. **PyPI credentials**, for task 9.3. `uv build` works and the wheel installs and runs on 3.11,
-   3.12 and 3.13 locally.
+2. **Done, 2026-09-26: PyPI**, task 9.3. Published as `specunode` 0.1.0 through Trusted Publishing
+   -- no token exists -- and installed from PyPI and demoed by the release workflow on both OSes.
 3. **Done, 2026-09-25: CI runs.** The repository is public at
    https://github.com/Poojan6216/specunode. Its first run failed every test job on causes no
    local run could show -- a test reading a file that is never committed, and three kill tests
