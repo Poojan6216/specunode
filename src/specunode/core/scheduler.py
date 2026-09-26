@@ -2185,6 +2185,12 @@ class SpeculativeTurn:
                 )
                 if spec.effect is EffectClass.READ and self._adopted is None and early:
                     self.reads_issued_early += 1
+                    # Its position is taken now, as the block arrives, not when its task first
+                    # runs: a turn that failed right after the block cancelled the task before
+                    # or after it started, as the event loop happened to order them -- a run
+                    # whose failure was written first let it start, a replay that writes nothing
+                    # did not -- and every call after it moved to another key.
+                    self._branch.reserve_step(self._base + ordinal + 1)
                     slots.append(asyncio.create_task(self._timed_read(tools, actual, ordinal)))
                 elif self._adopted is not None:
                     # The speculation was right: its result is already in hand, so the call is

@@ -1431,7 +1431,7 @@ def render_ledger(
             )
         )
     else:
-        lines.append("(no effects reached the world)")
+        lines.append(_no_effects(ledger))
     lines.extend(_render_unsettled(ledger, ellipsis=ellipsis))
 
     lines.extend(_summary(ledger, ellipsis=ellipsis, equivalence_digest=equivalence_digest))
@@ -1510,6 +1510,13 @@ def _summary(ledger: Ledger, *, ellipsis: str, equivalence_digest: str | None) -
     return lines
 
 
+def _no_effects(ledger: Ledger) -> str:
+    """What an empty table says: that nothing reached the world only if nothing may have."""
+    if ledger.unsettled:
+        return "(no effect is recorded as having reached the world -- but see below)"
+    return "(no effects reached the world)"
+
+
 def _render_unsettled(ledger: Ledger, *, ellipsis: str, keys: bool = True) -> list[str]:
     """The effects that may have been sent and were never settled, however the ledger is
     shown: a view that left them out showed a world that may not be the one there is."""
@@ -1532,7 +1539,7 @@ def _render_normalised(ledger: Ledger, *, ellipsis: str) -> str:
     relation refuses to compare past."""
     lines = [f"EFFECT LEDGER (normalised)  n={len(ledger.rows)}"]
     if not ledger.rows:
-        lines.append("(no effects reached the world)")
+        lines.append(_no_effects(ledger))
         lines.extend(_render_unsettled(ledger, ellipsis=ellipsis, keys=False))
         return "\n".join(lines) + "\n"
     table = [

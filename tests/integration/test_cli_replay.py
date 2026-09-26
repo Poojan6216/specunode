@@ -427,6 +427,10 @@ def test_every_view_of_the_ledger_shows_what_may_have_been_sent(tmp_path: Path) 
     assert rows[0]["args"] == {"customer_id": "cus-1", "amount": 25.0}
     normalised = CliRunner().invoke(app, ["ledger", run_id, "--normalised", "--journal", str(db)])
     assert "MAY HAVE BEEN SENT" in normalised.output, normalised.output
+    # Nor does any view say, just above it, that nothing reached the world (review 18).
+    plain = CliRunner().invoke(app, ["ledger", run_id, "--journal", str(db)])
+    for shown in (plain.output, normalised.output):
+        assert "(no effects reached the world)" not in shown, shown
 
 
 @pytest.mark.parametrize("name", ["we#ird.db", "q?mark.db", "pct%41.db"])

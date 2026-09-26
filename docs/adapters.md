@@ -179,12 +179,12 @@ waiting the first time; a node still waiting then ends with `specunode.TurnAband
 the recorded run never asked -- and the node is closed to writes and model asks before it is
 raised, so a `finally` cannot act on the wrong path either. Do not catch it: a node that does,
 and returns, is not committed, and the run stops all the same. Served answers come back at their
-recorded pace and order -- a stream piece by piece, as its caller had it -- so a node that races
-two calls, falls back on a timeout without cancelling, or gives up on a model slow to start,
-decides on resume as it did. An answer waits for an earlier one only until the node is done with
-that one -- answered, failed or given up on -- and a node that holds an earlier answer open far
-longer than the recorded run did, while it waits for a later one, is stopped with
-`TurnAbandoned` too.
+recorded pace and order -- a stream piece by piece, as its caller had it, each piece no sooner
+than the model sent it -- so a node that races two calls, falls back on a timeout without
+cancelling, or gives up on a model slow to start, decides on resume as it did. An answer waits
+for an earlier one only until the node is done with that one -- answered, failed or given up on
+-- and a node that holds an earlier answer open far longer than the recorded run did, while it
+waits for a later one, is stopped with `TurnAbandoned` too.
 
 ## Speculation and node bodies
 

@@ -18,6 +18,7 @@ and feeding one back as an input would replay a decision the run never actually 
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -36,7 +37,7 @@ from specunode.core.model import (
     TextBlock,
     ToolResultBlock,
     TurnComplete,
-    _abandon_after_s,
+    _hold_until,
     _Pacer,
     _served_events,
     _served_never_answers,
@@ -105,6 +106,7 @@ class JournaledTurn:
     latency_ms: int = 0
     node_ms: int = 0
     pieces: tuple[tuple[int, int, int], ...] | None = None
+    ask_ms: int = 0
     #: The entry its outcome was recorded in -- where it came back among its attempt's other
     #: turns. That attempt's own entry, not the one a turn it was served was first recorded in:
     #: those kept an earlier attempt's order while the turns it asked live took new offsets, so
@@ -254,6 +256,7 @@ class ReplayModel:
                 latency_ms=_as_latency(payload.get("latency_ms")),
                 node_ms=_as_latency(payload.get("node_ms")),
                 pieces=_as_pieces(payload.get("pieces")),
+                ask_ms=_as_latency(payload.get("ask_ms")),
                 offset=entry.offset,
             )
             outcomes[str(request_id)] = (key, turn)
@@ -288,9 +291,7 @@ class ReplayModel:
         self._next[key] = index + 1
         self._served.append(step)
         self._pacer.taken(
-            _pace_key(scope, turn.branch_id),
-            turn.offset,
-            time.monotonic() + _abandon_after_s(_recorded(turn), scope),
+            _pace_key(scope, turn.branch_id), turn.offset, _hold_until(_recorded(turn), scope)
         )
         return turn
 
@@ -299,7 +300,7 @@ class ReplayModel:
         turn = self._turn_for(envelope, scope)
         key = _pace_key(scope, turn.branch_id)
         try:
-            asked_at = time.monotonic()
+            asked_at = await _asked(turn)
             if turn.cancelled:
                 await _served_never_answers(_recorded(turn), scope, REPLAY_HINT)
             await self._pacer.due(key, turn.offset, asked_at, turn.latency_ms, scope)
@@ -322,7 +323,7 @@ class ReplayModel:
         turn = self._turn_for(envelope, scope)
         key = _pace_key(scope, turn.branch_id)
         try:
-            asked_at = time.monotonic()
+            asked_at = await _asked(turn)
             response = turn.response
             # The pieces the recorded caller had, text too, as a live stream and a served one
             # hand them over: a node that stopped reading on a piece of text never saw it here.
@@ -444,6 +445,7 @@ class RecordedTurns:
                 latency_ms=_as_latency(payload.get("latency_ms")),
                 node_ms=_as_latency(payload.get("node_ms")),
                 pieces=_as_pieces(payload.get("pieces")),
+                ask_ms=_as_latency(payload.get("ask_ms")),
                 attempt=branch,
                 order=entry.offset,
             )
@@ -518,9 +520,7 @@ class RecordedTurns:
                 asked.append(digest)
                 turn = turns[index][1]
                 self._pacer.taken(
-                    _pace_key(scope, turn.attempt),
-                    turn.order,
-                    time.monotonic() + _abandon_after_s(turn, scope),
+                    _pace_key(scope, turn.attempt), turn.order, _hold_until(turn, scope)
                 )
                 return turn
         self._asking.add(key)
@@ -548,6 +548,17 @@ class RecordedTurns:
     def recorded(self) -> int:
         """How many turns a resume could be served, over every node and position."""
         return sum(max(map(len, attempts)) for attempts in self._attempts.values())
+
+
+async def _asked(turn: JournaledTurn) -> float:
+    """When a replayed question counts as asked: after as long as the run took to write it.
+
+    A replay writes no question, and started its clock at once -- its answers came back a
+    write's time sooner than the run's did, and a deadline inside that gap decided otherwise.
+    """
+    if turn.ask_ms > 0:
+        await asyncio.sleep(turn.ask_ms / 1000.0)
+    return time.monotonic()
 
 
 def _pace_key(scope: CallScope, attempt: str) -> tuple[str, int, str]:
@@ -589,6 +600,7 @@ def _recorded(turn: JournaledTurn) -> RecordedTurn:
         latency_ms=turn.latency_ms,
         node_ms=turn.node_ms,
         pieces=turn.pieces,
+        ask_ms=turn.ask_ms,
     )
 
 

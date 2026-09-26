@@ -8,9 +8,11 @@ file is about where that line sits.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -425,3 +427,31 @@ async def test_a_squashed_branch_s_turn_is_never_served_back(tmp_path: Path) -> 
     assert ReplayModel(journal=journal, run_id=RUN).steps == ()
     retired = ReplayModel(journal=journal, run_id=RUN, retired_branches=frozenset({"br-doomed"}))
     assert retired.steps == (0,)
+
+
+async def test_a_replay_waits_as_long_as_the_question_took_to_write(tmp_path: Path) -> None:
+    """A replay writes no question, and started its clock at once: its answers came back a
+    write's time sooner than the run's, and a deadline inside that gap decided otherwise.
+    Suspected by the eighteenth review."""
+    import time
+
+    class SlowToAsk(Journal):
+        async def append_async(self, run_id: str, kind: str, payload: Any) -> int:
+            if kind == "model_request":
+                await asyncio.sleep(0.2)
+            return await super().append_async(run_id, kind, payload)
+
+    journal = SlowToAsk(tmp_path / "j.db")
+    journaled = JournaledModel(ScriptedModel(turns=[tool_turn(("a", {}))]), journal)
+    with scoped(CallScope(run_id=RUN, branch_id="br-canon", step=0, node_id="agent")):
+        async for _event in journaled.stream(envelope()):
+            pass
+    (outcome,) = list(journal.read(RUN, kinds=["model_response"]))
+    assert int(outcome.payload["ask_ms"]) >= 200, outcome.payload  # type: ignore[arg-type]
+
+    replay = ReplayModel(journal=journal, run_id=RUN)
+    began = time.monotonic()
+    with scoped(CallScope(run_id=RUN, node_id="agent", step=0)):
+        first = await replay.stream(envelope()).__anext__()
+    assert isinstance(first, ToolUseComplete)
+    assert time.monotonic() - began >= 0.2
