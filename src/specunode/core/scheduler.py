@@ -75,7 +75,13 @@ from specunode.drafters.base import DraftContext, Drafter
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
 from specunode.journal.ledger import Ledger, build_ledger
-from specunode.journal.replay import OpenGroup, RecordedTurns, position_rule_problem, recover
+from specunode.journal.replay import (
+    OpenGroup,
+    RecordedTurns,
+    ReplayModel,
+    position_rule_problem,
+    recover,
+)
 from specunode.verify.gate import resolve_decision
 from specunode.verify.witness import ReadValidation, validate_reads
 
@@ -1808,6 +1814,9 @@ class Scheduler:
             new_committed = await self._commit(branch, committed, reducers or {}, claimed)
 
         journaled = cursor_after() if cursor_after is not None else branch.cursor
+        if isinstance(self.target, ReplayModel):
+            # A replay carries on from where the recorded run did (``ReplayModel.cursor_after``).
+            journaled = self.target.cursor_after(node_id) or journaled
         branch.retired_cursor = journaled
         branch.retire()
         self._retire_seq += 1

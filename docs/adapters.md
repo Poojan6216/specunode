@@ -178,9 +178,10 @@ however many of its blocks had arrived. And once a node returns, what it left ru
 more positions and makes no more calls: a turn still under way makes none of its calls, has the
 guess it had open squashed, and gives back the positions its blocks took unless the model's
 whole answer had already arrived; a call not yet begun is refused with `TurnAbandoned`; and a
-write already begun is refused where it would be staged. What was already on its way finishes --
-a read already sent to the upstream, a question already put to the model -- and a write staged
-before the return goes out with the node's own. How far work left running got by the return is
+write already begun is refused where it would be staged. What was already begun goes out and
+finishes -- a read, or a question to the model, whose request was being written as the node
+returned, as well as one already sent -- and a write staged before the return goes out with the
+node's own. How far work left running got by the return is
 a matter of timing, and a replay, which writes no answers, can get it further: await the work a
 node needs, every write above all.
 

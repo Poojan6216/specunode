@@ -1982,3 +1982,121 @@ async def test_a_turn_left_running_is_judged_by_when_its_answer_arrived(
     await asyncio.sleep(0.5)
     assert replayed.ok, replayed.error
     assert cursors_after(Journal(db), run_id) == cursors_after(Journal(replay_db), replay_run)
+
+
+# -- the twenty-fifth review ---------------------------------------------------------------------
+
+SIDE_TURN = RequestEnvelope(
+    model="scripted",
+    messages=(Message(role="user", content=(TextBlock(text="a note for cus-1"),)),),
+    max_tokens=256,
+)
+
+
+class SummaryAndSide:
+    """A lookup at 10 ms and the turn's end at ``ends_at``; a question on the side answered at
+    50 ms; the price at once."""
+
+    def __init__(self, ends_at: float) -> None:
+        self.ends_at = ends_at
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        if envelope == SIDE_TURN:
+            await asyncio.sleep(0.05)
+            return ModelResponse(model="scripted", content=(TextBlock(text="noted"),))
+        return ModelResponse(model="scripted", content=(TextBlock(text="25"),))
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        use = ToolUseBlock(id="t0", name="lookup_plan", args={"customer_id": "cus-1"})
+        await asyncio.sleep(0.01)
+        yield ToolUseComplete(index=0, block=use)
+        await asyncio.sleep(self.ends_at - 0.01)
+        yield TurnComplete(ModelResponse(model="scripted", content=(use,), stop_reason="tool_use"))
+
+
+@pytest.mark.parametrize(
+    "returns",
+    ["on a side answer", "cancelling its turn"],
+    ids=["once a side answer is in", "cancelling its turn without awaiting it"],
+)
+async def test_a_replay_carries_on_from_where_the_run_did(tmp_path: Path, returns: str) -> None:
+    """A node left a turn running and returned -- once a question it asked on the side was
+    answered, or cancelling the turn without waiting for the cancel -- and whether the turn kept
+    its positions turned on timing a replay does not keep: its side answer comes back a write
+    sooner, and a turn cancelled while its answer was written is served as one that never
+    answered. The replay placed the next node elsewhere, and a finished run did not replay.
+    Found by the twenty-fifth review."""
+    charged: list[str] = []
+
+    def build() -> tuple[PlainAdapter, object]:
+        @tool(effect="read")
+        async def lookup_plan(customer_id: str) -> JsonValue:
+            return {"plan": "basic"}
+
+        @tool(effect="write", idempotent=False)
+        async def charge_card(customer_id: str, amount: float) -> JsonValue:
+            charged.append(f"charge {amount}")
+            return {"charge_id": "ch"}
+
+        async def summarise(session: RunSession) -> None:
+            with contextlib.suppress(BaseException):
+                await session.call_turn(SUMMARY_TURN)  # type: ignore[misc]
+
+        @node(name="plan")
+        async def plan(session: RunSession) -> Decision:
+            assert session.model is not None
+            left = asyncio.get_running_loop().create_task(summarise(session))
+            if returns == "on a side answer":
+                await session.model.complete(SIDE_TURN)
+            else:
+                await asyncio.wait({left}, timeout=0.09)
+                left.cancel()  # and returns at once, without waiting for the cancel
+            session.state["planned"] = True
+            return ToolCall("lookup_plan", {})
+
+        @node(name="bill")
+        async def bill(session: RunSession) -> Decision:
+            assert session.model is not None
+            price = await session.model.complete(PRICE_TURN)
+            await session.call_tool(
+                "charge_card", {"customer_id": "cus-1", "amount": float(price.text)}
+            )
+            session.state["billed"] = True
+            return ToolCall("charge_card", {})
+
+        def route(state: Mapping[str, JsonValue]) -> str | None:
+            if not state.get("planned"):
+                return "plan"
+            return None if state.get("billed") else "bill"
+
+        return PlainAdapter.of([plan, bill], route), registry_of([lookup_plan, charge_card])
+
+    db = tmp_path / "run.db"
+    run_id = new_ulid()
+    adapter, registry = build()
+    # Answers take 100 ms to write: the turn's answer, at 80 ms, is in and being written as the
+    # node returns.
+    result = await asyncio.wait_for(
+        scheduler(
+            SlowTo(db, {"model_response"}),
+            adapter,
+            registry,
+            SummaryAndSide(0.08 if returns == "cancelling its turn" else 0.06),
+        ).run(run_id, {}),
+        timeout=30,
+    )
+    await asyncio.sleep(0.5)  # what was left running ends
+    assert result.ok, result.error
+
+    adapter, registry = build()
+    replay_db = tmp_path / "replay.db"
+    replay_run = new_ulid()
+    replayed = await asyncio.wait_for(
+        scheduler(Journal(replay_db), adapter, registry, replay_of(Journal(db), run_id)).run(
+            replay_run, {}
+        ),
+        timeout=30,
+    )
+    await asyncio.sleep(0.5)
+    assert replayed.ok, replayed.error
+    assert cursors_after(Journal(db), run_id) == cursors_after(Journal(replay_db), replay_run)
