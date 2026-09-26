@@ -541,6 +541,9 @@ class CallScope:
     #: nothing and writes nothing more (``end_drive``). ``None`` outside a Scheduler.
     drive: Drive | None = None
     halted: Callable[[], bool] | None = None
+    #: Whether the node's body has returned: a question a task it left running puts to the model
+    #: after that is not asked.
+    returned: Callable[[], bool] | None = None
     #: When the node body began (``time.monotonic()``), so a turn it stopped waiting for can be
     #: served against the node's own clock, not only the call's.
     node_started: float = 0.0
@@ -763,6 +766,11 @@ def _refuse_if_halted(scope: CallScope) -> None:
         raise TurnAbandoned(
             "this node was stopped when a turn it no longer stopped waiting for was abandoned; "
             "it asks nothing more"
+        )
+    if scope.returned is not None and scope.returned():
+        raise TurnAbandoned(
+            "this node has returned: a question a task it left running puts to the model after "
+            "that is not asked"
         )
 
 
@@ -1445,6 +1453,8 @@ class JournaledModel:
         the drive it belongs to is over."""
         if scope.halted is not None and scope.halted():
             return "its node was stopped: a turn it was served was abandoned; it asks nothing more"
+        if scope.returned is not None and scope.returned():
+            return "its node has returned: a question left running is not asked after that"
         if self._let_go(scope):
             return "the run this call belongs to is over: nothing more is asked in it"
         return None

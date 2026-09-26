@@ -220,8 +220,6 @@ class ReplayModel:
     _next: dict[tuple[str, int], int] = field(default_factory=dict, init=False)
     _served: list[int] = field(default_factory=list, init=False)
     _pacer: _Pacer = field(default_factory=_Pacer, init=False)
-    #: Where the recorded run carried on from after each node retired, by node id.
-    _cursors: dict[str, StepCursor] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         problem = position_rule_problem(self.journal, self.run_id)
@@ -229,31 +227,6 @@ class ReplayModel:
             raise PositionRuleMismatch(problem)
         self._load()
         self._keep_one_attempt()
-        self._load_cursors()
-
-    def _load_cursors(self) -> None:
-        nodes: dict[str, str] = {}
-        for entry in self.journal.read(self.run_id, kinds=["branch_forked", "branch_resolved"]):
-            payload = entry.payload
-            branch_id = str(payload.get("branch_id", ""))
-            if entry.kind == "branch_forked":
-                nodes[branch_id] = str(payload.get("node_id") or "")
-            elif payload.get("status") == "retired" and nodes.get(branch_id):
-                self._cursors[nodes[branch_id]] = _cursor_from(
-                    payload.get("cursor_after"), StepCursor()
-                )
-
-    def cursor_after(self, node_id: str) -> StepCursor | None:
-        """Where the recorded run carried on from after ``node_id`` retired, if it did.
-
-        A replay carries on from there too (``Scheduler._retire``). Where a node leaves the
-        cursor can turn on timing -- a model turn it left running keeps its positions or gives
-        them back as it returns, by whether its answer had arrived -- and a replay, which writes
-        no answers, reaches that return a write sooner or later than the run did: recomputed,
-        the next node asked at a position the journal had no turn for, and a finished run did not
-        replay.
-        """
-        return self._cursors.get(node_id)
 
     def _keep_one_attempt(self) -> None:
         """Serve each (node, position) the turns of the attempt the run kept, and no other.

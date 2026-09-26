@@ -75,13 +75,7 @@ from specunode.drafters.base import DraftContext, Drafter
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
 from specunode.journal.ledger import Ledger, build_ledger
-from specunode.journal.replay import (
-    OpenGroup,
-    RecordedTurns,
-    ReplayModel,
-    position_rule_problem,
-    recover,
-)
+from specunode.journal.replay import OpenGroup, RecordedTurns, position_rule_problem, recover
 from specunode.verify.gate import resolve_decision
 from specunode.verify.witness import ReadValidation, validate_reads
 
@@ -954,6 +948,7 @@ class Scheduler:
             halt=lambda reason: self._halt_node(branch, reason),
             drive=self._drive,
             halted=lambda: branch.abandoned,
+            returned=lambda: branch.returned,
             node_started=time.monotonic(),
             # Whether this request is being sent on a guess. Always False before, which made
             # every ``model_request`` entry claim it was authorised work -- and a field that
@@ -1001,7 +996,11 @@ class Scheduler:
             raise SchedulerError(
                 f"node {node_id} did not retire: {branch.reason or 'no reason recorded'}"
             )
-        self._cursor = branch.retired_cursor or branch.cursor
+        # Merged, not taken: LangGraph runs a superstep's nodes side by side, each forked from
+        # the cursor as it stood when it began. Taken whole, the one that retired last put back
+        # a cursor from before its siblings' visits -- the next visit to one of them minted the
+        # same node id at the same position, under the same key, and its write was deduped away.
+        self._cursor = self._cursor.merged(branch.retired_cursor or branch.cursor)
         self._steps += 1
         # LangGraph owns reducers and channel semantics, and a second copy in the journal would
         # be a second answer to what the run's state is. docs/replay.md says so.
@@ -1342,6 +1341,7 @@ class Scheduler:
             halt=lambda reason: self._halt_node(branch, reason),
             drive=self._drive,
             halted=lambda: branch.abandoned,
+            returned=lambda: branch.returned,
             node_started=time.monotonic(),
             # Whether this request is being sent on a guess. Always False before, which made
             # every ``model_request`` entry claim it was authorised work -- and a field that
@@ -1814,9 +1814,6 @@ class Scheduler:
             new_committed = await self._commit(branch, committed, reducers or {}, claimed)
 
         journaled = cursor_after() if cursor_after is not None else branch.cursor
-        if isinstance(self.target, ReplayModel):
-            # A replay carries on from where the recorded run did (``ReplayModel.cursor_after``).
-            journaled = self.target.cursor_after(node_id) or journaled
         branch.retired_cursor = journaled
         branch.retire()
         self._retire_seq += 1
@@ -2431,6 +2428,14 @@ class SpeculativeTurn:
         # that a staged effect never exists for a turn the journal does not yet record.
         results: list[JsonValue] = []
         for ordinal, emitted in enumerate(self.decisions):
+            if branch.positions_settled:
+                # Looked at again before each block, not only once: a slow read earlier in the
+                # turn outlasted its node, which returned and retired meanwhile, and the guess
+                # confirmed by the next block was adopted into it -- its write never drained,
+                # never discarded, and the turn waiting on its ack for ever.
+                raise TurnAbandoned(
+                    f"node {self._node_id} returned before this turn ended; its calls are not made"
+                )
             task = slots[ordinal]
             child = self._confirmed.get(ordinal)
             confirmed = child

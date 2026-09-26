@@ -177,13 +177,14 @@ does not complete -- it fails, or the node stops waiting for it -- takes no posi
 however many of its blocks had arrived. And once a node returns, what it left running takes no
 more positions and makes no more calls: a turn still under way makes none of its calls, has the
 guess it had open squashed, and gives back the positions its blocks took unless the model's
-whole answer had already arrived; a call not yet begun is refused with `TurnAbandoned`; and a
-write already begun is refused where it would be staged. What was already begun goes out and
-finishes -- a read, or a question to the model, whose request was being written as the node
-returned, as well as one already sent -- and a write staged before the return goes out with the
-node's own. How far work left running got by the return is
-a matter of timing, and a replay, which writes no answers, can get it further: await the work a
-node needs, every write above all.
+whole answer had already arrived; a call or a question not yet begun is refused with
+`TurnAbandoned`; and a write already begun is refused where it would be staged. What was already
+begun goes out and finishes -- a read, or a question to the model, whose request was being
+written as the node returned, as well as one already sent -- and a write staged before the return
+goes out with the node's own. How far work left running got by the return is a matter of timing,
+which a replay -- writing no answers -- does not keep: it can get further or less far, and a
+turn left running can leave the next node's calls elsewhere, when the replay stops rather than
+go on. Await the work a node needs, every write above all.
 
 ### A model call that fails raises `ModelError`
 
@@ -205,10 +206,11 @@ and returns, is not committed, and the run stops all the same. Served answers co
 recorded pace and order -- a stream piece by piece, as its caller had it, each piece no sooner
 than the model sent it -- so a node that races two calls, falls back on a timeout without
 cancelling, or gives up on a model slow to start, decides on resume as it did, as far as the
-resuming process keeps the run's time: a disk slower than the run's can hand an answer over
-late, and a call whose effect already went out returns at once ([replay.md](replay.md)). A
-deadline with room to spare decides the same; one on the edge, or one that also covers the
-calls a turn makes, may not. An answer waits
+resuming process keeps the run's time: the run's node had each answer only once it was
+written, so a quicker or slower disk -- or a replay, which writes nothing -- hands it over
+sooner or later, by up to a journal write, and a call whose effect already went out returns at
+once ([replay.md](replay.md)). A deadline with room to spare decides the same; one on the edge,
+or one that also covers the calls a turn makes, may not. An answer waits
 for an earlier one only until the node is done with that one -- answered, failed or given up on
 -- and a node that holds an earlier answer open far longer than the recorded run did, while it
 waits for a later one, is stopped with `TurnAbandoned` too.

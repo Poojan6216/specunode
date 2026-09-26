@@ -104,6 +104,17 @@ class StepCursor:
         counts[structural_id] = index + 1
         return replace(self, visits=tuple(sorted(counts.items()))), f"{structural_id}#{index}"
 
+    def merged(self, other: StepCursor) -> StepCursor:
+        """The later of two cursors, position by position: the higher step, and each node's
+        higher visit count -- for a run carrying on from nodes that ran side by side."""
+        counts = dict(self.visits)
+        for name, count in other.visits:
+            counts[name] = max(counts.get(name, 0), count)
+        return StepCursor(
+            step_index=max(self.step_index, other.step_index),
+            visits=tuple(sorted(counts.items())),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ReadRecord:

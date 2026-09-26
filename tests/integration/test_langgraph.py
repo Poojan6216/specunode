@@ -11,7 +11,9 @@ deciding what runs next and keeps reducing state, which is why the final states 
 
 from __future__ import annotations
 
+import operator
 from pathlib import Path
+from typing import Annotated, TypedDict
 
 import pytest
 
@@ -339,3 +341,80 @@ async def test_a_failed_langgraph_run_is_not_reported_resumable(tmp_path: Path) 
     assert not result.ok
     recovery = recover(journal, result.run_id)
     assert recovery.finished and recovery.failed and not recovery.resumable
+
+
+async def test_nodes_run_side_by_side_keep_their_visits(tmp_path: Path) -> None:
+    """Two nodes of one superstep each counted their visit on the run's cursor as they began,
+    and the one that retired last put back its own cursor -- from before its sibling's visit. The
+    sibling's next visit minted the same node id at the same position: its write had the same key
+    as its first, and was deduped away. Found by the twenty-sixth review."""
+    import asyncio
+    from typing import Any
+
+    from langgraph.graph import END, START, StateGraph
+
+    from specunode.buffer.store_buffer import StoreBuffer
+    from specunode.core.effects import EffectClass, ToolRegistry, ToolSpec
+    from specunode.core.graph import routed
+    from specunode.core.policy import Policy
+    from specunode.core.scheduler import Scheduler
+    from specunode.integrations.langgraph import LangGraphAdapter
+
+    State = SideBySideState
+    sent: list[str] = []
+
+    async def notify_fn(who: str) -> dict[str, Any]:
+        sent.append(who)
+        return {"ok": True}
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(name="notify", effect=EffectClass.WRITE, fn=notify_fn, idempotent=False)
+    )
+    notify = routed(registry.get("notify"))
+
+    async def a(state: State) -> State:
+        await asyncio.sleep(0.2)  # retires last
+        return {"log": ["a"]}
+
+    async def b(state: State) -> State:
+        await asyncio.sleep(0.01)
+        await notify(who="ops")  # the same call on both visits
+        return {"log": ["b"]}
+
+    async def c(state: State) -> State:
+        return {"loops": state.get("loops", 0) + 1, "log": ["c"]}
+
+    graph = StateGraph(State)
+    graph.add_node("a", a)
+    graph.add_node("b", b)
+    graph.add_node("c", c)
+    graph.add_edge(START, "a")
+    graph.add_edge(START, "b")
+    graph.add_edge("a", "c")
+    graph.add_edge("b", "c")
+    graph.add_conditional_edges("c", lambda s: "b" if s.get("loops", 0) < 2 else END)
+
+    journal = Journal(tmp_path / "lg.db")
+    run_id = new_ulid()
+    result = await asyncio.wait_for(
+        Scheduler(
+            graph=LangGraphAdapter(compiled=graph.compile()),
+            registry=registry,
+            journal=journal,
+            buffer=StoreBuffer(journal=journal, run_id=""),
+            dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),
+            target=JournaledModel(ScriptedModel(turns=[]), journal, provider="scripted"),
+            policy=Policy(speculation=False),
+        ).run(run_id, {"loops": 0, "log": []}),
+        timeout=30,
+    )
+    assert result.ok, result.error
+    nodes = [e.payload.get("node_id") for e in journal.read(run_id, kinds=["branch_forked"])]
+    assert len(nodes) == len(set(nodes)), f"a node id minted twice: {nodes}"
+    assert sent == ["ops", "ops"], f"a write was deduped away: {sent}"
+
+
+class SideBySideState(TypedDict, total=False):
+    loops: int
+    log: Annotated[list[str], operator.add]

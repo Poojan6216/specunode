@@ -144,11 +144,13 @@ An idempotency key is derived from the run, the node, the program position, the 
 no positions, however many of its blocks had arrived -- and a turn still under way when its node
 returns is one it stopped waiting for: its calls are not made, and its positions are given back
 then, unless the model's whole answer had already arrived. Where a node leaves the cursor can
-turn on timing like that -- a replay, which writes no answers, reaches a node's return a write
-sooner or later than the run did -- so a replay carries on after each node from where the
-recorded run did, its journaled `cursor_after`, whatever its own timing. A call the node left
-running is refused once the node has returned, before it takes a position or where it would
-stage a write; a read or a question already begun still goes out. So the node's next call sits where it would had the
+turn on timing like that, and a replay -- which writes no answers -- reaches a node's return a
+write sooner or later than the run did: a node that left a turn running and returned as its
+answer arrived can leave the cursor elsewhere in a replay, which then stops (`ReplayExhausted`)
+rather than go on down a path the run did not take. Await every turn a node starts. A call or a
+question the node left running is refused once the node has returned -- before it takes a
+position, where it would stage a write, or before its question is put; one already begun still
+goes out. So the node's next call sits where it would had the
 turn not been asked, and a timing that a resume reproduces only roughly moves no key. Where a node's calls sit has
 changed between versions of SpecuNode -- the position rule, recorded in `run_started` -- and a
 run any part of which was recorded under another rule is neither resumed nor replayed by this
@@ -156,18 +158,20 @@ version; `specunode status` says so. Nothing is dispatched before the model turn
 is journaled, and a resumed node whose earlier answer may already have sent something is served
 that answer when it asks the same question -- so the resumed run makes the same calls, derives
 the same keys, and the dedupe table catches the earlier attempt, whatever the model would have
-said the second time. A served answer comes back no sooner than it first did -- counted, as the
-run's was, from when its question began to be written -- and in the order the answers came back
-in the attempt it is served from; so a resume, and a replay, take as long as the model took, and
-a node that acts on whichever answer arrives first, or falls back when one is not back in time,
-decides as it did. That holds as far as this process keeps the run's time, and no further: it
-writes the question and the answer again before it hands the answer over, and on a disk slower
-than the run's the answer can come late -- the question's write is hidden in the time the model
-took to answer, the answer's is not; and a call whose effect already went out returns at once,
-however long it took the first time. A node whose deadline
-fell closer than that to an answer -- or covers the calls a turn makes -- may decide otherwise
-on a resume, and a different call goes out under a different key. A streamed answer is handed
-over piece by piece: exactly the pieces its
+said the second time. A served answer is paced by when it first arrived from the model --
+counted, as the run's was, from when its question began to be written -- and in the order the
+answers came back in the attempt it is served from; so a resume, and a replay, take as long as
+the model took, and a node that acts on whichever answer arrives first, or falls back when one
+is not back in time, decides as it did -- as far as the resuming or replaying process keeps the
+run's time, and no further. The run's node had each answer only once its journal had written
+it; a resume writes it again, on its own disk, before handing it over, and a replay writes
+nothing. So an answer can reach a resumed or replayed node sooner than it reached the run's --
+on a quicker disk, and in a replay, by up to one write of it -- or later, on a slower disk; and a
+call whose effect already went out returns at once, however long it took the first time. A node
+whose deadline fell within that of an answer, or that covers the calls a turn makes, may decide
+otherwise on a resume or a replay, and a different call goes out under a different key -- under
+`replay --dispatch` too. Give a deadline that decides between effects room well past a journal
+write. A streamed answer is handed over piece by piece: exactly the pieces its
 caller had as it streamed, at the positions the stream gave them, each no sooner than it arrived
 from the model -- a node that gives up on a model slow to say its first word sees the first word
 when the model said it, and one busy with a slow lookup between two pieces does not make a quick
