@@ -47,6 +47,7 @@ from specunode.core.model import (
     TextDelta,
     ToolUseBlock,
     ToolUseComplete,
+    TurnAbandoned,
     TurnComplete,
 )
 from specunode.core.policy import Policy
@@ -1140,26 +1141,47 @@ def test_status_says_what_resume_would(tmp_path: Path, monkeypatch: pytest.Monke
 # -- the twenty-second review --------------------------------------------------------------------
 
 
-class AnswersThenClosesSlowly:
-    """Asks to note the order at 100 ms; then takes ``closing`` seconds to close its connection
-    -- inside its own ``async with``, as a client built on an HTTP stream context does -- and,
-    with ``fails``, fails as it closes."""
+class Connection:
+    """An HTTP stream's connection: closed in its ``async with`` exit, which takes ``closing``
+    seconds -- and cannot be cut short, as a connection pool's release often cannot -- and, with
+    ``fails``, fails."""
 
-    def __init__(self, *, closing: float = 1.5, fails: bool = False) -> None:
+    def __init__(self, closing: float, *, fails: bool = False) -> None:
         self.closing = closing
         self.fails = fails
+
+    async def __aenter__(self) -> Connection:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await asyncio.sleep(self.closing)
+        if self.fails:
+            raise ConnectionResetError("connection reset while closing the stream")
+
+
+class AnswersThenClosesSlowly:
+    """Asks to note the order at 100 ms, inside its own ``async with`` -- as a client built on an
+    HTTP stream context does -- whose exit takes ``closing`` seconds to close the connection,
+    and with ``fails`` fails doing it. The server keeps its end open for ``lingers`` seconds
+    after the answer."""
+
+    def __init__(self, *, closing: float = 1.5, fails: bool = False, lingers: float = 30) -> None:
+        self.closing = closing
+        self.fails = fails
+        self.lingers = lingers
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
         raise NotImplementedError
 
     async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
         use = ToolUseBlock(id="t0", name="note_order", args={"customer_id": "cus-1"})
-        await asyncio.sleep(0.1)
-        yield ToolUseComplete(index=0, block=use)
-        yield TurnComplete(ModelResponse(model="scripted", content=(use,), stop_reason="tool_use"))
-        await asyncio.sleep(self.closing)
-        if self.fails:
-            raise ConnectionResetError("connection reset while closing the stream")
+        async with Connection(self.closing, fails=self.fails):
+            await asyncio.sleep(0.1)
+            yield ToolUseComplete(index=0, block=use)
+            yield TurnComplete(
+                ModelResponse(model="scripted", content=(use,), stop_reason="tool_use")
+            )
+            await asyncio.sleep(self.lingers)
 
 
 def notes_orders(world: list[str], *, reads_it_itself: bool) -> tuple[PlainAdapter, object]:
@@ -1274,7 +1296,7 @@ async def test_a_client_failing_as_it_closes_does_not_undo_an_answer_on_disk(
             Journal(tmp_path / "j.db"),
             adapter,
             registry_of([note_order]),
-            AnswersThenClosesSlowly(closing=closing, fails=True),
+            AnswersThenClosesSlowly(closing=closing, fails=True, lingers=0),
         ).run(new_ulid(), {}),
         timeout=30,
     )
@@ -1529,3 +1551,349 @@ async def test_a_guess_of_a_turn_left_running_is_settled_before_the_run_ends(
         CliRunner().invoke, app, ["status", run_id, "--journal", str(db)]
     )
     assert "resumable: False" in shown.output, shown.output
+
+
+# -- the twenty-third review ---------------------------------------------------------------------
+
+
+class SummarisesThenClosesSlowly:
+    """A summary -- text, no call in it -- at 100 ms, inside an ``async with`` whose exit takes
+    1.5 s to close the connection; the server keeps its end open after the answer. ``complete``
+    prices the order, in a second."""
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        await asyncio.sleep(1.0)
+        return ModelResponse(model="scripted", content=(TextBlock(text="25"),))
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        text = "cus-1 ordered one widget"
+        async with Connection(1.5):
+            await asyncio.sleep(0.1)
+            yield TextDelta(index=0, text=text)
+            yield TurnComplete(
+                ModelResponse(
+                    model="scripted", content=(TextBlock(text=text),), stop_reason="end_turn"
+                )
+            )
+            await asyncio.sleep(30)
+
+
+def prices_orders(
+    world: list[str], seen: list[str], *, reads_it_itself: bool = False, race: bool = False
+) -> tuple[PlainAdapter, object]:
+    """Summarise, then price, within a second -- or charge the standard 10 if that is not done
+    by then. With ``race``: no deadline, but whichever of the summary and the price is back
+    first decides -- 30 for the summary, the model's price for the price."""
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        world.append(f"charge_card {amount}")
+        return {"charge_id": f"ch_{amount}"}
+
+    async def summarise(session: RunSession) -> None:
+        if reads_it_itself:
+            assert session.model is not None
+            async for _event in session.model.stream(SUMMARY_TURN):
+                pass
+        else:
+            await session.call_turn(SUMMARY_TURN)  # type: ignore[misc]
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        assert session.model is not None
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        if race:
+            summary = asyncio.ensure_future(summarise(session))
+            price = asyncio.ensure_future(session.model.complete(PRICE_TURN))
+            done, _ = await asyncio.wait({summary, price}, return_when=asyncio.FIRST_COMPLETED)
+            amount = 30.0 if summary in done else float(price.result().text)
+            seen.append("the summary came first" if summary in done else "the price came first")
+            await asyncio.wait({summary, price})
+        else:
+            try:
+                async with asyncio.timeout(1.0):
+                    await summarise(session)
+                    priced = await session.model.complete(PRICE_TURN)
+                amount = float(priced.text)
+                seen.append(f"priced at {loop.time() - began:.1f} s")
+            except TimeoutError:
+                amount = 10.0
+                seen.append(f"fell back at {loop.time() - began:.1f} s")
+        await session.call_tool("charge_card", {"customer_id": "cus-1", "amount": amount})
+        session.state["billed"] = True
+        return ToolCall("charge_card", {})
+
+    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
+    return adapter, registry_of([charge_card])
+
+
+@pytest.mark.parametrize(
+    ("reads_it_itself", "race"),
+    [(False, False), (True, False), (False, True)],
+    ids=["call_turn under a deadline", "stream read by the node under a deadline", "a race"],
+)
+async def test_a_client_closing_its_connection_does_not_decide_for_the_node(
+    tmp_path: Path, reads_it_itself: bool, race: bool
+) -> None:
+    """The answer was on disk at 100 ms, and the stream then waited -- uncancellably -- for the
+    client to close its connection in its ``async with`` exit. A deadline that fired meanwhile
+    was swallowed, and the node priced the order at 2.6 s where a resume, with no connection to
+    close, fell back at 1 s; a node racing the summary against the price had the price win, and
+    the resume the summary. Either way the resume charged a second, different amount under a
+    second key, and said ok. Found by the twenty-third review."""
+    world: list[str] = []
+    seen: list[str] = []
+    adapter, registry = prices_orders(world, seen, reads_it_itself=reads_it_itself, race=race)
+    db = tmp_path / "source.db"
+    run_id = new_ulid()
+    with pytest.raises(Crash):
+        await asyncio.wait_for(
+            scheduler(
+                CrashingJournal(db, before_commit_of("bill#0")),
+                adapter,
+                registry,
+                SummarisesThenClosesSlowly(),
+            ).run(run_id, {}),
+            timeout=30,
+        )
+    await bury_the_dead_process()
+    decided = "the summary came first" if race else "fell back"
+    assert len(seen) == 1 and seen[0].startswith(decided), f"the run decided otherwise: {seen}"
+    if not race:
+        # Not held up by the 1.5 s close: at the deadline, and a write or two after it.
+        assert float(seen[0].split()[-2]) < 1.5, f"the deadline was held up: {seen}"
+
+    resumed_seen: list[str] = []
+    adapter, registry = prices_orders(
+        world, resumed_seen, reads_it_itself=reads_it_itself, race=race
+    )
+    resumed = await asyncio.wait_for(
+        scheduler(Journal(db), adapter, registry, SummarisesThenClosesSlowly()).resume(run_id),
+        timeout=60,
+    )
+    assert resumed.ok, resumed.error
+    assert len(resumed_seen) == 1 and resumed_seen[0].startswith(decided), resumed_seen
+    assert len(world) == 1, f"charged {world} for one order"
+
+
+class GuessesSlowly:
+    """A drafter that takes ``delay`` seconds over its first guess -- a tier-2 drafter asking
+    its own model -- and guesses nothing after it."""
+
+    def __init__(self, decision: ToolCall, delay: float) -> None:
+        self.decision = decision
+        self.delay = delay
+        self.asked = 0
+
+    async def predict(self, context: object) -> list[object]:
+        from specunode.drafters.base import Prediction
+
+        self.asked += 1
+        if self.asked > 1:
+            return []
+        await asyncio.sleep(self.delay)
+        return [Prediction(decision=self.decision, tier=2, score=0.5)]
+
+
+class LooksUpOnceThenEnds:
+    """A lookup at ``block_at``; the turn's end at 800 ms."""
+
+    def __init__(self, block_at: float) -> None:
+        self.block_at = block_at
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        raise NotImplementedError
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        first = ToolUseBlock(id="t0", name="lookup_plan", args={"customer_id": "cus-1"})
+        await asyncio.sleep(self.block_at)
+        yield ToolUseComplete(index=0, block=first)
+        await asyncio.sleep(0.8 - self.block_at)
+        yield TurnComplete(
+            ModelResponse(model="scripted", content=(first,), stop_reason="tool_use")
+        )
+
+
+class SlowToFork(Journal):
+    """A disk slow (200 ms) to take a guess's fork."""
+
+    async def append_async(self, run_id: str, kind: str, payload: Mapping[str, JsonValue]) -> int:
+        if kind == "branch_forked" and payload.get("parent_id") is not None:
+            await asyncio.sleep(0.2)
+        return await super().append_async(run_id, kind, payload)
+
+
+@pytest.mark.parametrize(
+    "while_it",
+    ["guessed", "wrote its fork"],
+    ids=["the drafter was guessing", "the guess's fork was being written"],
+)
+async def test_a_guess_is_not_opened_or_run_once_its_node_returned(
+    tmp_path: Path, while_it: str
+) -> None:
+    """A turn its node left running was guessing -- a drafter asking its own model -- or writing
+    its guess's fork when the node returned. The guess was opened all the same: its call reached
+    the upstream after the node had returned, and it was never resolved -- or it was resolved
+    before its fork was on disk. Found by the twenty-third review."""
+    upstream: list[str] = []
+
+    @tool(effect="read")
+    async def lookup_plan(customer_id: str) -> JsonValue:
+        upstream.append("lookup_plan")
+        return {"plan": "basic"}
+
+    @tool(effect="read")
+    async def lookup_notes(customer_id: str) -> JsonValue:
+        upstream.append("lookup_notes")
+        return {"notes": []}
+
+    async def summarise(session: RunSession) -> None:
+        with contextlib.suppress(BaseException):
+            await session.call_turn(SUMMARY_TURN)  # type: ignore[misc]
+
+    @node(name="plan")
+    async def plan(session: RunSession) -> Decision:
+        asyncio.get_running_loop().create_task(summarise(session))  # never awaited
+        await asyncio.sleep(0.15)
+        session.state["planned"] = True
+        return ToolCall("lookup_plan", {})
+
+    guess = ToolCall("lookup_notes", {"customer_id": "cus-1"})
+    registry = registry_of([lookup_plan, lookup_notes])
+    db = tmp_path / "j.db"
+    # The node returns at 150 ms: while a drafter slow to guess is at it (from 10 ms to 210 ms)
+    # -- its retirement still being written then -- or while a guess's fork is written (from 50
+    # ms to 250 ms).
+    journal = SlowToFork(db) if while_it == "wrote its fork" else SlowToConfirm(db)
+    drafter = FixedDrafter(guess) if while_it == "wrote its fork" else GuessesSlowly(guess, 0.2)
+    run_id = new_ulid()
+    result = await asyncio.wait_for(
+        Scheduler(
+            graph=PlainAdapter.of([plan], lambda s: None if s.get("planned") else "plan"),  # type: ignore[arg-type]
+            registry=registry,
+            journal=journal,
+            buffer=StoreBuffer(journal=journal, run_id=""),
+            dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),
+            target=JournaledModel(
+                LooksUpOnceThenEnds(0.05 if while_it == "wrote its fork" else 0.01),
+                journal,
+                provider="scripted",
+            ),
+            policy=Policy(speculation=True, max_speculation_depth=3),
+            predictor=drafter,  # type: ignore[arg-type]
+        ).run(run_id, {}),
+        timeout=30,
+    )
+    assert result.ok, result.error
+    await asyncio.sleep(1.0)  # the rest of the reply arrives, and the turn ends
+    assert "lookup_notes" not in upstream, "a guess ran after its node returned"
+    assert after_the_first_end(db, run_id) == []
+    entries = list(Journal(db).read(run_id))
+    forked = {e.payload.get("branch_id"): e.offset for e in entries if e.kind == "branch_forked"}
+    resolved = {
+        e.payload.get("branch_id"): e.offset for e in entries if e.kind == "branch_resolved"
+    }
+    assert set(forked) <= set(resolved), f"{set(forked) - set(resolved)} never resolved"
+    assert all(forked[b] < resolved[b] for b in forked), "resolved before its fork was on disk"
+    guesses = [e for e in entries if e.kind == "branch_forked" and e.payload.get("parent_id")]
+    if while_it == "guessed":
+        assert guesses == [], "a guess was forked after its node returned"
+
+
+@pytest.mark.parametrize("fails_at", [0.13, 0.17], ids=["before", "after"])
+async def test_a_turn_left_running_takes_no_positions_whenever_it_fails(
+    tmp_path: Path, fails_at: float
+) -> None:
+    """A turn a node left running took a position with a block that came while the node ran.
+    Failing before the node returned, it gave the position back; failing after, it kept it --
+    and where the node's retirement said the run carries on from depended on which. The node
+    returns at 150 ms. Found by the twenty-third review."""
+
+    @tool(effect="read")
+    async def lookup_plan(customer_id: str) -> JsonValue:
+        return {"plan": "basic"}
+
+    async def summarise(session: RunSession) -> None:
+        with contextlib.suppress(BaseException):
+            await session.call_turn(SUMMARY_TURN)  # type: ignore[misc]
+
+    @node(name="plan")
+    async def plan(session: RunSession) -> Decision:
+        asyncio.get_running_loop().create_task(summarise(session))  # never awaited
+        await asyncio.sleep(0.15)
+        session.state["planned"] = True
+        return ToolCall("lookup_plan", {})
+
+    db = tmp_path / "j.db"
+    run_id = new_ulid()
+    result = await asyncio.wait_for(
+        scheduler(
+            Journal(db),
+            PlainAdapter.of([plan], lambda s: None if s.get("planned") else "plan"),
+            registry_of([lookup_plan]),
+            LooksUpForAWhile(0.02, fails_at, fails=True),
+        ).run(run_id, {}),
+        timeout=30,
+    )
+    await asyncio.sleep(0.3)
+    assert result.ok, result.error
+    assert cursors_after(Journal(db), run_id) == [("plan#0", 0)]
+
+
+class SlowTo(Journal):
+    """A disk slow (100 ms) to take entries of ``kinds``."""
+
+    def __init__(self, path: Path, kinds: set[str]) -> None:
+        super().__init__(path)
+        self.kinds = kinds
+
+    async def append_async(self, run_id: str, kind: str, payload: Mapping[str, JsonValue]) -> int:
+        if kind in self.kinds:
+            await asyncio.sleep(0.1)
+        return await super().append_async(run_id, kind, payload)
+
+
+@pytest.mark.parametrize(
+    "slow",
+    [set(), {"tool_request"}, {"branch_resolved"}],
+    ids=["a quick disk", "slow to take the call", "slow to take the retirement"],
+)
+async def test_a_write_left_running_is_not_staged_once_its_node_returned(
+    tmp_path: Path, slow: set[str]
+) -> None:
+    """A write the node started and never awaited, begun before the node returned, reached the
+    store buffer after it: staged during the retirement and sent -- or, a little later, left
+    waiting on a drain that had already been made. Found by the twenty-third review."""
+    sent: list[str] = []
+    left: list[asyncio.Task[JsonValue]] = []
+
+    @tool(effect="write", idempotent=False)
+    async def notify(customer_id: str) -> JsonValue:
+        sent.append("notify")
+        return {"ok": True}
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        call = session.call_tool("notify", {"customer_id": "cus-1"})
+        left.append(asyncio.get_running_loop().create_task(call))  # type: ignore[arg-type]
+        await asyncio.sleep(0)  # the call begins -- takes its position -- before the return
+        session.state["billed"] = True
+        return ToolCall("notify", {})
+
+    db = tmp_path / "j.db"
+    run_id = new_ulid()
+    result = await asyncio.wait_for(
+        scheduler(
+            SlowTo(db, slow) if slow else Journal(db),
+            PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill"),
+            registry_of([notify]),
+            AnswersThenClosesSlowly(),
+        ).run(run_id, {}),
+        timeout=30,
+    )
+    await asyncio.wait(left, timeout=2)
+    assert result.ok, result.error
+    assert left[0].done(), "the call left running is still waiting"
+    assert isinstance(left[0].exception(), TurnAbandoned)
+    assert sent == []

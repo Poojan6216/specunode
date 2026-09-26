@@ -337,6 +337,13 @@ class BranchTools:
         if spec.effect is EffectClass.READ:
             return await scheduler.execute_read(branch, call, spec, call_id, step, self._node_id)
 
+        if branch.positions_settled:
+            # Begun before its node returned, and reaching here after: staged now, it waited on
+            # a drain its retirement may already have made, or sent a write on a node that was
+            # done. What a node left running is not made once it has returned.
+            raise TurnAbandoned(
+                f"node {self._node_id} returned while its {name} was being made; it is not made"
+            )
         # ``step``, not the cursor: this call's program position is the one reserved above.
         effect = await scheduler.buffer.stage(branch, call, spec, node_id=self._node_id, step=step)
         scheduler.counters.effects_staged += 1
@@ -1279,8 +1286,7 @@ class Scheduler:
     async def _journal_fork(
         self, branch: Branch, node_id: str, *, group_id: str | None = None
     ) -> None:
-        await self.journal.append_async(
-            self.run_id,
+        await self._append_while_driving(
             "branch_forked",
             {
                 "v": 1,
@@ -1364,12 +1370,19 @@ class Scheduler:
         return outcome, ToolCall("", {})
 
     async def _squash_what_it_left(self, branch: Branch) -> None:
-        """Squash the open guesses of turns a node left running when its body returned.
+        """Settle the turns a node left running when its body returned.
 
-        Nothing they guessed can be adopted now. Left to be settled when the model's next block
-        arrived, a guess was squashed -- or confirmed -- after ``run_finished``; and once that
-        was refused, it was never resolved at all. Squashed here, while the run is still driven.
+        A turn still under way is one the node stopped waiting for, and takes no positions --
+        however many of its blocks had arrived by the return, which is a matter of timing: its
+        positions are given back now, before anything is awaited, as a turn that fails gives
+        them back. And nothing they guessed can be adopted now. Left to be settled when the
+        model's next block arrived, a guess was squashed -- or confirmed -- after
+        ``run_finished``; and once that was refused, it was never resolved at all. Squashed
+        here, while the run is still driven.
         """
+        for turn in self._turns:
+            if turn.branch is branch and turn.under_way:
+                branch.rewind_to(turn.base)
         for turn in self._turns:
             if turn.branch is branch:
                 await turn.squash_open("node_returned")
@@ -1885,9 +1898,11 @@ class Scheduler:
             turn = SpeculativeTurn(self, branch, node_id)
             self._turns.append(turn)
             branch.turns_in_flight += 1
+            turn.under_way = True
             try:
                 return await turn.run(envelope)
             finally:
+                turn.under_way = False
                 branch.turns_in_flight -= 1
 
         return call_turn
@@ -2163,6 +2178,12 @@ class SpeculativeTurn:
         self._tier: int = 1
         #: What the open prediction cost to produce; charged to ``wasted_tokens`` on a squash.
         self._cost_tokens: int = 0
+        #: Between ``call_turn`` asking for it and handing its results over, or failing.
+        self.under_way = False
+        #: The open guess's fork, while it is being written; and the last squash, once begun --
+        #: what a squash made as the node returns waits for, whichever task began it.
+        self._forking: asyncio.Future[None] | None = None
+        self._squashing: asyncio.Future[None] | None = None
         #: The model's whole reply, from ``TurnComplete``, for a caller that continues the
         #: conversation.
         self.response: ModelResponse | None = None
@@ -2460,7 +2481,9 @@ class SpeculativeTurn:
             known_tools=scheduler.registry.names(),
         )
         candidates = await drafter.predict(context)
-        if not candidates:
+        if not candidates or self._branch.positions_settled or scheduler._let_go():
+            # Looked at again after the drafter: its node may have returned while it guessed,
+            # and a guess opened then ran on a branch nothing would ever resolve.
             return
 
         prediction = candidates[0]
@@ -2537,11 +2560,22 @@ class SpeculativeTurn:
         # And journaled whatever the caller does: a fork cut off before it reached the disk
         # left a resolution with no fork to resolve.
         forking = asyncio.ensure_future(scheduler._journal_fork(child, self._node_id))
+        self._forking = forking
         try:
             await asyncio.shield(forking)
         except asyncio.CancelledError:
             await _let_finish(forking)
             raise
+        finally:
+            self._forking = None
+        if self._speculative is not child:
+            # Squashed while its fork was written: its node returned meanwhile.
+            return
+        if self._branch.positions_settled or scheduler._let_go():
+            # Its node returned, or its run ended, while its fork was written: started now, its
+            # call ran on a guess nothing would resolve, and reached the upstream.
+            await self._squash_open("node_returned")
+            return
         tools = BranchTools(scheduler, child, self._node_id)
         # The block this predicts would be the next one the model emits, so it occupies the
         # next ordinal. Reserving it here is what keeps a confirmed speculation's effect at the
@@ -2661,9 +2695,24 @@ class SpeculativeTurn:
         """The branch this turn's calls sit on: its node's."""
         return self._branch
 
+    @property
+    def base(self) -> int:
+        """The position the turn began at: its calls sit after it."""
+        return self._base
+
     async def squash_open(self, reason: str) -> None:
-        """Squash the guess this turn has open, if it has one (``_squash_open``)."""
+        """Squash the guess this turn has open, and see it done -- for a node that has returned.
+
+        A guess whose fork is still being written is resolved after it, not before; and a squash
+        the turn's own task began is waited for too, so it is on disk before the node retires.
+        """
+        forking = self._forking
+        if forking is not None:
+            await asyncio.wait({forking})
         await self._squash_open(reason)
+        squashing = self._squashing
+        if squashing is not None:
+            await asyncio.wait({squashing})
 
     async def _squash_open(self, reason: str) -> None:
         """Cancellation *is* the squash. The buffer is closed before the task is cancelled.
@@ -2682,6 +2731,7 @@ class SpeculativeTurn:
         self._speculative = None
         self._adopted = None
         squashing = asyncio.ensure_future(self._squash(child, opened, cost, reason))
+        self._squashing = squashing
         try:
             await asyncio.shield(squashing)
         except asyncio.CancelledError:

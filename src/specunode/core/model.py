@@ -960,6 +960,17 @@ def _served_events(
     return events
 
 
+#: Model streams let go of -- their turn over, read no further -- whose clients are still closing
+#: them: held until they end, so none is collected mid-close.
+_CLOSING: set[asyncio.Future[None]] = set()
+
+
+def _closed(reading: asyncio.Future[None]) -> None:
+    _CLOSING.discard(reading)
+    if not reading.cancelled():
+        reading.exception()  # retrieved: nobody reads it now
+
+
 class _ReadAhead:
     """A model's stream, read as it arrives -- whoever is reading it, and whenever.
 
@@ -1021,12 +1032,22 @@ class _ReadAhead:
             raise item
         return arrived, item
 
-    async def close(self) -> None:
-        """Stop reading, and wait until the model's stream is closed."""
-        self._reading.cancel()
-        await _let_finish(self._reading)
-        if not self._reading.cancelled():
-            self._reading.exception()  # retrieved: it was handed over already, if anything
+    def close(self) -> None:
+        """Stop reading, and let the client close its stream in the background -- not waited for.
+
+        A client that yields its last event inside its own ``async with`` -- an HTTP stream
+        context -- closes its connection in the exit, after its turn is over. Waited for on the
+        caller's task, that held a node past its deadline -- and the deadline, firing during the
+        wait, was swallowed: the node went on as though it had none, where a resume, with no
+        connection to close, was on time and took the other path.
+        """
+        reading = self._reading
+        if reading.done():
+            _closed(reading)
+            return
+        reading.cancel()
+        _CLOSING.add(reading)
+        reading.add_done_callback(_closed)
 
 
 class RecordedTurnSource(Protocol):
@@ -1673,10 +1694,11 @@ class JournaledModel:
                                 track(-1)
                                 track = None
                             # Complete, on disk, and handed over: the turn is over, and nothing
-                            # after it is waited for. Read on to the stream's end, a client slow
-                            # to close its connection held its caller past a deadline -- which
-                            # gave up on a turn the journal said it had been answered -- and one
-                            # that failed as it closed raised its own error over the answer.
+                            # after it is waited for -- the client closes its stream in the
+                            # background (``_ReadAhead.close``). Read on to the stream's end, a
+                            # client slow to close its connection held its caller past a deadline
+                            # -- which gave up on a turn the journal said it had been answered --
+                            # and one that failed as it closed raised its own error over the answer.
                             yield event
                             return
                         handed.add(event, at_ms)
@@ -1733,7 +1755,7 @@ class JournaledModel:
                         raise
                     raise ModelError(failure) from exc
                 finally:
-                    await arriving.close()
+                    arriving.close()
             except BaseException:
                 # A turn that failed before the caller saw any of it left nothing to act on, and
                 # neither did one read by call_turn, which hands a failed turn to nobody. One a

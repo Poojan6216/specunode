@@ -174,10 +174,12 @@ block, so while it runs the node takes no other position: a second `call_turn`, 
 among the turn's own, at another place on a resume, under another key. Await the turn first; to
 ask the model on the side, use `session.model.complete()`, which takes no position. A turn that
 does not complete -- it fails, or the node stops waiting for it -- takes no positions at all,
-however many of its blocks had arrived. And once a node returns, nothing it left running takes a
-position or reaches the world: a call it started and never awaited is refused with
-`TurnAbandoned`, a turn it left running takes no positions and makes none of its calls, and a
-guess that turn had open is squashed as the node returns.
+however many of its blocks had arrived. And once a node returns, what it left running takes no
+more positions and reaches the world no further: a turn still under way gives back the positions
+its blocks took, makes none of its calls, and has the guess it had open squashed; a call not yet
+begun is refused with `TurnAbandoned`; and a write already begun is refused where it would be
+staged. A write staged before the return goes out with the node's own -- and whether one got that
+far is a matter of timing, so await every write a node makes.
 
 ### A model call that fails raises `ModelError`
 
@@ -187,8 +189,9 @@ serves back, and what a replay raises, at the same point: the failure is journal
 outcome, so a node that catches it and asks again is matched with its second question. Catch
 `ModelError`, not the client's own type: a node that catches the client's type is not the same
 node on resume. A turn is over once its answer is on disk and handed over: a client still
-closing its connection after the answer is not waited for, and an error it raises closing does
-not replace the answer. A turn the node stops waiting for -- its timeout, a cancel -- is journaled as
+closing its connection after the answer -- in its own `async with` exit, say -- closes it in the
+background, never on the node's time, and an error it raises closing does not replace the
+answer. A turn the node stops waiting for -- its timeout, a cancel -- is journaled as
 cancelled too, and served as one that never answers, until well past when the node stopped
 waiting the first time; a node still waiting then ends with `specunode.TurnAbandoned`. It is a
 `BaseException`, not a `ModelError` or any `Exception` -- asking again would be asking something
