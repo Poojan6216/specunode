@@ -87,7 +87,10 @@ ignore = ["B008", "RUF012"]
 "tests/**" = ["B011"]
 
 [tool.mypy]
-python_version = "3.11"
+# No python_version: checked as the interpreter it runs under -- 3.11 in CI's lint job. Held to
+# 3.11 under a newer interpreter, it could not read the stubs of numpy 2.5 (a ``type``
+# statement), which psycopg's stubs import and mypy always follows. Ruff's target-version keeps
+# the source itself to 3.11 syntax.
 strict = true
 files = ["src/specunode"]
 warn_unreachable = true

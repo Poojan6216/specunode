@@ -1672,8 +1672,14 @@ class JournaledModel:
                             if track is not None:
                                 track(-1)
                                 track = None
-                        else:
-                            handed.add(event, at_ms)
+                            # Complete, on disk, and handed over: the turn is over, and nothing
+                            # after it is waited for. Read on to the stream's end, a client slow
+                            # to close its connection held its caller past a deadline -- which
+                            # gave up on a turn the journal said it had been answered -- and one
+                            # that failed as it closed raised its own error over the answer.
+                            yield event
+                            return
+                        handed.add(event, at_ms)
                         yield event
                     if not completed:
                         # A stream that simply stops -- a dropped connection the client did not

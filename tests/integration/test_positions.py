@@ -301,9 +301,9 @@ async def test_a_journal_from_another_position_rule_is_refused(
     await bury_the_dead_process()
     monkeypatch.undo()
     adapter, registry = billing(charged)
-    with pytest.raises(SchedulerError, match="earlier version"):
+    with pytest.raises(SchedulerError, match="another version"):
         await driving(Journal(db), adapter, registry, speculation=False).resume(run_id)
-    with pytest.raises(PositionRuleMismatch, match="earlier version"):
+    with pytest.raises(PositionRuleMismatch, match="another version"):
         replay_of(Journal(db), run_id)
     assert charged == [10.0]
 
@@ -327,7 +327,9 @@ class LooksUpThenFails:
         raise ModelError("overloaded")
 
 
-def failing_billing(charged: list[float]) -> tuple[PlainAdapter, object]:
+def failing_billing(
+    charged: list[float], envelope: RequestEnvelope = TURN
+) -> tuple[PlainAdapter, object]:
     """Ask the model; if it fails or is slower than 0.3 s, charge the standard price."""
 
     @tool(effect="read")
@@ -342,7 +344,7 @@ def failing_billing(charged: list[float]) -> tuple[PlainAdapter, object]:
     @node(name="bill")
     async def bill(session: RunSession) -> Decision:
         with contextlib.suppress(TimeoutError, ModelError):
-            await asyncio.wait_for(session.call_turn(TURN), timeout=0.3)  # type: ignore[misc]
+            await asyncio.wait_for(session.call_turn(envelope), timeout=0.3)  # type: ignore[misc]
         await session.call_tool("charge_card", {"customer_id": "cus-1", "amount": 10.0})
         session.state["billed"] = True
         return ToolCall("charge_card", {})
@@ -589,25 +591,31 @@ async def test_a_turn_left_running_does_not_move_a_retired_nodes_position(tmp_pa
     assert charged == ["charge 10.0"], f"the charge went out twice: {charged}"
 
 
-async def test_a_run_is_judged_by_the_rule_each_failed_turn_was_recorded_under(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("recorded_rule", [1, 2])
+async def test_a_run_recorded_under_another_rule_is_refused_whatever_its_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded_rule: int
 ) -> None:
-    """Started under an earlier rule and resumed under this one, a run whose failed turn this
-    version recorded was refused -- and the earlier version, followed as advised, charged
-    twice. A turn is judged by the rule in force when it was recorded. Found by the
-    twenty-first review."""
+    """Judged turn by turn, the check read what the journal said of a turn, not what happened to
+    it: a turn ``call_turn`` streamed, asked with a default envelope, was journaled as a request
+    for no stream and not counted; and a rule that changed where calls sit after a turn a
+    deadline cut short was not visible in any turn. Both resumed under this rule and charged
+    twice. Any part of a run recorded under another rule now refuses the whole -- resume, replay
+    and ``status`` alike. Found by the twenty-second review."""
+    from typer.testing import CliRunner
+
+    from specunode.cli import app
     from specunode.core import scheduler as scheduler_module
 
     charged: list[float] = []
     db = tmp_path / "source.db"
     run_id = new_ulid()
-    # The earlier rule starts the run, and dies as the node asks its first question.
-    monkeypatch.setattr(scheduler_module, "POSITION_RULE", 1)
-    adapter, registry = failing_billing(charged)
+    monkeypatch.setattr(scheduler_module, "POSITION_RULE", recorded_rule)
+    # A default envelope: ``stream`` is False, and call_turn streams it all the same.
+    adapter, registry = failing_billing(charged, replace(TURN, stream=False))
     with pytest.raises(Crash):
         await asyncio.wait_for(
             failing(
-                CrashingJournal(db, lambda kind, payload: kind == "model_request"),
+                CrashingJournal(db, before_commit_of("bill#0")),
                 adapter,
                 registry,
                 speculation=False,
@@ -616,94 +624,15 @@ async def test_a_run_is_judged_by_the_rule_each_failed_turn_was_recorded_under(
         )
     await bury_the_dead_process()
     monkeypatch.undo()
-    # This rule resumes it: the turn fails with a read in it, the fallback is charged, and the
-    # process dies before it commits.
-    adapter, registry = failing_billing(charged)
-    with pytest.raises(Crash):
-        await asyncio.wait_for(
-            failing(
-                CrashingJournal(db, before_commit_of("bill#0")),
-                adapter,
-                registry,
-                speculation=False,
-            ).resume(run_id),
-            timeout=30,
-        )
-    await bury_the_dead_process()
     assert charged == [10.0]
-    adapter, registry = failing_billing(charged)
-    resumed = await asyncio.wait_for(
-        failing(Journal(db), adapter, registry, speculation=False).resume(run_id), timeout=60
+    adapter, registry = failing_billing(charged, replace(TURN, stream=False))
+    refusal = f"under rule {recorded_rule} for where a node's calls sit"
+    with pytest.raises(SchedulerError, match=refusal):
+        await failing(Journal(db), adapter, registry, speculation=False).resume(run_id)
+    with pytest.raises(PositionRuleMismatch, match=refusal):
+        replay_of(Journal(db), run_id)
+    shown = await asyncio.to_thread(
+        CliRunner().invoke, app, ["status", run_id, "--journal", str(db)]
     )
-    assert resumed.ok, resumed.error
-    assert charged == [10.0]
-
-
-async def test_a_failed_whole_answer_under_an_earlier_rule_is_not_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A turn asked with ``complete()`` never takes a position, whatever rule recorded it: a
-    run whose only failed turn was one was refused all the same. Found by the twenty-first
-    review."""
-    from specunode.core import scheduler as scheduler_module
-
-    class CutOff:
-        async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
-            return ModelResponse(
-                model="scripted",
-                content=(ToolUseBlock(id="t", name="lookup_plan", args={"customer_id": "cus-1"}),),
-                stop_reason="max_tokens",
-            )
-
-        def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
-            raise NotImplementedError
-
-    charged: list[float] = []
-
-    @tool(effect="read")
-    async def lookup_plan(customer_id: str) -> JsonValue:
-        return {"plan": "basic"}
-
-    @tool(effect="write", idempotent=False)
-    async def charge_card(customer_id: str, amount: float) -> JsonValue:
-        charged.append(amount)
-        return {"charge_id": "ch"}
-
-    @node(name="bill")
-    async def bill(session: RunSession) -> Decision:
-        assert session.model is not None
-        with contextlib.suppress(ModelError):
-            await session.model.complete(replace(TURN, stream=False))
-        await session.call_tool("charge_card", {"customer_id": "cus-1", "amount": 10.0})
-        session.state["billed"] = True
-        return ToolCall("charge_card", {})
-
-    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
-    registry = registry_of([lookup_plan, charge_card])
-    db = tmp_path / "source.db"
-    run_id = new_ulid()
-    monkeypatch.setattr(scheduler_module, "POSITION_RULE", 1)
-    with pytest.raises(Crash):
-        await Scheduler(
-            graph=adapter,  # type: ignore[arg-type]
-            registry=registry,
-            journal=(journal := CrashingJournal(db, before_commit_of("bill#0"))),
-            buffer=StoreBuffer(journal=journal, run_id=""),
-            dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),
-            target=JournaledModel(CutOff(), journal, provider="scripted"),
-            policy=Policy(speculation=False),
-        ).run(run_id, {})
-    await bury_the_dead_process()
-    monkeypatch.undo()
-    replay_of(Journal(db), run_id)  # not refused
-    resumed = await Scheduler(
-        graph=adapter,  # type: ignore[arg-type]
-        registry=registry,
-        journal=(again := Journal(db)),
-        buffer=StoreBuffer(journal=again, run_id=""),
-        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),
-        target=JournaledModel(CutOff(), again, provider="scripted"),
-        policy=Policy(speculation=False),
-    ).resume(run_id)
-    assert resumed.ok, resumed.error
+    assert "resumable: False" in shown.output and refusal in shown.output, shown.output
     assert charged == [10.0]

@@ -174,7 +174,10 @@ block, so while it runs the node takes no other position: a second `call_turn`, 
 among the turn's own, at another place on a resume, under another key. Await the turn first; to
 ask the model on the side, use `session.model.complete()`, which takes no position. A turn that
 does not complete -- it fails, or the node stops waiting for it -- takes no positions at all,
-however many of its blocks had arrived.
+however many of its blocks had arrived. And once a node returns, nothing it left running takes a
+position or reaches the world: a call it started and never awaited is refused with
+`TurnAbandoned`, a turn it left running takes no positions and makes none of its calls, and a
+guess that turn had open is squashed as the node returns.
 
 ### A model call that fails raises `ModelError`
 
@@ -183,7 +186,9 @@ node sees `specunode.ModelError`, with the client's error as its cause. That is 
 serves back, and what a replay raises, at the same point: the failure is journaled as the turn's
 outcome, so a node that catches it and asks again is matched with its second question. Catch
 `ModelError`, not the client's own type: a node that catches the client's type is not the same
-node on resume. A turn the node stops waiting for -- its timeout, a cancel -- is journaled as
+node on resume. A turn is over once its answer is on disk and handed over: a client still
+closing its connection after the answer is not waited for, and an error it raises closing does
+not replace the answer. A turn the node stops waiting for -- its timeout, a cancel -- is journaled as
 cancelled too, and served as one that never answers, until well past when the node stopped
 waiting the first time; a node still waiting then ends with `specunode.TurnAbandoned`. It is a
 `BaseException`, not a `ModelError` or any `Exception` -- asking again would be asking something
@@ -192,7 +197,11 @@ raised, so a `finally` cannot act on the wrong path either. Do not catch it: a n
 and returns, is not committed, and the run stops all the same. Served answers come back at their
 recorded pace and order -- a stream piece by piece, as its caller had it, each piece no sooner
 than the model sent it -- so a node that races two calls, falls back on a timeout without
-cancelling, or gives up on a model slow to start, decides on resume as it did. An answer waits
+cancelling, or gives up on a model slow to start, decides on resume as it did, as far as the
+resuming process keeps the run's time: a disk slower than the run's can hand an answer over
+late, and a call whose effect already went out returns at once ([replay.md](replay.md)). A
+deadline with room to spare decides the same; one on the edge, or one that also covers the
+calls a turn makes, may not. An answer waits
 for an earlier one only until the node is done with that one -- answered, failed or given up on
 -- and a node that holds an earlier answer open far longer than the recorded run did, while it
 waits for a later one, is stopped with `TurnAbandoned` too.

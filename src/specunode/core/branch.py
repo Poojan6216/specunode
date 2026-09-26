@@ -67,10 +67,11 @@ class BranchStatus(Enum):
         return self in (BranchStatus.RETIRED, BranchStatus.SQUASHED, BranchStatus.STALLED)
 
 
-#: Which rule places a node's calls at program positions -- and so derives their keys -- when a
-#: model turn does not complete. 2: it takes none. Recorded in ``run_started``; a journal from
-#: another rule, in which such a turn had tool calls, is not resumed or replayed under this one.
-POSITION_RULE = 2
+#: Which rule places a node's calls at program positions -- and so derives their keys. 3: a model
+#: turn that does not complete takes none; a node's turn runs alone; and once a node's body has
+#: returned, nothing it left running takes one. Recorded in ``run_started``; a run recorded under
+#: another rule is neither resumed nor replayed under this one.
+POSITION_RULE = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +222,11 @@ class Branch:
     #: The position its retirement journaled (``cursor_after``): where the run carries on
     #: from, whatever a call its node left running does to the cursor afterwards.
     retired_cursor: StepCursor | None = None
+    #: Its node's body has returned: a call or a turn the node left running takes no position,
+    #: gives none back, and is not made. Set as the body returns, before anything is awaited on
+    #: its behalf -- its retirement can take a while to write, and a left-over turn's block
+    #: arriving meanwhile moved the cursor that retirement journaled.
+    returned: bool = False
     #: How many entries of ``read_set`` were copied from the parent at fork time. Everything
     #: after that index is a read *this* branch made, which is what adoption has to hand back:
     #: a confirmed speculation never retires, so a read it made on a guess would otherwise be
@@ -276,6 +282,11 @@ class Branch:
     @property
     def running(self) -> bool:
         return not self.status.terminal
+
+    @property
+    def positions_settled(self) -> bool:
+        """Nothing takes or gives back a position here now: its node returned, or it retired."""
+        return self.returned or self.status is BranchStatus.RETIRED
 
     def fork(
         self, child_id: str, *, predicted: Decision, step: int, tier: int | None = None

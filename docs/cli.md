@@ -34,7 +34,8 @@ List the run ids the journal holds, one per line. Options: `--journal`.
 Say what a run left behind and what a resume would build on: whether it finished, the journal
 offset it reached, how many branches retired, which branches were confirmed but never retired,
 how many dispatch claims are still in flight, the step index a resume would continue above,
-and whether it is resumable at all. Options: `--journal`.
+and whether it is resumable at all -- not, and why, for a run `resume` would refuse, such as one
+recorded under another rule for where a node's calls sit. Options: `--journal`.
 
 ### `specunode ledger RUN_ID`
 
@@ -85,8 +86,8 @@ failed -- cut off, refused, overloaded -- is recorded as the failure it was and 
 that failure, so a node that caught it and asked again is matched with its second question. A
 run is driven by one process at a time: resuming one that another process is running exits 2, as
 does one whose Postgres run lock was lost while it ran, an unknown run, one that never recorded
-its start, a LangGraph run, which cannot be resumed in this version, and a run recorded by an
-earlier version under another rule for where a failed turn's calls sit, when it has such a turn.
+its start, a LangGraph run, which cannot be resumed in this version, and a run any part of which
+was recorded by another version under another rule for where a node's calls sit.
 Prints the ledger; exits 1 if the run did not complete and 2 if the config is missing,
 unreadable, or cannot build the graph or the target. A turn the crashed run had stopped waiting
 for is served as one that never answers, and a node that keeps waiting well past that ends with
@@ -118,8 +119,8 @@ recorded, into a separate journal (`replay-<run>.db` beside the source, so the r
 checked is never written to; a second replay of the same run appends another run to that same
 file rather than starting empty). Refuses at the first turn whose request does not match the
 journal's, naming the step and the fields that differ, rather than continuing down a trajectory
-the recorded run never took (exit 1); and refuses a run recorded by an earlier version under
-another rule for where a failed turn's calls sit, when it has such a turn (exit 2). Dispatches
+the recorded run never took (exit 1); and refuses a run any part of which was recorded by another
+version under another rule for where a node's calls sit (exit 2). Dispatches
 nothing unless told to. Options: `--journal`; `--config PATH`; `--speculation on|off` (default
 `on`; anything else exits 2); `--dispatch` actually sends effects, which is off by default
 because a replay that re-sent every effect would charge every card again. See

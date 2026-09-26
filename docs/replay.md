@@ -141,20 +141,28 @@ required whenever the run falls short.
 **Both halves of that pair are conditional on a resumed node making the calls it made before.**
 An idempotency key is derived from the run, the node, the program position, the tool and the
 *arguments*. A model turn that did not complete -- it failed, or its node gave up on it -- takes
-no positions, however many of its blocks had arrived: the node's next call sits where it would
-had the turn not been asked, so a timing that a resume reproduces only roughly moves no key. A
-run in which an earlier version, which placed the calls after such a turn differently, recorded
-such a turn with tool calls in it is neither resumed nor replayed by this one -- for a resume,
-unless that turn's node has since retired -- and `specunode status` says so. Nothing is
-dispatched before the model turn that decided it is journaled, and a resumed node whose earlier
-answer may already have sent something is served that answer when it asks the same question --
-so the resumed run makes the same calls, derives the same keys, and the dedupe table catches the
-earlier attempt, whatever the model would have said the second time. A served answer comes back
-at the pace it first did -- counted, as the run's was, from when its question began to be
-written, however long this process's disk takes to write it -- and in the order the answers came
-back in the attempt it is served from -- a node that acts on whichever answer arrives first, or
-falls back when one is not back in time, decides as it did; so a resume, and a replay, take as
-long as the model took. A streamed answer is handed over piece by piece: exactly the pieces its
+no positions, however many of its blocks had arrived; nor does anything a node left running once
+the node has returned -- a turn, whose blocks take none and whose calls are not made, or a call,
+which is not made. So the node's next call sits where it would had the turn not been asked, and
+a timing that a resume reproduces only roughly moves no key. Where a node's calls sit has
+changed between versions of SpecuNode -- the position rule, recorded in `run_started` -- and a
+run any part of which was recorded under another rule is neither resumed nor replayed by this
+version; `specunode status` says so. Nothing is dispatched before the model turn that decided it
+is journaled, and a resumed node whose earlier answer may already have sent something is served
+that answer when it asks the same question -- so the resumed run makes the same calls, derives
+the same keys, and the dedupe table catches the earlier attempt, whatever the model would have
+said the second time. A served answer comes back no sooner than it first did -- counted, as the
+run's was, from when its question began to be written -- and in the order the answers came back
+in the attempt it is served from; so a resume, and a replay, take as long as the model took, and
+a node that acts on whichever answer arrives first, or falls back when one is not back in time,
+decides as it did. That holds as far as this process keeps the run's time, and no further: it
+writes the question and the answer again before it hands the answer over, and on a disk slower
+than the run's the answer can come late -- the question's write is hidden in the time the model
+took to answer, the answer's is not; and a call whose effect already went out returns at once,
+however long it took the first time. A node whose deadline
+fell closer than that to an answer -- or covers the calls a turn makes -- may decide otherwise
+on a resume, and a different call goes out under a different key. A streamed answer is handed
+over piece by piece: exactly the pieces its
 caller had as it streamed, at the positions the stream gave them, each no sooner than it arrived
 from the model -- a node that gives up on a model slow to say its first word sees the first word
 when the model said it, and one busy with a slow lookup between two pieces does not make a quick
@@ -185,7 +193,8 @@ asked again part-way -- the error says which. A call that outlives its node -- a
 started and never awaited -- asks nothing and writes nothing once its run or resume is over: not
 while `run_finished` is being written, and not into a later resume of the same run. What a
 resume cannot keep the same is anything else that shapes a call: a read made again that returns
-something new, a timestamp, code that changed. Then a different call at the same position gets a
+something new, a timestamp, code that changed, or -- for a node that decides by the clock -- this
+process's own speed. Then a different call at the same position gets a
 different key, and the world receives it as well.
 
 The kill/resume test resumes every kill point with a model that would decide differently if it

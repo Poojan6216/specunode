@@ -1135,3 +1135,397 @@ def test_status_says_what_resume_would(tmp_path: Path, monkeypatch: pytest.Monke
     run_id = asyncio.run(crashed())
     shown = CliRunner().invoke(app, ["status", run_id, "--journal", str(tmp_path / "j.db")])
     assert "resumable: False" in shown.output, shown.output
+
+
+# -- the twenty-second review --------------------------------------------------------------------
+
+
+class AnswersThenClosesSlowly:
+    """Asks to note the order at 100 ms; then takes ``closing`` seconds to close its connection
+    -- inside its own ``async with``, as a client built on an HTTP stream context does -- and,
+    with ``fails``, fails as it closes."""
+
+    def __init__(self, *, closing: float = 1.5, fails: bool = False) -> None:
+        self.closing = closing
+        self.fails = fails
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        raise NotImplementedError
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        use = ToolUseBlock(id="t0", name="note_order", args={"customer_id": "cus-1"})
+        await asyncio.sleep(0.1)
+        yield ToolUseComplete(index=0, block=use)
+        yield TurnComplete(ModelResponse(model="scripted", content=(use,), stop_reason="tool_use"))
+        await asyncio.sleep(self.closing)
+        if self.fails:
+            raise ConnectionResetError("connection reset while closing the stream")
+
+
+def notes_orders(world: list[str], *, reads_it_itself: bool) -> tuple[PlainAdapter, object]:
+    """Note the order if the model answers within a second; charge a fallback if it does not."""
+
+    @tool(effect="write", idempotent=False)
+    async def note_order(customer_id: str) -> JsonValue:
+        world.append("note_order")
+        return {"noted": True}
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        world.append("charge_card")
+        return {"charge_id": "ch"}
+
+    async def ask(session: RunSession) -> None:
+        if not reads_it_itself:
+            await session.call_turn(TURN_FOR_ORDERS)  # type: ignore[misc]
+            return
+        assert session.model is not None
+        answered = False
+        async for event in session.model.stream(TURN_FOR_ORDERS):
+            answered = answered or isinstance(event, TurnComplete)
+        assert answered
+        await session.call_tool("note_order", {"customer_id": "cus-1"})
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        try:
+            await asyncio.wait_for(ask(session), timeout=1.0)
+        except (TimeoutError, ModelError):
+            await session.call_tool("charge_card", {"customer_id": "cus-1", "amount": 10.0})
+        session.state["billed"] = True
+        return ToolCall("note_order", {})
+
+    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
+    return adapter, registry_of([note_order, charge_card])
+
+
+@pytest.mark.parametrize("reads_it_itself", [False, True])
+async def test_an_answer_on_disk_is_not_given_up_on_while_the_client_closes(
+    tmp_path: Path, reads_it_itself: bool
+) -> None:
+    """The model answered at 100 ms and its client took 1.5 s more to close its connection. The
+    turn was journaled as answered, but its stream was read on to its end: the node's one-second
+    deadline fired, and it charged a fallback. A replay and a resume, served a stream that ends
+    at its answer, took the model's path instead -- a write the run never sent. Found by the
+    twenty-second review. The deadline leaves room for every write in the turn to be slow."""
+    world: list[str] = []
+    adapter, registry = notes_orders(world, reads_it_itself=reads_it_itself)
+    db = tmp_path / "source.db"
+    run_id = new_ulid()
+    with pytest.raises(Crash):
+        await asyncio.wait_for(
+            scheduler(
+                CrashingJournal(db, before_commit_of("bill#0")),
+                adapter,
+                registry,
+                AnswersThenClosesSlowly(),
+            ).run(run_id, {}),
+            timeout=30,
+        )
+    await bury_the_dead_process()
+    assert world == ["note_order"], f"the node gave up on an answer on disk: {world}"
+
+    replayed: list[str] = []
+    adapter, registry = notes_orders(replayed, reads_it_itself=reads_it_itself)
+    result = await asyncio.wait_for(
+        scheduler(
+            Journal(tmp_path / "replay.db"), adapter, registry, replay_of(Journal(db), run_id)
+        ).run(new_ulid(), {}),
+        timeout=30,
+    )
+    assert result.ok, result.error
+    assert replayed == ["note_order"]
+
+    adapter, registry = notes_orders(world, reads_it_itself=reads_it_itself)
+    resumed = await asyncio.wait_for(
+        scheduler(Journal(db), adapter, registry, AnswersThenClosesSlowly()).resume(run_id),
+        timeout=60,
+    )
+    assert resumed.ok, resumed.error
+    assert world == ["note_order"], f"the resume decided otherwise: {world}"
+
+
+@pytest.mark.parametrize("closing", [0.0, 0.05])
+async def test_a_client_failing_as_it_closes_does_not_undo_an_answer_on_disk(
+    tmp_path: Path, closing: float
+) -> None:
+    """A client that failed as it closed its connection, after its answer: the answer was on
+    disk, and the node was handed the client's own error in its place -- not a ``ModelError``,
+    so a node catching that failed. Found by the twenty-second review."""
+    seen: list[str] = []
+
+    @tool(effect="write", idempotent=False)
+    async def note_order(customer_id: str) -> JsonValue:
+        return {"noted": True}
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        try:
+            await session.call_turn(TURN_FOR_ORDERS)  # type: ignore[misc]
+            seen.append("answered")
+        except ModelError as exc:
+            seen.append(f"ModelError: {exc}")
+        session.state["billed"] = True
+        return ToolCall("note_order", {})
+
+    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
+    result = await asyncio.wait_for(
+        scheduler(
+            Journal(tmp_path / "j.db"),
+            adapter,
+            registry_of([note_order]),
+            AnswersThenClosesSlowly(closing=closing, fails=True),
+        ).run(new_ulid(), {}),
+        timeout=30,
+    )
+    assert result.ok, result.error
+    assert seen == ["answered"]
+
+
+class LooksUpForAWhile:
+    """A lookup at ``block_at``, and the turn's end at ``end_at`` -- or, with ``fails``, a
+    failure there. ``complete`` prices the order."""
+
+    def __init__(self, block_at: float, end_at: float, *, fails: bool = False) -> None:
+        self.block_at = block_at
+        self.end_at = end_at
+        self.fails = fails
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        return ModelResponse(model="scripted", content=(TextBlock(text="25"),))
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        use = ToolUseBlock(id="t0", name="lookup_plan", args={"customer_id": "cus-1"})
+        await asyncio.sleep(self.block_at)
+        yield ToolUseComplete(index=0, block=use)
+        await asyncio.sleep(self.end_at - self.block_at)
+        if self.fails:
+            raise ModelError("overloaded")
+        yield TurnComplete(ModelResponse(model="scripted", content=(use,), stop_reason="tool_use"))
+
+
+class SlowToConfirm(Journal):
+    """A disk slow (300 ms) to take that ``plan#0`` is confirmed -- its retirement's start."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.owners: dict[str, str] = {}
+
+    async def append_async(self, run_id: str, kind: str, payload: Mapping[str, JsonValue]) -> int:
+        if kind == "branch_forked":
+            self.owners[str(payload.get("branch_id"))] = str(payload.get("node_id"))
+        if (
+            kind == "branch_resolved"
+            and payload.get("status") == "confirmed"
+            and self.owners.get(str(payload.get("branch_id"))) == "plan#0"
+        ):
+            await asyncio.sleep(0.3)
+        return await super().append_async(run_id, kind, payload)
+
+
+SUMMARY_TURN = RequestEnvelope(
+    model="scripted",
+    messages=(Message(role="user", content=(TextBlock(text="summarise cus-1"),)),),
+    max_tokens=256,
+    stream=True,
+)
+PRICE_TURN = RequestEnvelope(
+    model="scripted",
+    messages=(Message(role="user", content=(TextBlock(text="price for cus-1"),)),),
+    max_tokens=256,
+)
+
+
+def cursors_after(journal: Journal, run_id: str) -> list[tuple[str, object]]:
+    """Each retired node, and the position its retirement journaled."""
+    nodes = {
+        e.payload.get("branch_id"): e.payload.get("node_id")
+        for e in journal.read(run_id, kinds=["branch_forked"])
+    }
+    retired: list[tuple[str, object]] = []
+    for entry in journal.read(run_id, kinds=["branch_resolved"]):
+        if entry.payload.get("status") == "retired":
+            cursor = entry.payload.get("cursor_after")
+            step = cursor.get("step_index") if isinstance(cursor, Mapping) else None
+            retired.append((str(nodes.get(entry.payload.get("branch_id"))), step))
+    return retired
+
+
+@pytest.mark.parametrize("left_running", ["a turn", "a turn that fails", "a lookup"])
+async def test_what_a_node_left_running_takes_no_position_while_it_retires(
+    tmp_path: Path, left_running: str
+) -> None:
+    """A node left something running and returned; it arrived -- a turn's block, the failure of
+    a turn whose block had come while the node ran, a lookup -- while the node's retirement was
+    being written, and moved the position that retirement journaled: a block took one, a
+    failure gave one back. The replay, on a quick disk, retired the node first: the next node
+    asked at a position the journal had no turn for, and a finished run did not replay. Found
+    by the twenty-second review."""
+    charged: list[str] = []
+
+    def build() -> tuple[PlainAdapter, object]:
+        @tool(effect="read")
+        async def lookup_plan(customer_id: str) -> JsonValue:
+            return {"plan": "basic"}
+
+        @tool(effect="write", idempotent=False)
+        async def charge_card(customer_id: str, amount: float) -> JsonValue:
+            charged.append(f"charge {amount}")
+            return {"charge_id": "ch"}
+
+        async def left(session: RunSession) -> None:
+            with contextlib.suppress(BaseException):
+                if left_running == "a lookup":
+                    await asyncio.sleep(0.25)
+                    await session.call_tool("lookup_plan", {"customer_id": "cus-1"})
+                else:
+                    await session.call_turn(SUMMARY_TURN)  # type: ignore[misc]
+
+        @node(name="plan")
+        async def plan(session: RunSession) -> Decision:
+            asyncio.get_running_loop().create_task(left(session))  # never awaited
+            await asyncio.sleep(0.15)
+            session.state["planned"] = True
+            return ToolCall("lookup_plan", {})
+
+        @node(name="bill")
+        async def bill(session: RunSession) -> Decision:
+            assert session.model is not None
+            price = await session.model.complete(PRICE_TURN)
+            await session.call_tool(
+                "charge_card", {"customer_id": "cus-1", "amount": float(price.text)}
+            )
+            session.state["billed"] = True
+            return ToolCall("charge_card", {})
+
+        def route(state: Mapping[str, JsonValue]) -> str | None:
+            if not state.get("planned"):
+                return "plan"
+            return None if state.get("billed") else "bill"
+
+        return PlainAdapter.of([plan, bill], route), registry_of([lookup_plan, charge_card])
+
+    # The node returns at 150 ms; its retirement is written from then until about 450 ms. A block
+    # at 20 ms comes while it runs, one at 250 ms while it retires.
+    model = (
+        LooksUpForAWhile(0.02, 0.2, fails=True)
+        if left_running == "a turn that fails"
+        else LooksUpForAWhile(0.25, 0.35)
+    )
+    db = tmp_path / "run.db"
+    run_id = new_ulid()
+    adapter, registry = build()
+    result = await asyncio.wait_for(
+        scheduler(SlowToConfirm(db), adapter, registry, model).run(run_id, {}), timeout=30
+    )
+    await asyncio.sleep(0.5)  # what was left running ends
+    assert result.ok, result.error
+
+    adapter, registry = build()
+    replay_db = tmp_path / "replay.db"
+    replay_run = new_ulid()
+    replayed = await asyncio.wait_for(
+        scheduler(Journal(replay_db), adapter, registry, replay_of(Journal(db), run_id)).run(
+            replay_run, {}
+        ),
+        timeout=30,
+    )
+    await asyncio.sleep(0.5)
+    assert replayed.ok, replayed.error
+    assert cursors_after(Journal(db), run_id) == cursors_after(Journal(replay_db), replay_run)
+
+
+class LooksUpTwiceSlowly:
+    """A lookup at 10 ms; a second, different one at ``second_at``; the turn's end at 400 ms --
+    after the run is over."""
+
+    def __init__(self, second_at: float) -> None:
+        self.second_at = second_at
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        raise NotImplementedError
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        first = ToolUseBlock(id="t0", name="lookup_plan", args={"customer_id": "cus-1"})
+        second = ToolUseBlock(id="t1", name="lookup_notes", args={"customer_id": "cus-1"})
+        await asyncio.sleep(0.01)
+        yield ToolUseComplete(index=0, block=first)
+        await asyncio.sleep(self.second_at - 0.01)
+        yield ToolUseComplete(index=1, block=second)
+        await asyncio.sleep(0.4 - self.second_at)
+        yield TurnComplete(
+            ModelResponse(model="scripted", content=(first, second), stop_reason="tool_use")
+        )
+
+
+@pytest.mark.parametrize(
+    ("guess", "second_at"),
+    [("wrong", 0.39), ("right", 0.39), ("right", 0.02)],
+    ids=["wrong", "right", "confirmed before its node returned"],
+)
+async def test_a_guess_of_a_turn_left_running_is_settled_before_the_run_ends(
+    tmp_path: Path, guess: str, second_at: float
+) -> None:
+    """A turn its node left running had a guess open; the model's next block settled it after
+    the run was over -- squashed or confirmed, written after ``run_finished`` -- and a confirmed
+    one made the finished run read as resumable. One confirmed before its node returned was
+    discarded, unadopted, when the turn ended after the run -- and that was written after
+    ``run_finished`` too. Found by the twenty-second review."""
+    from typer.testing import CliRunner
+
+    from specunode.cli import app
+    from specunode.journal.replay import recover
+
+    @tool(effect="read")
+    async def lookup_plan(customer_id: str) -> JsonValue:
+        return {"plan": "basic"}
+
+    @tool(effect="read")
+    async def lookup_notes(customer_id: str) -> JsonValue:
+        return {"notes": []}
+
+    async def summarise(session: RunSession) -> None:
+        with contextlib.suppress(BaseException):
+            await session.call_turn(SUMMARY_TURN)  # type: ignore[misc]
+
+    @node(name="plan")
+    async def plan(session: RunSession) -> Decision:
+        asyncio.get_running_loop().create_task(summarise(session))  # never awaited
+        await asyncio.sleep(0.15)
+        session.state["planned"] = True
+        return ToolCall("lookup_plan", {})
+
+    predicted = (
+        ToolCall("lookup_notes", {"customer_id": "cus-1"})
+        if guess == "right"
+        else ToolCall("lookup_plan", {"customer_id": "cus-2"})
+    )
+    registry = registry_of([lookup_plan, lookup_notes])
+    db = tmp_path / "j.db"
+    journal = Journal(db)
+    run_id = new_ulid()
+    result = await asyncio.wait_for(
+        Scheduler(
+            graph=PlainAdapter.of([plan], lambda s: None if s.get("planned") else "plan"),  # type: ignore[arg-type]
+            registry=registry,
+            journal=journal,
+            buffer=StoreBuffer(journal=journal, run_id=""),
+            dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),
+            target=JournaledModel(LooksUpTwiceSlowly(second_at), journal, provider="scripted"),
+            policy=Policy(speculation=True, max_speculation_depth=3),
+            predictor=FixedDrafter(predicted),  # type: ignore[arg-type]
+        ).run(run_id, {}),
+        timeout=30,
+    )
+    assert result.ok, result.error
+    await asyncio.sleep(0.8)  # the rest of the reply arrives
+    assert after_the_first_end(db, run_id) == []
+    entries = list(Journal(db).read(run_id))
+    forked = {e.payload.get("branch_id") for e in entries if e.kind == "branch_forked"}
+    resolved = {e.payload.get("branch_id") for e in entries if e.kind == "branch_resolved"}
+    assert forked <= resolved, f"{forked - resolved} forked and never resolved"
+    assert not recover(Journal(db), run_id).resumable
+    shown = await asyncio.to_thread(
+        CliRunner().invoke, app, ["status", run_id, "--journal", str(db)]
+    )
+    assert "resumable: False" in shown.output, shown.output

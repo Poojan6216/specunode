@@ -90,67 +90,39 @@ class ReplayExhausted(RuntimeError):
 
 
 class PositionRuleMismatch(RuntimeError):
-    """The run was recorded under another rule for where a node's calls sit, and it matters.
+    """The run was recorded under another rule for where a node's calls sit.
 
-    A call's idempotency key is derived from its program position. How a model turn that did
-    not complete counts toward the positions after it has changed (``POSITION_RULE``); where
-    the recorded run has such a turn with tool calls in it, a resume or replay under this rule
-    would put the calls after it at other positions -- a write already sent would go out again
-    under a new key. So it is refused, with the version that recorded it named as the way on.
+    A call's idempotency key is derived from its program position, and where a node's calls sit
+    has changed between versions (``POSITION_RULE``): how a model turn that did not complete
+    counts, whether a node's calls can interleave with its turn, and whether a turn its node
+    left running moves the cursor. Resumed or replayed under this rule, a run recorded under
+    another could put a call at another position -- and a write already sent would go out again
+    under a new key. So it is refused.
     """
 
 
-def position_rule_problem(journal: Journal, run_id: str, *, replay: bool = False) -> str | None:
-    """Why ``run_id`` cannot be resumed (or, with ``replay``, replayed) under this position rule.
+def position_rule_problem(journal: Journal, run_id: str) -> str | None:
+    """Why ``run_id`` cannot be resumed or replayed under this position rule, if it cannot.
 
-    Only a turn that could have taken positions matters: one the target model streamed -- as
-    ``call_turn`` does -- that did not complete, with a tool call in it, recorded while another
-    rule was in force (the ``run_started`` before it says which). And for a resume, only in a
-    node that has not retired: a retired one's positions are its journaled ``cursor_after``,
-    whatever rule counted them. Looked at over the whole run instead, a run whose later part
-    this version had recorded was refused -- and the version that recorded its start, followed
-    as advised, charged twice.
+    Any part of it recorded under another rule refuses the whole. Judged turn by turn instead --
+    only a failed streamed turn with a tool call, only in a node that had not retired -- the
+    judgement read what the journal says of a turn, which is not what happened to it: a turn
+    ``call_turn`` streamed was journaled as a request that did not ask for one, and a rule that
+    changed where calls sit after a turn a deadline cut short was not visible in the turn at all.
+    Both resumed, and charged twice.
     """
-    rule = 1  # in force until a ``run_started`` says otherwise: none recorded it before 2
-    asked: dict[str, bool] = {}  # request id -> the target model was asked with a stream
-    under_another: list[str] = []  # branches with such a turn, recorded under another rule
-    retired: set[str] = set()
-    for entry in journal.read(
-        run_id, kinds=["run_started", "model_request", "model_response", "branch_resolved"]
-    ):
-        payload = entry.payload
-        if entry.kind == "run_started":
-            recorded = payload.get("positions")
-            rule = recorded if isinstance(recorded, int) and not isinstance(recorded, bool) else 1
-        elif entry.kind == "model_request":
-            asked[str(payload.get("request_id"))] = (
-                payload.get("role") == "target" and payload.get("stream") is True
+    for entry in journal.read(run_id, kinds=["run_started"]):
+        recorded = entry.payload.get("positions")
+        rule = recorded if isinstance(recorded, int) and not isinstance(recorded, bool) else 1
+        if rule != POSITION_RULE:
+            return (
+                f"run {run_id} was recorded by another version of SpecuNode, under rule {rule} "
+                f"for where a node's calls sit; this version places them by rule "
+                f"{POSITION_RULE}. A call's idempotency key comes from its position, so a write "
+                "already sent could go out again under a new key: this version does not resume "
+                "or replay it."
             )
-        elif entry.kind == "branch_resolved":
-            if payload.get("status") == "retired":
-                retired.add(str(payload.get("branch_id")))
-        elif (
-            rule != POSITION_RULE
-            and payload.get("failed") is not None
-            and asked.get(str(payload.get("request_id")), False)
-        ):
-            response = payload.get("response")
-            blocks = response.get("content") if isinstance(response, Mapping) else None
-            if isinstance(blocks, Sequence) and any(
-                isinstance(block, Mapping) and block.get("kind") == "tool_use" for block in blocks
-            ):
-                under_another.append(str(payload.get("branch_id")))
-    if not replay:
-        under_another = [branch for branch in under_another if branch not in retired]
-    if not under_another:
-        return None
-    return (
-        f"run {run_id} has a model turn that did not complete, with tool calls in it, recorded by "
-        f"an earlier version of SpecuNode under another rule for where the calls after such a "
-        f"turn sit (this is rule {POSITION_RULE}). Placed under this rule, a write already sent "
-        "could go out again under a new key: resume or replay it with the version that "
-        "recorded that turn."
-    )
+    return None
 
 
 @dataclass(frozen=True)
@@ -249,7 +221,7 @@ class ReplayModel:
     _pacer: _Pacer = field(default_factory=_Pacer, init=False)
 
     def __post_init__(self) -> None:
-        problem = position_rule_problem(self.journal, self.run_id, replay=True)
+        problem = position_rule_problem(self.journal, self.run_id)
         if problem is not None:
             raise PositionRuleMismatch(problem)
         self._load()
