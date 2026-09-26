@@ -361,6 +361,9 @@ class Scheduler:
     _budget: Budget | None = field(default=None, repr=False)
     #: The run this Scheduler drives, or drove: it drives one (``_driving``).
     _driven: str | None = field(default=None, repr=False)
+    #: This drive of it -- one run, or one resume -- as the calls it makes carry it: once it
+    #: ends, the model writes nothing more for them (``JournaledModel.end_drive``).
+    _drive: str = field(default_factory=new_ulid, repr=False)
 
     # -- bookkeeping the ports call back into ------------------------------------------------
 
@@ -377,6 +380,17 @@ class Scheduler:
             event = asyncio.Event()
             self._park_events[branch_id] = event
         return event
+
+    def _end_drive(self) -> None:
+        """Tell the model this drive is over: a call left running -- a task a node started and
+        never awaited -- writes nothing into the journal after it, nor asks anything more.
+
+        By this drive, not by whether the run is still held: a resume of the same run in the
+        same process held it again, and a call left over from the drive before wrote into it.
+        """
+        end = getattr(self.target, "end_drive", None)
+        if callable(end):
+            end(self._drive)
 
     def _halt_node(self, branch: Branch, reason: str) -> None:
         """Stop a node whose served turn was abandoned: no more writes, and no more model asks.
@@ -459,6 +473,7 @@ class Scheduler:
             step=step,
             node_id=node_id,
             speculative=unauthorised,
+            drive=self._drive,
         )
         token = call_scope.set(scope)
         try:
@@ -566,6 +581,7 @@ class Scheduler:
                 held = True
                 yield
         finally:
+            self._end_drive()
             self.buffer.driving = None
             if not held:
                 self._driven = None
@@ -865,6 +881,7 @@ class Scheduler:
             record_prompt=branch.record_prompt,
             track_turn=branch.track_turn,
             halt=lambda reason: self._halt_node(branch, reason),
+            drive=self._drive,
             halted=lambda: branch.abandoned,
             node_started=time.monotonic(),
             # Whether this request is being sent on a guess. Always False before, which made
@@ -1247,6 +1264,7 @@ class Scheduler:
             record_prompt=branch.record_prompt,
             track_turn=branch.track_turn,
             halt=lambda reason: self._halt_node(branch, reason),
+            drive=self._drive,
             halted=lambda: branch.abandoned,
             node_started=time.monotonic(),
             # Whether this request is being sent on a guess. Always False before, which made
@@ -1963,6 +1981,9 @@ class Scheduler:
         # Raised rather than skipped -- a run that could not say it finished did not report
         # success with no "finished" on disk, which a status reads as a run still to resume.
         await self.journal.check_run_lock(self.run_id)
+        # Over for the model before it is over on disk: an answer that landed while
+        # ``run_finished`` was being written was appended after it.
+        self._end_drive()
         await self.journal.append_async(
             self.run_id,
             "run_finished",
@@ -2174,6 +2195,14 @@ class SpeculativeTurn:
                 self.issued_at.append(time.monotonic())
                 spec = scheduler.registry.get(actual.name)
                 ordinal = len(slots)
+                # Every block takes its position as it arrives -- a read issued early, a write
+                # staged after the stream, a guess adopted. Taken when each first ran, a turn
+                # that failed right after a block left its position taken or not as the event
+                # loop happened to order things -- a run whose failure was written first let an
+                # early read start, a replay that writes nothing did not, and a guess adopted on
+                # another branch never took it at all -- and every call after it moved to
+                # another key.
+                self._branch.reserve_step(self._base + ordinal + 1)
                 if spec.effect is not EffectClass.READ:
                     self._pending_write_keys.append(keys_touched(spec, actual.args))
                 # Not a read of something a write earlier in this turn changes: issued now, it
@@ -2185,12 +2214,6 @@ class SpeculativeTurn:
                 )
                 if spec.effect is EffectClass.READ and self._adopted is None and early:
                     self.reads_issued_early += 1
-                    # Its position is taken now, as the block arrives, not when its task first
-                    # runs: a turn that failed right after the block cancelled the task before
-                    # or after it started, as the event loop happened to order them -- a run
-                    # whose failure was written first let it start, a replay that writes nothing
-                    # did not -- and every call after it moved to another key.
-                    self._branch.reserve_step(self._base + ordinal + 1)
                     slots.append(asyncio.create_task(self._timed_read(tools, actual, ordinal)))
                 elif self._adopted is not None:
                     # The speculation was right: its result is already in hand, so the call is

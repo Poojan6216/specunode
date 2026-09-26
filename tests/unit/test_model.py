@@ -455,3 +455,35 @@ async def test_a_replay_waits_as_long_as_the_question_took_to_write(tmp_path: Pa
         first = await replay.stream(envelope()).__anext__()
     assert isinstance(first, ToolUseComplete)
     assert time.monotonic() - began >= 0.2
+
+
+def test_a_record_that_does_not_hold_together_stops_the_node() -> None:
+    """A piece that does not fit its block raised a ValueError -- an Exception a node's fallback
+    caught and went on from, with its question left unanswered on disk. It stops the node, as
+    TurnAbandoned, which the served path records. Found by the nineteenth review."""
+    from specunode.core.model import TurnAbandoned, _served_events
+
+    reply = ModelResponse(
+        model="m",
+        content=(ToolUseBlock(id="t", name="a", args={}),),
+        stop_reason="tool_use",
+    )
+    stopped: list[str] = []
+    scope = CallScope(run_id=RUN, node_id="agent", halt=stopped.append)
+    with pytest.raises(TurnAbandoned, match="does not hold together"):
+        _served_events(reply, ((0, 5, 3),), scope)  # a piece of text, where the reply has a call
+    assert stopped and "does not hold together" in stopped[0]
+
+
+def test_a_tool_call_recorded_before_tool_pieces_were_marked_is_served() -> None:
+    """A journal written before tool calls' pieces were marked carried 0 for them; resumed, it
+    was refused as a text piece. Found by the nineteenth review."""
+    from specunode.core.model import _served_events
+
+    reply = ModelResponse(
+        model="m",
+        content=(ToolUseBlock(id="t", name="a", args={}),),
+        stop_reason="tool_use",
+    )
+    ((at, event),) = _served_events(reply, ((0, 5, 0),))
+    assert at == 5 and isinstance(event, ToolUseComplete)

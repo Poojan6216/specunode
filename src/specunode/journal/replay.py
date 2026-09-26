@@ -327,7 +327,7 @@ class ReplayModel:
             response = turn.response
             # The pieces the recorded caller had, text too, as a live stream and a served one
             # hand them over: a node that stopped reading on a piece of text never saw it here.
-            for at, event in _served_events(response, turn.pieces):
+            for at, event in _served_events(response, turn.pieces, scope):
                 if at >= 0:
                     await _sleep_until(asked_at + at / 1000.0)
                 yield event

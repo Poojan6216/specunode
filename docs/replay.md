@@ -174,11 +174,12 @@ reports why the node was stopped, whatever its `finally` ran into after. A repla
 `specunode resume --ask-abandoned` asks the model again instead, live, at the point where the
 node would be stopped, for an operator who has decided to: that turn only, never on a node
 already stopped, and not a streamed one part of which was already handed over, which cannot be
-asked again part-way -- the error says which. A call that outlives its node and its run writes
-nothing into the journal after the run's end. What a resume cannot keep the same is anything
-else that shapes a call: a read made again that returns something new, a timestamp, code that
-changed. Then a different call at the same position gets a different key, and the world receives
-it as well.
+asked again part-way -- the error says which. A call that outlives its node -- a task the node
+started and never awaited -- asks nothing and writes nothing once its run or resume is over: not
+while `run_finished` is being written, and not into a later resume of the same run. What a
+resume cannot keep the same is anything else that shapes a call: a read made again that returns
+something new, a timestamp, code that changed. Then a different call at the same position gets a
+different key, and the world receives it as well.
 
 The kill/resume test resumes every kill point with a model that would decide differently if it
 were asked, on a node that asks and charges in one step as well as on one that only decides, and

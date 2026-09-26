@@ -186,6 +186,25 @@ for an earlier one only until the node is done with that one -- answered, failed
 -- and a node that holds an earlier answer open far longer than the recorded run did, while it
 waits for a later one, is stopped with `TurnAbandoned` too.
 
+## Model clients
+
+A model client -- `specunode.integrations.anthropic.AnthropicModel`, or your own -- has two
+methods. `complete(envelope)` returns the whole reply. `stream(envelope)` yields its pieces as
+they parse -- `TextDelta` for text, `ToolUseComplete` for each tool call as it finishes -- and
+then `TurnComplete` with the whole reply. The runtime reads the stream as it arrives, whoever is
+reading it, and records each piece with when it came, so a resume and a replay hand the pieces
+back at that pace.
+
+**Each piece's `index` is the position of its block in the finished reply.** A block that
+streams nothing -- a thinking block -- still takes its position, so the pieces after it keep
+theirs. A resume serves a piece against the block at its position; one that does not fit its
+block stops the node with `TurnAbandoned` rather than be served as something else.
+
+**A failure may come at any point**, and is recorded as the turn's outcome wherever it comes:
+`stream()` itself raising before it yields anything -- a client's own rate limiter -- a failure
+mid-stream, or a reply cut off. Raise `ModelError` for a failure the node may catch and ask
+again after; anything else is raised to the node as a `ModelError` caused by it.
+
 ## Speculation and node bodies
 
 **A speculative branch does not run your node bodies by default.** A node body is unbounded

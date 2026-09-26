@@ -522,6 +522,9 @@ class CallScope:
     #: :class:`TurnAbandoned` (``halted``). Called before a served turn is abandoned -- a node's
     #: ``finally`` went on writing, on the very path the runtime had just judged wrong.
     halt: Callable[[str], None] | None = None
+    #: The drive -- one run, or one resume -- this call belongs to; once it is over, the model
+    #: writes nothing more for the call (``JournaledModel.end_drive``). Empty outside a Scheduler.
+    drive: str = ""
     halted: Callable[[], bool] | None = None
     #: When the node body began (``time.monotonic()``), so a turn it stopped waiting for can be
     #: served against the node's own clock, not only the call's.
@@ -875,7 +878,9 @@ TOOL_PIECE = -1
 
 
 def _served_events(
-    response: ModelResponse, pieces: Sequence[tuple[int, int, int]] | None
+    response: ModelResponse,
+    pieces: Sequence[tuple[int, int, int]] | None,
+    scope: CallScope | None = None,
 ) -> list[tuple[int, StreamEvent]]:
     """A recorded stream's pieces, each with when it reached the recorded caller (ms after it
     asked; -1: at once) -- the pieces it had, in the order and at the pace it had them.
@@ -893,7 +898,8 @@ def _served_events(
     begun: dict[int, int] = {}
     for index, at, end in pieces:
         piece = response.content[index] if 0 <= index < len(response.content) else None
-        if isinstance(piece, ToolUseBlock) and end == TOOL_PIECE:
+        # A tool call's piece is marked TOOL_PIECE; one recorded before it was carried 0.
+        if isinstance(piece, ToolUseBlock) and end in (TOOL_PIECE, 0):
             events.append((at, ToolUseComplete(index=index, block=piece)))
         elif isinstance(piece, TextBlock) and end >= 0:
             start = begun.get(index, 0)
@@ -902,12 +908,20 @@ def _served_events(
             begun[index] = stop
         else:
             # Never handed over as something else, or dropped: a piece served as the wrong
-            # block issued a read the node never made, or left out one it did.
-            raise ValueError(
-                f"the journal's record of this turn does not hold together: a piece at block "
-                f"{index} is not a {'tool call' if end == TOOL_PIECE else 'text block'} in the "
-                "recorded reply"
+            # block issued a read the node never made, or left out one it did. And not an
+            # error a node can catch and go on from, as a ValueError was, with its question
+            # left unanswered on disk: the node is stopped, and the turn recorded as such.
+            kind = "tool call" if end == TOOL_PIECE else "piece of text"
+            found = type(piece).__name__ if piece is not None else "no block at all"
+            reason = (
+                f"the journal's record of this turn does not hold together -- a {kind} at "
+                f"block {index}, where the recorded reply has {found} -- so it cannot be handed "
+                "over as it was, and the node stops here. A stream's pieces must carry the "
+                "positions its finished reply gives their blocks."
             )
+            if scope is not None and scope.halt is not None:
+                scope.halt(reason)
+            raise TurnAbandoned(reason)
     return events
 
 
@@ -920,17 +934,21 @@ class _ReadAhead:
     timed by when the model sent it, and handed over when it is asked for.
     """
 
-    def __init__(self, stream: AsyncIterator[StreamEvent]) -> None:
+    def __init__(self, opening: Callable[[], AsyncIterator[StreamEvent]]) -> None:
         self._arrived: asyncio.Queue[tuple[float, StreamEvent | BaseException | None]] = (
             asyncio.Queue()
         )
         #: When the stream ended, or failed: the monotonic time it did.
         self.ended_at: float | None = None
-        self._reading = asyncio.ensure_future(self._read(stream))
+        self._reading = asyncio.ensure_future(self._read(opening))
 
-    async def _read(self, stream: AsyncIterator[StreamEvent]) -> None:
+    async def _read(self, opening: Callable[[], AsyncIterator[StreamEvent]]) -> None:
         try:
-            async for event in stream:
+            # Opened here, where its failure is handed over like any other: a client whose
+            # ``stream()`` refuses before returning anything -- a rate limiter saying "overloaded"
+            # -- raised past the turn's recording, left its question with no outcome, and a
+            # resume asked the model again.
+            async for event in opening():
                 self._arrived.put_nowait((time.monotonic(), event))
         except BaseException as exc:
             # Handed to the reader where it arrived, whatever it is; a cancel of this task
@@ -1026,8 +1044,8 @@ class JournaledModel:
         self._role = role
         self._provider = provider
         self._recorded: dict[str, RecordedTurnSource] = {}
-        #: Runs this process has driven: once it lets one go, it writes nothing more into it.
-        self._driven: set[str] = set()
+        #: Drives that are over: a call of one writes nothing more, and asks nothing more.
+        self._ended: set[str] = set()
         #: How long each question's write took, by request id, while its call is under way.
         self._ask_ms: dict[str, int] = {}
 
@@ -1066,10 +1084,7 @@ class JournaledModel:
         digest: str,
         recorded: RecordedTurn | None,
     ) -> str:
-        if self._journal.holds(scope.run_id):
-            self._driven.add(scope.run_id)
-        else:
-            self._refuse_if_let_go(scope)
+        self._refuse_if_let_go(scope)
         request_id = new_ulid()
         # Hard Rule 13 tracks target requests only. A draft request legitimately differs --
         # a different model, at minimum -- and folding it in would make every tier-2 run
@@ -1308,9 +1323,18 @@ class JournaledModel:
         collector after the run ended is not, and writes nothing into a run it let go of."""
         return self._journal.holds(scope.run_id)
 
+    def end_drive(self, drive: str) -> None:
+        """The Scheduler's drive ``drive`` is over: its calls write nothing more, ask nothing more.
+
+        Before its ``run_finished`` is written, so nothing lands after it; and by drive, not by
+        whether the run is held, so a call left over from one drive writes nothing into the
+        next -- a resume of the same run, in the same process -- either.
+        """
+        self._ended.add(drive)
+
     def _let_go(self, scope: CallScope) -> bool:
-        """Whether this process drove the scope's run and no longer does."""
-        return scope.run_id in self._driven and not self._journal.holds(scope.run_id)
+        """Whether the drive the scope's call belongs to is over."""
+        return bool(scope.drive) and scope.drive in self._ended
 
     def _refuse_if_let_go(self, scope: CallScope) -> None:
         if self._let_go(scope):
@@ -1318,6 +1342,22 @@ class JournaledModel:
                 "the run this call belongs to is over, and this process no longer drives it: "
                 "nothing more is asked in it"
             )
+
+    async def _refuse_if_stopped(
+        self, envelope: RequestEnvelope, scope: CallScope, request_id: str, digest: str
+    ) -> None:
+        """Ask nothing live for a node stopped, or a run let go, while its question was written.
+
+        Looked at only before the write, a question whose write straddled the node being
+        stopped went to the live model all the same. Its question is on disk, so it is given an
+        outcome: it was never answered.
+        """
+        if not ((scope.halted is not None and scope.halted()) or self._let_go(scope)):
+            return
+        empty = ModelResponse(model=envelope.model, stop_reason="error")
+        await self._cancelled(empty, scope, request_id, digest, 0, abandoned=True)
+        _refuse_if_halted(scope)
+        self._refuse_if_let_go(scope)
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
         scope = current_scope()
@@ -1382,6 +1422,7 @@ class JournaledModel:
                         if recorded.failed is not None:
                             raise ModelError(recorded.failed)
                         return served
+                await self._refuse_if_stopped(envelope, scope, request_id, digest)
                 response: ModelResponse | None = None
                 try:
                     response = await self._inner.complete(envelope)
@@ -1472,7 +1513,7 @@ class JournaledModel:
                     # a served turn as they saw the original.
                     response = recorded.response
                     try:
-                        for at, event in _served_events(response, recorded.pieces):
+                        for at, event in _served_events(response, recorded.pieces, scope):
                             if at >= 0:
                                 await _sleep_until(asked_at + at / 1000.0)
                             handed.add(event, at if at >= 0 else None)
@@ -1531,16 +1572,19 @@ class JournaledModel:
                             track = None
                         yield TurnComplete(response=response)
                         return
+                await self._refuse_if_stopped(envelope, scope, request_id, digest)
                 completed = False
                 #: An outcome is on disk, or will be: a turn has exactly one, the last word.
                 recorded_outcome = False
                 final: ModelResponse | None = None
-                arriving = _ReadAhead(self._inner.stream(envelope))
+                #: When the model's whole reply arrived, in ms after the ask.
+                final_ms: int | None = None
+                arriving = _ReadAhead(lambda: self._inner.stream(envelope))
                 try:
                     async for arrived, event in arriving:
                         at_ms = int((arrived - asked_at) * 1000)
                         if isinstance(event, TurnComplete):
-                            final = event.response
+                            final, final_ms = event.response, at_ms
                             refuse_cut_off(event.response)
                             recorded_outcome = True
                             await self._outcome(
@@ -1589,9 +1633,13 @@ class JournaledModel:
                         raise
                     # What of the reply reached the caller is recorded with the failure, and
                     # served again before it, so a resumed node sees what this one saw -- the
-                    # failure no sooner than it arrived.
-                    ended = arriving.ended_at or time.monotonic()
-                    latency_ms = int((ended - asked_at) * 1000)
+                    # failure no sooner than it arrived: a reply refused as cut off, when the
+                    # reply did, not when the node got round to it.
+                    if final_ms is not None:
+                        latency_ms = final_ms
+                    else:
+                        ended = arriving.ended_at or time.monotonic()
+                        latency_ms = int((ended - asked_at) * 1000)
                     failure = _failure_text(exc)
                     await self._outcome(
                         final or handed.response(envelope),
