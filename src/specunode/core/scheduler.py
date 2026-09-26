@@ -39,7 +39,7 @@ from enum import Enum
 from specunode.buffer.dispatcher import Dispatcher
 from specunode.buffer.store_buffer import EffectOutcome, StoreBuffer
 from specunode.canonical import JsonValue, chash
-from specunode.core.branch import Branch, BranchStatus, ReadRecord, StepCursor
+from specunode.core.branch import POSITION_RULE, Branch, BranchStatus, ReadRecord, StepCursor
 from specunode.core.decision import Decision, ToolCall, decision_key, decision_payload, is_barrier
 from specunode.core.effects import EffectClass, ToolRegistry, ToolSpec
 from specunode.core.graph import END, GraphAdapter, NodeRef, Parallel, RunSession, session_scope
@@ -55,7 +55,10 @@ from specunode.core.model import (
     TurnAbandoned,
     TurnComplete,
     TurnResults,
+    _let_finish,
     call_scope,
+    drive_over,
+    end_drive,
     partial_turns_discarded,
 )
 from specunode.core.policy import Budget, Policy
@@ -70,7 +73,7 @@ from specunode.drafters.base import DraftContext, Drafter
 from specunode.ids import new_ulid
 from specunode.journal.journal import Journal
 from specunode.journal.ledger import Ledger, build_ledger
-from specunode.journal.replay import OpenGroup, RecordedTurns, recover
+from specunode.journal.replay import OpenGroup, RecordedTurns, position_rule_problem, recover
 from specunode.verify.gate import resolve_decision
 from specunode.verify.witness import ReadValidation, validate_reads
 
@@ -240,6 +243,12 @@ class BranchTools:
         scheduler = self._scheduler
         branch = self._branch
         spec = scheduler.registry.get(name)
+        if drive_over(scheduler._drive):
+            # A call left running after its run -- a task its node never awaited -- reached the
+            # upstream and journaled after ``run_finished``.
+            raise TurnAbandoned(
+                f"the run node {self._node_id} belonged to is over; its {name} is not made"
+            )
         if branch.abandoned:
             # Said plainly, not as the closed buffer's own refusal.
             raise TurnAbandoned(
@@ -388,9 +397,7 @@ class Scheduler:
         By this drive, not by whether the run is still held: a resume of the same run in the
         same process held it again, and a call left over from the drive before wrote into it.
         """
-        end = getattr(self.target, "end_drive", None)
-        if callable(end):
-            end(self._drive)
+        end_drive(self._drive)
 
     def _halt_node(self, branch: Branch, reason: str) -> None:
         """Stop a node whose served turn was abandoned: no more writes, and no more model asks.
@@ -581,7 +588,10 @@ class Scheduler:
                 held = True
                 yield
         finally:
-            self._end_drive()
+            if held:
+                # Only a drive that held the run is over: one that could not hold it drove
+                # nothing, may try again -- and ended here, it could never ask the model.
+                self._end_drive()
             self.buffer.driving = None
             if not held:
                 self._driven = None
@@ -752,6 +762,9 @@ class Scheduler:
                 f"run {run_id!r} never recorded its start, so it sent nothing and there is "
                 "nothing to resume; start it again with `run`, under the same id."
             )
+        misplaced = await asyncio.to_thread(position_rule_problem, self.journal, run_id)
+        if misplaced is not None:
+            raise SchedulerError(misplaced)
         self.run_id = run_id
         self.buffer.run_id = run_id
         self.buffer.scheduler_task = asyncio.current_task()
@@ -775,6 +788,7 @@ class Scheduler:
             {
                 "v": 1,
                 "mode": "resume",
+                "positions": POSITION_RULE,
                 "resumed_from_offset": recovery.last_offset,
                 "config_hash": chash({"reducers": dict(self.reducers)}),
                 "registry_hash": chash(sorted(self.registry.names())),
@@ -1914,6 +1928,7 @@ class Scheduler:
             {
                 "v": 1,
                 "mode": "run",
+                "positions": POSITION_RULE,
                 "config_hash": chash({"reducers": dict(self.reducers)}),
                 "registry_hash": chash(sorted(self.registry.names())),
                 "policy": self._policy_payload(),
@@ -2109,6 +2124,9 @@ class SpeculativeTurn:
             # never became durable, so what it staged is discarded, unsent. It was adopted
             # mid-stream once, and a node that caught the failure and finished sent it.
             await self._discard_confirmed()
+            # And the turn takes no positions: the node's next call is where it would be had
+            # none of the turn's blocks arrived (``Branch.rewind_to``, POSITION_RULE).
+            branch.rewind_to(self._base)
             raise
 
         # Any speculation still open when the turn ended predicted a call the model never made.
@@ -2507,20 +2525,43 @@ class SpeculativeTurn:
         await self._squash_open("mismatch")
 
     async def _squash_open(self, reason: str) -> None:
-        """Cancellation *is* the squash. The buffer is closed before the task is cancelled."""
+        """Cancellation *is* the squash. The buffer is closed before the task is cancelled.
+
+        Taken off the turn first, and then finished whatever the caller does: a cancel at one of
+        its awaits reached here again from the failure path, and the same guess was squashed --
+        and counted in flight and in alpha -- twice; let go of without finishing, its squash
+        was never journaled.
+        """
         if self._speculative is None:
             return
-        scheduler = self._scheduler
         child = self._speculative
+        opened, cost = self._open, self._cost_tokens
+        self._open = None
+        self._predicted = None
+        self._speculative = None
+        self._adopted = None
+        squashing = asyncio.ensure_future(self._squash(child, opened, cost, reason))
+        try:
+            await asyncio.shield(squashing)
+        except asyncio.CancelledError:
+            await _let_finish(squashing)
+            raise
+
+    async def _squash(
+        self,
+        child: Branch,
+        opened: asyncio.Task[JsonValue] | None,
+        cost: int,
+        reason: str,
+    ) -> None:
+        scheduler = self._scheduler
         child.squash(reason)
         self.squashed += 1
         # Every squash is a miss in the alpha window, whatever its reason. End-of-turn
         # squashes -- a guess the model never got round to contradicting -- were not recorded
         # at all, so the window overstated the acceptance rate by exactly those. The tokens
         # the guess cost to produce are wasted from here on.
-        scheduler.budget.record_resolution(
-            tier=self._tier, confirmed=False, tokens=self._cost_tokens
-        )
+        scheduler.budget.record_resolution(tier=self._tier, confirmed=False, tokens=cost)
         scheduler.budget.inflight_branches -= 1
         await scheduler._journal_alpha_observed(child.fork_step, child.id)
         # Revoke first, cancel second: a tool that cannot be cancelled finishes anyway, and a
@@ -2529,14 +2570,14 @@ class SpeculativeTurn:
         discarded = await scheduler.buffer.discard_and_journal(child, reason)
         scheduler.counters.effects_discarded += discarded
         scheduler.counters.branches_squashed += 1
-        if self._open is not None:
-            self._open.cancel()
+        if opened is not None:
+            opened.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._open
+                await opened
         # The cost travels with the resolution. The ledger sums ``wasted_tokens`` from
         # ``branch_resolved`` and from nowhere else, so a squash that fed the budget but not
         # the journal left the receipt saying 0 beside a gate that had closed for tokens.
-        scheduler.counters.wasted_tokens += self._cost_tokens
+        scheduler.counters.wasted_tokens += cost
         await scheduler.journal.append_async(
             scheduler.run_id,
             "branch_resolved",
@@ -2547,13 +2588,9 @@ class SpeculativeTurn:
                 "status": "squashed",
                 "reason": reason,
                 "tier": self._tier,
-                "wasted_tokens": self._cost_tokens,
+                "wasted_tokens": cost,
             },
         )
-        self._open = None
-        self._predicted = None
-        self._speculative = None
-        self._adopted = None
 
     async def _timed_read(self, tools: BranchTools, decision: ToolCall, ordinal: int) -> JsonValue:
         """Run a read the model has emitted but whose turn is not yet durable.

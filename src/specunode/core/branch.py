@@ -67,6 +67,12 @@ class BranchStatus(Enum):
         return self in (BranchStatus.RETIRED, BranchStatus.SQUASHED, BranchStatus.STALLED)
 
 
+#: Which rule places a node's calls at program positions -- and so derives their keys -- when a
+#: model turn does not complete. 2: it takes none. Recorded in ``run_started``; a journal from
+#: another rule, in which such a turn had tool calls, is not resumed or replayed under this one.
+POSITION_RULE = 2
+
+
 @dataclass(frozen=True, slots=True)
 class StepCursor:
     """The run's program position, forked by value and promoted only at retirement.
@@ -302,6 +308,17 @@ class Branch:
         """
         self.cursor = replace(self.cursor, step_index=max(self.cursor.step_index, step))
         return step
+
+    def rewind_to(self, step: int) -> None:
+        """Put the cursor back to ``step`` -- for a model turn that did not complete, only.
+
+        Such a turn stages nothing, and the positions its blocks took as they arrived are given
+        back: how many had arrived before it failed, or before its node gave up on it, is a
+        matter of timing -- of a slow disk, of a guess being settled -- and a resume or a replay
+        reproduces that only roughly. Left taken, the node's next call moved by however many had
+        arrived, and a fallback charge went out a second time under a new key.
+        """
+        self.cursor = replace(self.cursor, step_index=step)
 
     def advance_step(self) -> int:
         """Take the next program position for a call this branch is about to make.

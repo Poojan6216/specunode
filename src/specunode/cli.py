@@ -38,7 +38,12 @@ from specunode.journal.ledger import (
     sign_ledger,
     verify_ledger,
 )
-from specunode.journal.replay import ReplayDivergence, ReplayModel, recover
+from specunode.journal.replay import (
+    PositionRuleMismatch,
+    ReplayDivergence,
+    ReplayModel,
+    recover,
+)
 from specunode.runner import RunnerError, build_graph, build_target
 
 app = typer.Typer(
@@ -479,15 +484,20 @@ def replay(
     # with the record it is checking against, and the record is the only evidence there is.
     into = Journal(_beside(location) / f"replay-{run_id}.db")
     policy = loaded.to_policy()
+    try:
+        replaying = ReplayModel(
+            journal=source, run_id=run_id, retired_branches=recovery.retired_branches
+        )
+    except PositionRuleMismatch as mismatch:
+        typer.echo(str(mismatch), err=True)
+        raise typer.Exit(2) from mismatch
     scheduler = Scheduler(
         graph=adapter,
         registry=registry,
         journal=into,
         buffer=StoreBuffer(journal=into, run_id=""),
         dispatcher=Dispatcher(registry=registry, dry_run=not dispatch),
-        target=ReplayModel(
-            journal=source, run_id=run_id, retired_branches=recovery.retired_branches
-        ),
+        target=replaying,
         policy=replace(policy, speculation=speculation == "on"),
         reducers=loaded.state.reducers,
     )

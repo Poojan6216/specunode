@@ -24,7 +24,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from specunode.canonical import JsonValue
-from specunode.core.branch import StepCursor
+from specunode.core.branch import POSITION_RULE, StepCursor
 from specunode.core.model import (
     REPLAY_HINT,
     CallScope,
@@ -87,6 +87,44 @@ class ReplayDivergence(RuntimeError):
 
 class ReplayExhausted(RuntimeError):
     """The replayed run asked for a step the journal has no response for."""
+
+
+class PositionRuleMismatch(RuntimeError):
+    """The run was recorded under another rule for where a node's calls sit, and it matters.
+
+    A call's idempotency key is derived from its program position. How a model turn that did
+    not complete counts toward the positions after it has changed (``POSITION_RULE``); where
+    the recorded run has such a turn with tool calls in it, a resume or replay under this rule
+    would put the calls after it at other positions -- a write already sent would go out again
+    under a new key. So it is refused, with the version that recorded it named as the way on.
+    """
+
+
+def position_rule_problem(journal: Journal, run_id: str) -> str | None:
+    """Why ``run_id`` cannot be resumed or replayed under this position rule, if it cannot."""
+    rules: set[int] = set()
+    unplaced = False
+    for entry in journal.read(run_id, kinds=["run_started", "model_response"]):
+        payload = entry.payload
+        if entry.kind == "run_started":
+            rule = payload.get("positions")
+            rules.add(rule if isinstance(rule, int) and not isinstance(rule, bool) else 1)
+        elif payload.get("failed") is not None:
+            response = payload.get("response")
+            blocks = response.get("content") if isinstance(response, Mapping) else None
+            if isinstance(blocks, Sequence) and any(
+                isinstance(block, Mapping) and block.get("kind") == "tool_use" for block in blocks
+            ):
+                unplaced = True
+    if rules <= {POSITION_RULE} or not unplaced:
+        return None
+    return (
+        f"run {run_id} was recorded by an earlier version of SpecuNode (position rule "
+        f"{min(rules)}; this is {POSITION_RULE}), and it has a model turn that did not complete "
+        "with tool calls in it. The two place the calls after such a turn at different program "
+        "positions, so a write already sent could go out again under a new key: resume or "
+        "replay it with the version that recorded it."
+    )
 
 
 @dataclass(frozen=True)
@@ -185,6 +223,9 @@ class ReplayModel:
     _pacer: _Pacer = field(default_factory=_Pacer, init=False)
 
     def __post_init__(self) -> None:
+        problem = position_rule_problem(self.journal, self.run_id)
+        if problem is not None:
+            raise PositionRuleMismatch(problem)
         self._load()
         self._keep_one_attempt()
 

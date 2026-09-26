@@ -104,6 +104,7 @@ jobs:
             tests/integration/test_served_pace.py \
             tests/integration/test_served_streams.py \
             tests/integration/test_turn_edges.py \
+            tests/integration/test_positions.py \
             tests/unit/test_recorded_turns.py \
             tests/test_equivalence.py \
             tests/test_leak.py \

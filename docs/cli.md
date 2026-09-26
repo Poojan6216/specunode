@@ -85,18 +85,19 @@ failed -- cut off, refused, overloaded -- is recorded as the failure it was and 
 that failure, so a node that caught it and asked again is matched with its second question. A
 run is driven by one process at a time: resuming one that another process is running exits 2, as
 does one whose Postgres run lock was lost while it ran, an unknown run, one that never recorded
-its start, and a LangGraph run, which cannot be resumed in this version. Prints the ledger;
-exits 1 if the run did not complete and 2 if the config is missing, unreadable, or cannot build
-the graph or the target. A turn the crashed run had stopped waiting for is served as one that
-never answers, and a node that keeps waiting well past that ends with `TurnAbandoned` -- every
-time, until someone decides: `--ask-abandoned` asks the model again instead, live, at the point
-the node would be stopped, knowing its answer may differ from what was acted on. Only that turn:
-one the node stops waiting for again, as the crashed run did, is served as it was; and a
-streamed turn part of which was already handed over is not asked again part-way -- the node is
-stopped. A resume that finishes while an effect may have been sent and nothing settled it --
-claimed by an earlier attempt and never answered, or dead-lettered without proof it never left
--- does not report success: it names the tools, for `specunode resolve`. Options: `--journal`;
-`--config PATH`; `--ask-abandoned`.
+its start, a LangGraph run, which cannot be resumed in this version, and a run recorded by an
+earlier version under another rule for where a failed turn's calls sit, when it has such a turn.
+Prints the ledger; exits 1 if the run did not complete and 2 if the config is missing,
+unreadable, or cannot build the graph or the target. A turn the crashed run had stopped waiting
+for is served as one that never answers, and a node that keeps waiting well past that ends with
+`TurnAbandoned` -- every time, until someone decides: `--ask-abandoned` asks the model again
+instead, live, at the point the node would be stopped, knowing its answer may differ from what
+was acted on. Only that turn: one the node stops waiting for again, as the crashed run did, is
+served as it was; and a streamed turn part of which was already handed over is not asked again
+part-way -- the node is stopped. A resume that finishes while an effect may have been sent and
+nothing settled it -- claimed by an earlier attempt and never answered, or dead-lettered without
+proof it never left -- does not report success: it names the tools, for `specunode resolve`.
+Options: `--journal`; `--config PATH`; `--ask-abandoned`.
 
 ### `specunode resolve RUN_ID KEY`
 
@@ -115,15 +116,14 @@ Options: `--landed`; `--not-sent`; `--ack JSON`; `--journal`.
 Re-run a journaled run against its own recorded model output, from the inputs the journal
 recorded, into a separate journal (`replay-<run>.db` beside the source, so the record being
 checked is never written to; a second replay of the same run appends another run to that same
-file rather than starting empty). Refuses at the first turn whose request does not match the journal's,
-naming the step and the fields that differ, rather than continuing down a trajectory the
-recorded run never took (exit 1). Dispatches nothing unless told to. A replay writes into
-`replay-<run>.db` beside the source journal and appends to it if that file already exists, so
-a second replay of the same run adds a second run to the same file rather than starting empty.
-Options: `--journal`; `--config PATH`; `--speculation on|off` (default `on`; anything else
-exits 2); `--dispatch`
-actually sends effects, which is off by default because a replay that re-sent every effect
-would charge every card again. See [replay.md](replay.md).
+file rather than starting empty). Refuses at the first turn whose request does not match the
+journal's, naming the step and the fields that differ, rather than continuing down a trajectory
+the recorded run never took (exit 1); and refuses a run recorded by an earlier version under
+another rule for where a failed turn's calls sit, when it has such a turn (exit 2). Dispatches
+nothing unless told to. Options: `--journal`; `--config PATH`; `--speculation on|off` (default
+`on`; anything else exits 2); `--dispatch` actually sends effects, which is off by default
+because a replay that re-sent every effect would charge every card again. See
+[replay.md](replay.md).
 
 ### `specunode mcp-proxy --upstream "<command>"`
 

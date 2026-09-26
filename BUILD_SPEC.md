@@ -1060,6 +1060,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [2.5] DEFECTS (fixed), found by the seventeenth review -- twelve, four critical, and all four in the sixteenth review's repairs: (1, critical) a streamed text block was timed by its last piece and served whole then, so a node that gives up on a model slow to start saw the first word late on resume and in replay, and charged its fallback as well -- every piece is recorded with its time now, and served as it came; (2, critical) a served stream the node gave up on was recorded with every block and no timing, so the next resume handed the node all of it at once, an early read took the fallback's position, and the fallback went out twice -- a turn is recorded as its caller had it; (3, critical) `--ask-abandoned` asked every turn the recorded node had given up on again at once, including one it would give up on again, and the node charged a price no run had decided -- it asks only at the point the node would be stopped; (4, critical) a dead letter that may have been sent did not keep a resume from reporting success, as a claim still in flight does; (5) a node's `finally` refused on its way out replaced why it was stopped in the run's error; (6) a replay was told to resume; (7) a claim demonstrably never sent failed a resume as maybe sent; (8) `ledger --json` and `--normalised` left out what may have been sent; (9) a journal whose path held `#`, `?` or `%` was refused; (10) read-only commands created the journal's tables in a Postgres database that was not a journal; (11) two tests failed on a disk slower than CI's; (12) replay.md described repeated requests at one step wrongly. A thirteenth, suspected, is closed too: a guess adopted by a branch closed to writes could still stage into it. Each fix fails under its own planted bug. — 2026-09-26
 [2.5] DEFECTS (fixed), found by the eighteenth review -- seven, two critical, one of them in the seventeenth review's repair: (1, critical) a turn given up on or failed was recorded with its blocks packed together while its pieces kept the stream's positions, so after a thinking block -- which streams nothing -- a piece was served as the wrong block or dropped, early reads went missing or tripled, and a charge moved to a new key -- a partial reply keeps every block's position, a piece records whether it is a tool call, and a piece that does not fit is an error, never served as something else; (2, critical, older) a piece was timed by when the node took it, not when the model sent it, so a node busy with a slow lookup made the model look slow to a resume whose lookup was quick -- the model's stream is read ahead as it arrives (`_ReadAhead`); (3) `--ask-abandoned` lost a race to a later answer's own wait, and asked the model live on a node already stopped; (4) a turn asked again live read as served; (5) the error recommended `--ask-abandoned` for a turn it would refuse; (6) an empty ledger said nothing had reached the world just above what may have; (7, older) a call that outlived its node wrote into the journal after `run_finished`. Fixing (1) turned up a replay that raised a recorded failure before the read it had just handed over got to run, so the read's position went untaken -- an early read takes its position as its block arrives -- and the review's suspicion that a replay's clock started a question-write too early was right, and closed. Each fix fails under its own planted bug. — 2026-09-26
 [2.5] DEFECTS (fixed), found by the nineteenth review -- five, one critical, and it in the eighteenth's repair again: (1, critical) the model's stream was opened before the turn's recording began, so a client whose `stream()` refused at once -- a rate limiter -- left its question with no outcome and the node the client's raw error, and a resume asked the model again -- it is opened inside the read-ahead, where its failure is recorded like any other; (2) a reply refused as cut off was timed by when the node got to it -- by when it arrived now; (3) a record that did not hold together raised an error a node could catch, and refused a journal from the commit before, whose tool pieces were marked 0 -- the old mark is read, and a record that does not fit stops the node as `TurnAbandoned`, recorded; (4) calls left running still wrote after `run_finished`: while it was being written, into a resume of the same run in the same process, or as the first question of their drive -- every call carries its drive, and the model is told the drive is over before `run_finished` is written; (5) a question whose write straddled its node being stopped went to the live model -- looked at again once it is on disk. And its suspicion was right: a turn that failed after a guessed block left the next call one position earlier with speculation on than off -- every block now takes its position as it arrives. The model client's contract is written down (adapters.md). Each fix fails under its own planted bug. — 2026-09-26
+[2.5] DEFECTS (fixed), found by the twentieth review -- seven, two critical, both in the nineteenth's repair of where a failed turn's calls sit: (1, critical) a journal from an earlier commit, resumed here, put a retried charge at another position -- a new key, and it went out twice with the run reporting success; (2, critical) whether a turn that did not complete kept the positions its blocks had taken hung on timing -- a node's deadline firing while a guess was settled, a resume slower to write its question -- so a fallback charge moved and went out twice, and a finished run failed to replay. A turn that does not complete now takes no positions (`Branch.rewind_to`; position rule 2, recorded in `run_started`), and a journal from another rule with such a turn in it is refused by resume and replay; (3) a Scheduler that could not hold its run ended its drive anyway, and its retry could ask the model nothing; (4) the stop check ran a step of the event loop before the stream was opened -- it runs where it is opened too; (5) only the target model was told a drive was over: a drafter's model and a left-over tool call still wrote after `run_finished` -- the drive's end is now kept for every call of it; (6) a new test timed a late question with a sleep, and failed on a slow disk; (7, older) a cancel inside a guess's squash squashed and counted it twice -- it is let go of first, and its squash finished. Each fix fails under its own planted bug. — 2026-09-26
 [3.3] Four tests settled a guess inside a 15–25 ms block delay, which a journal append on a slow CI disk could miss. Found all at once by running the suite with every append 40 ms slower (`tests/slow_journal.py`); each now holds the settling block until the event it needs has happened, and passes at 40, 100 and 250 ms of added latency. The `slow-disk` CI job runs the tests that guess that way on every push. — 2026-09-25
 ```
 
@@ -1070,17 +1071,17 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**1058 tests pass, 24 skip — 18 of the passes against a real Postgres 16 server.** `ruff check`,
+**1069 tests pass, 24 skip — 18 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Nineteen independent adversarial reviews have found 190 defects here, 31 of them critical.** The
-counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8, 10, 6, 7, 7, 6, 12, 7, 5.** All are fixed but one, kept on purpose
+**Twenty independent adversarial reviews have found 197 defects here, 33 of them critical.** The
+counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8, 10, 6, 7, 7, 6, 12, 7, 5, 7.** All are fixed but one, kept on purpose
 and documented: a node's writes are refused while any model turn it started is unjournaled, even
 one that did not decide the write. That number is the most useful thing in this report, so it
 is at the top rather than buried: the version of this document written a day earlier described
-a finished project. The nineteenth to sixth reviews (2026-09-25 and -26) and the fifth (2026-09-23) are
+a finished project. The twentieth to sixth reviews (2026-09-25 and -26) and the fifth (2026-09-23) are
 summarised below; the fourth is in commit `c8802ec`.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
@@ -1200,6 +1201,28 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (4 guesses forked, 4 squashed, 4 charges staged and discarded, the
 alpha gate closed once, 0 wasted tokens — a pattern-index guess costs no model tokens — and 0
 leaks) and 7.8 replay under model drift (both cases diverge at step 0).
+
+### What the twentieth review found
+
+Seven findings, two critical -- both in the nineteenth review's repair, the rule for where a
+turn's calls sit when the turn does not complete.
+
+- **Critical: where a failed turn's calls sat depended on timing.** The nineteenth review's
+  repair had every block of a turn take its program position as it arrived, and kept those
+  positions when the turn failed or its node gave up on it. How many had arrived by then is
+  timing -- a guess being settled on a slow disk, a question slower to write on resume -- and a
+  resume reproduces it only roughly: a fallback charge moved to another position, under a new
+  key, and went out twice; a run that finished fine failed to replay. A turn that does not
+  complete now takes no positions at all.
+- **Critical: a journal from an earlier commit charged twice.** The same change, resumed over a
+  journal written before it, put a retried charge at another position than the one already sent.
+  The rule is recorded in `run_started` now, and a journal from another rule that has such a
+  turn in it is refused by resume and replay, naming the version to use.
+- And five more: a Scheduler that could not hold its run ended its drive, so its retry could ask
+  nothing; the stop check ran a step before the stream opened; only the target model was told a
+  drive was over -- a drafter's model and a left-over tool call still wrote after
+  `run_finished`; a new test failed on a slow disk; and, older, a cancel inside a guess's squash
+  counted it twice. All fixed.
 
 ### What the nineteenth review found
 

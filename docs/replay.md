@@ -140,44 +140,49 @@ required whenever the run falls short.
 
 **Both halves of that pair are conditional on a resumed node making the calls it made before.**
 An idempotency key is derived from the run, the node, the program position, the tool and the
-*arguments*. Nothing is dispatched before the model turn that decided it is journaled, and a
-resumed node whose earlier answer may already have sent something is served that answer when it
-asks the same question -- so the resumed run makes the same calls, derives the same keys, and
-the dedupe table catches the earlier attempt, whatever the model would have said the second
-time. A served answer comes back at the pace it first did, and in the order the answers came
-back in the attempt it is served from -- a node that acts on whichever answer arrives first, or
-falls back when one is not back in time, decides as it did; so a resume, and a replay, take as
-long as the model took. A streamed answer is handed over piece by piece: exactly the pieces its
-caller had as it streamed, at the positions the stream gave them, each no sooner than it arrived
-from the model -- a node that gives up on a model slow to say its first word sees the first word
-when the model said it, and one busy with a slow lookup between two pieces does not make a quick
-model look slow -- and a turn its caller gave up on part-way is recorded, and served, as far as
-it got. A replay, which writes no question, waits as long as the run took to write each one
-before its answer's clock starts. An answer waits for an earlier one only until the node is done
-with that one, however it is done with it: answered, failed or given up on. An answer that sent
-nothing is asked for again; there is nothing to protect. A turn that failed -- a reply cut off
-or refused, a model that was overloaded -- is recorded as the failure it was and served again as
-that failure, and a replay raises it again at the same point: a node that caught it and asked
-again then asks its second question, and is matched with the answer to that. A turn the node
-stopped waiting for -- its timeout fired, or it was cancelled, even while the answer was being
-written -- is recorded as cancelled, and served as one that never answers: until well past the
-later of when the recorded call and the recorded node stopped waiting -- twice the call's wait,
-or as far into the node as it had got, and 30 seconds more. A node that stops waiting by then --
-its timeout fires again -- goes on as it did before; one still waiting is not asking what it
-asked before, and ends with `TurnAbandoned`, rather than wait without end or be answered anew.
-So does a node still holding an earlier answer open that long, while it waits for a later one:
-the run it resumes was done with the earlier one first. `TurnAbandoned` is a `BaseException`,
-like a cancellation, so an ordinary `except Exception` fallback cannot catch it; the node is
-closed first, so its `finally` cannot write or ask either; a node that catches it anyway and
-returns is not committed -- the run stops with `TurnAbandoned` all the same -- and the run
-reports why the node was stopped, whatever its `finally` ran into after. A replay does the same.
-`specunode resume --ask-abandoned` asks the model again instead, live, at the point where the
-node would be stopped, for an operator who has decided to: that turn only, never on a node
-already stopped, and not a streamed one part of which was already handed over, which cannot be
-asked again part-way -- the error says which. A call that outlives its node -- a task the node
-started and never awaited -- asks nothing and writes nothing once its run or resume is over: not
-while `run_finished` is being written, and not into a later resume of the same run. What a
-resume cannot keep the same is anything else that shapes a call: a read made again that returns
+*arguments*. A model turn that did not complete -- it failed, or its node gave up on it -- takes
+no positions, however many of its blocks had arrived: the node's next call sits where it would
+had the turn not been asked, so a timing that a resume reproduces only roughly moves no key. A
+run recorded by an earlier version, which placed the calls after such a turn differently, is
+neither resumed nor replayed by this one when it has such a turn with tool calls in it. Nothing
+is dispatched before the model turn that decided it is journaled, and a resumed node whose
+earlier answer may already have sent something is served that answer when it asks the same
+question -- so the resumed run makes the same calls, derives the same keys, and the dedupe table
+catches the earlier attempt, whatever the model would have said the second time. A served answer
+comes back at the pace it first did, and in the order the answers came back in the attempt it is
+served from -- a node that acts on whichever answer arrives first, or falls back when one is not
+back in time, decides as it did; so a resume, and a replay, take as long as the model took. A
+streamed answer is handed over piece by piece: exactly the pieces its caller had as it streamed,
+at the positions the stream gave them, each no sooner than it arrived from the model -- a node
+that gives up on a model slow to say its first word sees the first word when the model said it,
+and one busy with a slow lookup between two pieces does not make a quick model look slow -- and
+a turn its caller gave up on part-way is recorded, and served, as far as it got. A replay, which
+writes no question, waits as long as the run took to write each one before its answer's clock
+starts. An answer waits for an earlier one only until the node is done with that one, however it
+is done with it: answered, failed or given up on. An answer that sent nothing is asked for
+again; there is nothing to protect. A turn that failed -- a reply cut off or refused, a model
+that was overloaded -- is recorded as the failure it was and served again as that failure, and a
+replay raises it again at the same point: a node that caught it and asked again then asks its
+second question, and is matched with the answer to that. A turn the node stopped waiting for --
+its timeout fired, or it was cancelled, even while the answer was being written -- is recorded
+as cancelled, and served as one that never answers: until well past the later of when the
+recorded call and the recorded node stopped waiting -- twice the call's wait, or as far into the
+node as it had got, and 30 seconds more. A node that stops waiting by then -- its timeout fires
+again -- goes on as it did before; one still waiting is not asking what it asked before, and
+ends with `TurnAbandoned`, rather than wait without end or be answered anew. So does a node
+still holding an earlier answer open that long, while it waits for a later one: the run it
+resumes was done with the earlier one first. `TurnAbandoned` is a `BaseException`, like a
+cancellation, so an ordinary `except Exception` fallback cannot catch it; the node is closed
+first, so its `finally` cannot write or ask either; a node that catches it anyway and returns is
+not committed -- the run stops with `TurnAbandoned` all the same -- and the run reports why the
+node was stopped, whatever its `finally` ran into after. A replay does the same. `specunode
+resume --ask-abandoned` asks the model again instead, live, at the point where the node would be
+stopped, for an operator who has decided to: that turn only, never on a node already stopped,
+and not a streamed one part of which was already handed over, which cannot be asked again
+part-way -- the error says which. A call that outlives its node -- a task the node started and
+never awaited -- asks nothing and writes nothing once its run or resume is over: not while
+`run_finished` is being written, and not into a later resume of the same run. What a resume
+cannot keep the same is anything else that shapes a call: a read made again that returns
 something new, a timestamp, code that changed. Then a different call at the same position gets a
 different key, and the world receives it as well.
 

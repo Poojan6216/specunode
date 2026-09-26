@@ -559,6 +559,23 @@ def current_scope() -> CallScope:
     return scope
 
 
+#: Drives that are over, by id: every call of one -- the target model's, a drafter's, a tool's --
+#: asks nothing and writes nothing more. By drive, not by whether the run is still held: a call
+#: left over from one drive wrote into the next, a resume of the same run in the same process.
+_drives_over: set[str] = set()
+
+
+def end_drive(drive: str) -> None:
+    """The Scheduler's drive ``drive`` is over. Called before its ``run_finished`` is written."""
+    if drive:
+        _drives_over.add(drive)
+
+
+def drive_over(drive: str) -> bool:
+    """Whether ``drive`` is over; a call outside any Scheduler's drive (``""``) never is."""
+    return bool(drive) and drive in _drives_over
+
+
 @contextmanager
 def scoped(scope: CallScope) -> Iterator[None]:
     token = call_scope.set(scope)
@@ -934,15 +951,30 @@ class _ReadAhead:
     timed by when the model sent it, and handed over when it is asked for.
     """
 
-    def __init__(self, opening: Callable[[], AsyncIterator[StreamEvent]]) -> None:
+    def __init__(
+        self,
+        opening: Callable[[], AsyncIterator[StreamEvent]],
+        stopped: Callable[[], str | None] = lambda: None,
+    ) -> None:
         self._arrived: asyncio.Queue[tuple[float, StreamEvent | BaseException | None]] = (
             asyncio.Queue()
         )
         #: When the stream ended, or failed: the monotonic time it did.
         self.ended_at: float | None = None
-        self._reading = asyncio.ensure_future(self._read(opening))
+        self._reading = asyncio.ensure_future(self._read(opening, stopped))
 
-    async def _read(self, opening: Callable[[], AsyncIterator[StreamEvent]]) -> None:
+    async def _read(
+        self,
+        opening: Callable[[], AsyncIterator[StreamEvent]],
+        stopped: Callable[[], str | None],
+    ) -> None:
+        # Looked at once more here, where the stream is opened: this task first runs a step of
+        # the event loop after it was made, and a node stopped, or a drive ended, in that step
+        # had its question asked all the same.
+        reason = stopped()
+        if reason is not None:
+            self._arrived.put_nowait((time.monotonic(), TurnAbandoned(reason)))
+            return
         try:
             # Opened here, where its failure is handed over like any other: a client whose
             # ``stream()`` refuses before returning anything -- a rate limiter saying "overloaded"
@@ -1044,8 +1076,6 @@ class JournaledModel:
         self._role = role
         self._provider = provider
         self._recorded: dict[str, RecordedTurnSource] = {}
-        #: Drives that are over: a call of one writes nothing more, and asks nothing more.
-        self._ended: set[str] = set()
         #: How long each question's write took, by request id, while its call is under way.
         self._ask_ms: dict[str, int] = {}
 
@@ -1323,18 +1353,9 @@ class JournaledModel:
         collector after the run ended is not, and writes nothing into a run it let go of."""
         return self._journal.holds(scope.run_id)
 
-    def end_drive(self, drive: str) -> None:
-        """The Scheduler's drive ``drive`` is over: its calls write nothing more, ask nothing more.
-
-        Before its ``run_finished`` is written, so nothing lands after it; and by drive, not by
-        whether the run is held, so a call left over from one drive writes nothing into the
-        next -- a resume of the same run, in the same process -- either.
-        """
-        self._ended.add(drive)
-
     def _let_go(self, scope: CallScope) -> bool:
-        """Whether the drive the scope's call belongs to is over."""
-        return bool(scope.drive) and scope.drive in self._ended
+        """Whether the drive the scope's call belongs to is over (``end_drive``)."""
+        return drive_over(scope.drive)
 
     def _refuse_if_let_go(self, scope: CallScope) -> None:
         if self._let_go(scope):
@@ -1343,16 +1364,26 @@ class JournaledModel:
                 "nothing more is asked in it"
             )
 
+    def _why_stopped(self, scope: CallScope) -> str | None:
+        """Why this call must not ask the model now, if it must not: its node was stopped, or
+        the drive it belongs to is over."""
+        if scope.halted is not None and scope.halted():
+            return "its node was stopped: a turn it was served was abandoned; it asks nothing more"
+        if self._let_go(scope):
+            return "the run this call belongs to is over: nothing more is asked in it"
+        return None
+
     async def _refuse_if_stopped(
         self, envelope: RequestEnvelope, scope: CallScope, request_id: str, digest: str
     ) -> None:
-        """Ask nothing live for a node stopped, or a run let go, while its question was written.
+        """Ask nothing live for a node stopped, or a drive ended, while its question was written.
 
         Looked at only before the write, a question whose write straddled the node being
         stopped went to the live model all the same. Its question is on disk, so it is given an
-        outcome: it was never answered.
+        outcome -- it was never answered -- unless its drive is over, when nothing more is
+        written at all.
         """
-        if not ((scope.halted is not None and scope.halted()) or self._let_go(scope)):
+        if self._why_stopped(scope) is None:
             return
         empty = ModelResponse(model=envelope.model, stop_reason="error")
         await self._cancelled(empty, scope, request_id, digest, 0, abandoned=True)
@@ -1579,7 +1610,9 @@ class JournaledModel:
                 final: ModelResponse | None = None
                 #: When the model's whole reply arrived, in ms after the ask.
                 final_ms: int | None = None
-                arriving = _ReadAhead(lambda: self._inner.stream(envelope))
+                arriving = _ReadAhead(
+                    lambda: self._inner.stream(envelope), lambda: self._why_stopped(scope)
+                )
                 try:
                     async for arrived, event in arriving:
                         at_ms = int((arrived - asked_at) * 1000)
@@ -1610,11 +1643,12 @@ class JournaledModel:
                         # a failure: read as a complete turn, it let a confirmed guess's write go
                         # out with no decision on disk.
                         raise ModelError("the model's stream ended without completing its turn")
-                except (asyncio.CancelledError, GeneratorExit) as stopped:
+                except (asyncio.CancelledError, GeneratorExit, TurnAbandoned) as stopped:
                     # The caller stopped waiting -- its timeout, or it stopped reading -- before the
-                    # turn was handed over. What it saw of the reply is recorded with that. Not a
-                    # stream the garbage collector closes after the run ended: the process no
-                    # longer drives that run, and its "run_finished" is already written.
+                    # turn was handed over, or its node was stopped before it was asked. What it
+                    # saw of the reply is recorded with that. Not a stream the garbage collector
+                    # closes after the run ended: the process no longer drives that run, and its
+                    # "run_finished" is already written.
                     finalised = isinstance(stopped, GeneratorExit) and not self._in_run(scope)
                     if not recorded_outcome and not finalised:
                         latency_ms = int((time.monotonic() - asked_at) * 1000)

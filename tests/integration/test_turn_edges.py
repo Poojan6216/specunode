@@ -465,9 +465,10 @@ async def test_a_call_left_over_from_one_drive_writes_nothing_into_the_next(
 async def test_a_first_question_asked_after_the_run_is_over_is_refused(tmp_path: Path) -> None:
     model = AnswersWhen(asyncio.Event())
     model.go.set()
+    over = asyncio.Event()
 
     async def later(asking: object) -> None:
-        await asyncio.sleep(0.3)
+        await over.wait()  # asked once the run has returned, however slow its disk
         with contextlib.suppress(BaseException):
             await asking.complete(SMALL)  # type: ignore[attr-defined]
 
@@ -481,7 +482,8 @@ async def test_a_first_question_asked_after_the_run_is_over_is_refused(tmp_path:
     db = tmp_path / "j.db"
     run_id = new_ulid()
     result = await scheduler(Journal(db), adapter, registry_of([]), model).run(run_id, {})
-    await asyncio.sleep(0.8)
+    over.set()
+    await asyncio.sleep(0.3)
     assert result.ok, result.error
     assert model.asked == 0, "the model was asked live after the run was over"
     assert after_the_first_end(db, run_id) == []
@@ -578,3 +580,298 @@ async def test_a_failed_turn_leaves_the_next_call_where_it_is_without_speculatio
     assert await restart_step(tmp_path, speculation=True) == await restart_step(
         tmp_path, speculation=False
     )
+
+
+# -- a drive that could not hold its run is not over ----------------------------------------------
+
+
+async def test_a_resume_retried_after_run_busy_can_ask_the_model(tmp_path: Path) -> None:
+    """A Scheduler that could not hold the run "drove nothing, and may try again" -- but it had
+    ended its drive, and on the retry every question it asked was refused as after the run.
+    Found by the twentieth review."""
+    from tests.integration.test_crash_then_resume import build_billing
+
+    from specunode.journal.journal import RunBusy
+    from specunode.testing.models import ScriptedModel
+    from specunode.testing.world import standard_world
+
+    db = tmp_path / "source.db"
+    world = standard_world()
+    adapter, registry = build_billing(world)
+    run_id = new_ulid()
+    with pytest.raises(Crash):
+        await scheduler(
+            CrashingJournal(db, before_commit_of("bill#0")),
+            adapter,
+            registry,
+            ScriptedModel(turns=[charge(25.0)]),  # type: ignore[list-item]
+        ).run(run_id, {})
+    await bury_the_dead_process()
+    adapter, registry = build_billing(world)
+    resumer = scheduler(Journal(db), adapter, registry, ScriptedModel(turns=[charge(25.0)]))  # type: ignore[list-item]
+    with Journal(db).hold_run(run_id), pytest.raises(RunBusy):
+        await resumer.resume(run_id)
+    resumed = await asyncio.wait_for(resumer.resume(run_id), timeout=30)
+    assert resumed.ok, resumed.error
+    assert [row["amount"] for row in world.tables["charges"].values()] == [25.0]
+
+
+# -- nothing is asked once a drive is over or a node stopped, however the loop orders it ---------
+
+LEFTOVER = replace(SMALL, max_tokens=77, stream=True)
+
+
+class Notes:
+    """Records, when it is asked, whether its caller's drive was over or its node stopped."""
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        raise NotImplementedError
+
+    def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        from specunode.core.model import current_scope, drive_over
+
+        scope = current_scope()
+        stopped = scope.halted is not None and scope.halted()
+        self.asked.append(f"drive over={drive_over(scope.drive)}, node stopped={stopped}")
+        return self._answer()
+
+    async def _answer(self) -> AsyncIterator[StreamEvent]:
+        yield TurnComplete(response=charge(1.0))  # type: ignore[arg-type]
+
+
+class FinishesAsTheQuestionLands(Journal):
+    """The leftover question lands on disk just as the Scheduler goes to write run_finished."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.in_check = asyncio.Event()
+        self.finishing = asyncio.Event()
+
+    async def check_run_lock(self, run_id: str) -> None:
+        await super().check_run_lock(run_id)
+        self.in_check.set()
+        await self.finishing.wait()
+
+    async def append_async(self, run_id: str, kind: str, payload: Mapping[str, JsonValue]) -> int:
+        request = payload.get("request")
+        params = request.get("params") if isinstance(request, Mapping) else None
+        leftover = (
+            kind == "model_request"
+            and isinstance(params, Mapping)
+            and params.get("max_tokens") == LEFTOVER.max_tokens
+        )
+        if leftover:
+            await self.in_check.wait()
+        offset = await super().append_async(run_id, kind, payload)
+        if leftover:
+            loop = asyncio.get_running_loop()
+            loop.call_soon(lambda: loop.call_soon(self.finishing.set))
+        return offset
+
+
+async def test_the_model_is_not_asked_once_the_drive_is_over(tmp_path: Path) -> None:
+    """Looked at before the stream was opened, and opened a step of the event loop later: a
+    drive that ended in that step had its question asked all the same. Found by the twentieth
+    review."""
+    model = Notes()
+
+    async def read(stream: AsyncIterator[StreamEvent]) -> None:
+        with contextlib.suppress(BaseException):
+            async for _event in stream:
+                pass
+
+    @node(name="ask")
+    async def ask(session: RunSession) -> Decision:
+        assert session.model is not None
+        asyncio.get_running_loop().create_task(
+            read(session.model.stream(LEFTOVER))
+        )  # never awaited
+        session.state["asked"] = True
+        return ToolCall("noop", {})
+
+    adapter = PlainAdapter.of([ask], lambda s: None if s.get("asked") else "ask")
+    db = tmp_path / "j.db"
+    run_id = new_ulid()
+    result = await asyncio.wait_for(
+        scheduler(FinishesAsTheQuestionLands(db), adapter, registry_of([]), model).run(run_id, {}),
+        timeout=30,
+    )
+    await asyncio.sleep(0.3)
+    assert result.ok, result.error
+    assert model.asked == [], model.asked
+
+
+class HaltsAsTheQuestionLands(Journal):
+    """The node's question lands on disk, and another task of the node stops it one step of the
+    event loop later -- as a served turn given up on does."""
+
+    def __init__(self, path: Path, halt_now: asyncio.Event) -> None:
+        super().__init__(path)
+        self.halt_now = halt_now
+
+    async def append_async(self, run_id: str, kind: str, payload: Mapping[str, JsonValue]) -> int:
+        request = payload.get("request")
+        params = request.get("params") if isinstance(request, Mapping) else None
+        second = (
+            kind == "model_request"
+            and isinstance(params, Mapping)
+            and params.get("max_tokens") == LEFTOVER.max_tokens
+        )
+        offset = await super().append_async(run_id, kind, payload)
+        if second:
+            loop = asyncio.get_running_loop()
+            loop.call_soon(lambda: loop.call_soon(self.halt_now.set))
+        return offset
+
+
+async def test_the_model_is_not_asked_for_a_node_stopped_as_its_stream_opens(
+    tmp_path: Path,
+) -> None:
+    from specunode.core.model import current_scope
+
+    model = Notes()
+    halt_now = asyncio.Event()
+
+    async def stopper() -> None:
+        scope = current_scope()
+        await halt_now.wait()
+        assert scope.halt is not None
+        scope.halt("a served turn of this node was abandoned")
+
+    @node(name="ask")
+    async def ask(session: RunSession) -> Decision:
+        assert session.model is not None
+        asyncio.get_running_loop().create_task(stopper())
+        with contextlib.suppress(BaseException):
+            async for _event in session.model.stream(LEFTOVER):
+                pass
+        session.state["asked"] = True
+        return ToolCall("noop", {})
+
+    adapter = PlainAdapter.of([ask], lambda s: None if s.get("asked") else "ask")
+    db = tmp_path / "j.db"
+    run_id = new_ulid()
+    await asyncio.wait_for(
+        scheduler(HaltsAsTheQuestionLands(db, halt_now), adapter, registry_of([]), model).run(
+            run_id, {}
+        ),
+        timeout=30,
+    )
+    assert model.asked == [], model.asked
+    outcomes = [e.payload for e in Journal(db).read(run_id, kinds=["model_response"])]
+    assert [o.get("cancelled") for o in outcomes] == [True], "the question has no outcome"
+
+
+# -- nor by a drafter's model, nor through a tool ------------------------------------------------
+
+NOW = replace(SMALL, max_tokens=100, stream=True)
+LATER = replace(SMALL, max_tokens=200, stream=True)
+
+
+class PlansAtOnce:
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        raise NotImplementedError
+
+    async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        if envelope.max_tokens == LATER.max_tokens:
+            await asyncio.sleep(0.3)  # long after the run is over
+        use = ToolUseBlock(id="t0", name="lookup_plan", args={"customer_id": "cus-1"})
+        yield ToolUseComplete(index=0, block=use)
+        yield TurnComplete(
+            response=ModelResponse(model="scripted", content=(use,), stop_reason="tool_use")
+        )
+
+
+class Draft:
+    def __init__(self) -> None:
+        self.asked = 0
+
+    async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+        self.asked += 1
+        use = ToolUseBlock(id="d0", name="lookup_plan", args={"customer_id": "cus-2"})
+        return ModelResponse(model="draft", content=(use,), stop_reason="tool_use")
+
+    def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+        raise NotImplementedError
+
+
+async def test_a_drafter_is_not_asked_after_the_run(tmp_path: Path) -> None:
+    """Only the target model was told the drive was over: a drafter's model was asked after
+    the run, and wrote into the journal after ``run_finished``. Found by the twentieth review."""
+    from specunode.drafters.t2_model import ModelDrafter
+
+    @tool(effect="read")
+    async def lookup_plan(customer_id: str) -> JsonValue:
+        return {"plan": "basic"}
+
+    @node(name="plan")
+    async def plan(session: RunSession) -> Decision:
+        assert session.call_turn is not None
+        await session.call_turn(NOW)  # type: ignore[misc]
+        asyncio.get_running_loop().create_task(session.call_turn(LATER))  # never awaited
+        session.state["done"] = True
+        return ToolCall("lookup_plan", {})
+
+    adapter = PlainAdapter.of([plan], lambda s: None if s.get("done") else "plan")
+    registry = registry_of([lookup_plan])
+    db = tmp_path / "j.db"
+    journal = Journal(db)
+    draft = Draft()
+    driver = Scheduler(
+        graph=adapter,  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),
+        target=JournaledModel(PlansAtOnce(), journal, provider="scripted"),
+        policy=Policy(speculation=True, max_speculation_depth=3),
+        predictor=ModelDrafter(  # type: ignore[arg-type]
+            client=JournaledModel(draft, journal, role="draft", provider="scripted"),
+            tools=(),
+        ),
+    )
+    run_id = new_ulid()
+    result = await asyncio.wait_for(driver.run(run_id, {}), timeout=30)
+    asked_in_run = draft.asked
+    await asyncio.sleep(1.0)
+    assert result.ok, result.error
+    assert draft.asked == asked_in_run, "the draft model was asked after the run was over"
+    assert after_the_first_end(db, run_id) == []
+
+
+async def test_a_tool_is_not_called_after_the_run(tmp_path: Path) -> None:
+    """A task the node never awaited reached the upstream after the run, and wrote its call and
+    result into the journal after ``run_finished``. Found by the twentieth review."""
+    reached: list[str] = []
+    over = asyncio.Event()
+
+    @tool(effect="read")
+    async def lookup_plan(customer_id: str) -> JsonValue:
+        reached.append(customer_id)
+        return {"plan": "basic"}
+
+    async def later(session: RunSession) -> None:
+        await over.wait()
+        with contextlib.suppress(BaseException):
+            await session.call_tool("lookup_plan", {"customer_id": "cus-1"})
+
+    @node(name="ask")
+    async def ask(session: RunSession) -> Decision:
+        asyncio.get_running_loop().create_task(later(session))  # never awaited
+        session.state["asked"] = True
+        return ToolCall("noop", {})
+
+    adapter = PlainAdapter.of([ask], lambda s: None if s.get("asked") else "ask")
+    db = tmp_path / "j.db"
+    run_id = new_ulid()
+    result = await scheduler(
+        Journal(db), adapter, registry_of([lookup_plan]), AnswersWhen(asyncio.Event())
+    ).run(run_id, {})
+    over.set()
+    await asyncio.sleep(0.3)
+    assert result.ok, result.error
+    assert reached == [], "the upstream was reached after the run"
+    assert after_the_first_end(db, run_id) == []
