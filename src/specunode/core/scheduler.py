@@ -52,6 +52,7 @@ from specunode.core.model import (
     RequestEnvelope,
     StreamEvent,
     ToolUseComplete,
+    TurnAbandoned,
     TurnComplete,
     TurnResults,
     call_scope,
@@ -239,6 +240,12 @@ class BranchTools:
         scheduler = self._scheduler
         branch = self._branch
         spec = scheduler.registry.get(name)
+        if branch.abandoned:
+            # Said plainly, not as the closed buffer's own refusal.
+            raise TurnAbandoned(
+                f"node {self._node_id} was stopped when a turn it no longer stopped waiting for "
+                f"was abandoned; its {name} is not made"
+            )
         if spec.effect is not EffectClass.READ and branch.unjournaled_turns:
             # Refused before it takes a position or reaches the journal. Staged, it would be
             # drained the moment the node parked on it -- before the turn that decided it was
@@ -370,6 +377,17 @@ class Scheduler:
             event = asyncio.Event()
             self._park_events[branch_id] = event
         return event
+
+    def _halt_node(self, branch: Branch) -> None:
+        """Stop a node whose served turn was abandoned: no more writes, and no more model asks.
+
+        Its ``finally`` and ``async with`` exits still run, and a write staged there went out --
+        decided on the very path the runtime had just judged not to be the recorded one; a
+        model ask there went live. A run cancelled from outside closed the branch first; this
+        does the same.
+        """
+        branch.abandoned = True
+        self.buffer.close(branch)
 
     def mark_parked(self, branch: Branch) -> None:
         """Signal this branch's own quiesce loop. Deliberately not resolved through adoption.
@@ -652,6 +670,7 @@ class Scheduler:
             raise
 
         await self._close_gate_if_spent(steps)
+        ok, error = await self._account_for_claims(ok, error)
         await self._journal_run_finished(ok, error, steps, committed)
         return RunResult(
             run_id=run_id,
@@ -662,16 +681,16 @@ class Scheduler:
             error=error,
         )
 
-    async def resume(self, run_id: str) -> RunResult:
+    async def resume(self, run_id: str, *, ask_abandoned: bool = False) -> RunResult:
         """Continue a run that was interrupted; see :meth:`_resume`.
 
         Held for its whole length, like :meth:`run`: two resumes of one run at once each took up
         the same claim, and between them sent a charge twice.
         """
         async with self._driving(run_id):
-            return await self._resume(run_id)
+            return await self._resume(run_id, ask_abandoned=ask_abandoned)
 
-    async def _resume(self, run_id: str) -> RunResult:
+    async def _resume(self, run_id: str, *, ask_abandoned: bool = False) -> RunResult:
         """Continue a run that was interrupted, without re-sending what already went out.
 
         Nothing is replayed and nothing is re-decided: committed state is rebuilt from the
@@ -717,7 +736,10 @@ class Scheduler:
         self.run_id = run_id
         self.buffer.run_id = run_id
         self.buffer.scheduler_task = asyncio.current_task()
-        recorded = RecordedTurns(self.journal, run_id)
+        # ``ask_abandoned``: a turn the recorded node stopped waiting for is asked for again,
+        # live, instead of served as one that never answers -- the operator's way past a resume
+        # that is abandoned every time, knowing the new answer may differ.
+        recorded = RecordedTurns(self.journal, run_id, serve_cancelled=not ask_abandoned)
         # Any target that offers it: JournaledModel does, and a wrapper can pass it through.
         # One that does not is asked every question again, and run_started says so.
         serve = getattr(self.target, "serve_recorded", None)
@@ -788,6 +810,7 @@ class Scheduler:
             raise
 
         await self._close_gate_if_spent(self._steps)
+        ok, error = await self._account_for_claims(ok, error)
         await self._journal_run_finished(ok, error, self._steps, self._committed)
         state = dict(final) if isinstance(final, Mapping) else self._committed.to_dict()
         return RunResult(
@@ -838,6 +861,9 @@ class Scheduler:
             node_id=node_id,
             record_prompt=branch.record_prompt,
             track_turn=branch.track_turn,
+            halt=lambda: self._halt_node(branch),
+            halted=lambda: branch.abandoned,
+            node_started=time.monotonic(),
             # Whether this request is being sent on a guess. Always False before, which made
             # every ``model_request`` entry claim it was authorised work -- and a field that
             # never varies reads as a check while recording nothing. "On a guess" is the same
@@ -1217,6 +1243,9 @@ class Scheduler:
             node_id=node_id,
             record_prompt=branch.record_prompt,
             track_turn=branch.track_turn,
+            halt=lambda: self._halt_node(branch),
+            halted=lambda: branch.abandoned,
+            node_started=time.monotonic(),
             # Whether this request is being sent on a guess. Always False before, which made
             # every ``model_request`` entry claim it was authorised work -- and a field that
             # never varies reads as a check while recording nothing. "On a guess" is the same
@@ -1309,6 +1338,19 @@ class Scheduler:
                     branch.squash(f"{type(exc).__name__}: {exc}")
                 else:
                     branch.reason = f"{type(exc).__name__}: {exc}"
+                return BranchOutcome.FAULTED
+            if branch.abandoned:
+                # Stopped -- a turn it was served was abandoned -- and it returned all the same:
+                # it caught ``TurnAbandoned``. What it decided on that path was not the recorded
+                # run's; committed, the run went on from it and reported success.
+                reason = (
+                    f"{TurnAbandoned.__name__}: the node was stopped when a turn it was served "
+                    "was abandoned, and returned anyway; what it decided is not committed"
+                )
+                if branch.status is not BranchStatus.CONFIRMED:
+                    branch.squash(reason)
+                else:
+                    branch.reason = reason
                 return BranchOutcome.FAULTED
             return BranchOutcome.DONE
         return BranchOutcome.PARKED
@@ -1601,7 +1643,11 @@ class Scheduler:
                 f"node {node_id} did not finish after its writes were dispatched; it is "
                 "waiting on something the runtime never completes"
             )
-        if isinstance(task, asyncio.Task) and task.done() and task.exception() is not None:
+        if (
+            isinstance(task, asyncio.Task)
+            and task.done()
+            and (task.exception() is not None or branch.abandoned)
+        ):
             # The node failed after its writes were authorised and dispatched. The branch is
             # not squashed -- its effects were legitimate and are in the world -- but it never
             # reaches RETIRED either, so without this its lifecycle would simply stop in the
@@ -1843,6 +1889,7 @@ class Scheduler:
                 "policy": self._policy_payload(),
                 "graph": {
                     "adapter": capabilities.framework,
+                    "drives_itself": capabilities.drives_itself,
                     "nodes": [n.structural_id for n in self.graph.nodes()],
                 },
                 "target": {"provider": "configured", "model": "configured"},
@@ -1876,6 +1923,23 @@ class Scheduler:
         if self.budget.speculation_disabled or self.budget.should_disable() is None:
             return
         await self._journal_speculation_disabled(step)
+
+    async def _account_for_claims(self, ok: bool, error: str | None) -> tuple[bool, str | None]:
+        """A run is not done while an effect it claimed may have gone out and was never settled.
+
+        A resumed node that makes a different call leaves the dead process's claim for the
+        first in flight, and nothing ever settles it: the run reported plain success, and the
+        ledger showed only the second -- while the world may hold both.
+        """
+        unresolved = await asyncio.to_thread(self.journal.unresolved_dispatches, self.run_id)
+        if not ok or not unresolved:
+            return ok, error
+        tools = ", ".join(sorted({str(claim.get("tool", "?")) for claim in unresolved}))
+        return False, (
+            f"the run finished, but {len(unresolved)} effect(s) an earlier attempt claimed "
+            f"({tools}) may have been sent and were never settled -- check the upstream, and "
+            "record what happened with `specunode resolve <run> <key> --landed` or `--not-sent`"
+        )
 
     async def _journal_run_finished(
         self, ok: bool, error: str | None, steps: int, committed: CommittedState

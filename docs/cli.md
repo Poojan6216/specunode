@@ -38,7 +38,8 @@ and whether it is resumable at all. Options: `--journal`.
 
 ### `specunode ledger RUN_ID`
 
-Print a run's effect ledger: what reached the world, and what authorised it. Options:
+Print a run's effect ledger: what reached the world, and what authorised it -- and, marked MAY
+HAVE BEEN SENT, any effect claimed for sending whose outcome was never recorded. Options:
 `--journal`; `--short` abbreviates ids; `--normalised` renders only what the equivalence
 relation compares, so two runs can be diffed; `--json` emits the rows (effect id, tool,
 arguments, idempotency key, branch, authorising step, status) as JSON instead.
@@ -81,8 +82,13 @@ that failure, so a node that caught it and asked again is matched with its secon
 is driven by one process at a time: resuming one that another process is running exits 2, as
 does one whose Postgres run lock was lost while it ran, an unknown run, one that never recorded
 its start, and a LangGraph run, which cannot be resumed in this version. Prints the ledger; exits 1 if the run did not complete and 2 if the
-config is missing, unreadable, or cannot build the graph or the target. Options: `--journal`;
-`--config PATH`.
+config is missing, unreadable, or cannot build the graph or the target. A turn the crashed run
+had stopped waiting for is served as one that never answers, and a node that keeps waiting ends
+with `TurnAbandoned` -- every time, until someone decides: `--ask-abandoned` asks the model again
+for it instead, live, knowing its answer may differ from what was acted on. A resume that
+finishes while an effect an earlier attempt claimed was never settled does not report success:
+it names the tools, for `specunode resolve`. Options: `--journal`; `--config PATH`;
+`--ask-abandoned`.
 
 ### `specunode resolve RUN_ID KEY`
 

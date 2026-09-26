@@ -374,6 +374,10 @@ class Ledger:
     terminal: bool = False
     #: ``""`` means unsigned, which is never conflated with forged.
     signature: str = ""
+    #: Effects claimed for sending and never settled: each may or may not have reached the
+    #: world. Read from the claim table, not the chain, so not signed; rendered, because a
+    #: ledger that listed only what settled hid a charge an earlier attempt may have made.
+    in_flight: tuple[str, ...] = ()
 
     @property
     def context_identity(
@@ -438,8 +442,13 @@ def journal_head(entries: Iterable[Entry], run_id: str) -> JournalPosition:
 
 
 def build_ledger(journal: Journal, run_id: str) -> Ledger:
-    """Render a run's ledger from its journal. Pure: the only input is the entries."""
-    return build_ledger_from_entries(journal.read(run_id), run_id)
+    """Render a run's ledger from its journal: its entries, and the claims never settled."""
+    ledger = build_ledger_from_entries(journal.read(run_id), run_id)
+    in_flight = tuple(
+        f"{claim.get('tool', '?')} {str(claim.get('nkey', ''))[:12]}"
+        for claim in journal.unresolved_dispatches(run_id)
+    )
+    return replace(ledger, in_flight=in_flight) if in_flight else ledger
 
 
 def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
@@ -1385,6 +1394,12 @@ def render_ledger(
         )
     else:
         lines.append("(no effects reached the world)")
+    if ledger.in_flight:
+        lines.append(
+            f"MAY HAVE BEEN SENT: {len(ledger.in_flight)} effect(s) claimed and never settled -- "
+            "check the upstream, then `specunode resolve <run> <key> --landed` or `--not-sent`:"
+        )
+        lines.extend(f"  {claim}" for claim in ledger.in_flight)
 
     lines.extend(_summary(ledger, ellipsis=ellipsis, equivalence_digest=equivalence_digest))
     return "\n".join(lines) + "\n"

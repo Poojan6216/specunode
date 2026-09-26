@@ -18,6 +18,7 @@ and feeding one back as an input would replay a decision the run never actually 
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -37,7 +38,10 @@ from specunode.core.model import (
     ToolUseBlock,
     ToolUseComplete,
     TurnComplete,
+    _abandon_after_s,
+    _Pacer,
     _served_never_answers,
+    _sleep_until,
     current_scope,
     project,
     request_hash,
@@ -100,6 +104,13 @@ class JournaledTurn:
     cancelled: bool = False
     request_id: str = ""
     latency_ms: int = 0
+    node_ms: int = 0
+    block_ms: tuple[int, ...] = ()
+    #: The entry its outcome was recorded in -- where it came back among its attempt's other
+    #: turns. That attempt's own entry, not the one a turn it was served was first recorded in:
+    #: those kept an earlier attempt's order while the turns it asked live took new offsets, so
+    #: a live answer handed over first was replayed after a served one it had come back before.
+    offset: int = -1
 
 
 def _describe(value: JsonValue, limit: int = 120) -> str:
@@ -170,6 +181,7 @@ class ReplayModel:
     _turns: dict[tuple[str, int], list[JournaledTurn]] = field(default_factory=dict, init=False)
     _next: dict[tuple[str, int], int] = field(default_factory=dict, init=False)
     _served: list[int] = field(default_factory=list, init=False)
+    _pacer: _Pacer = field(default_factory=_Pacer, init=False)
 
     def __post_init__(self) -> None:
         self._load()
@@ -241,6 +253,9 @@ class ReplayModel:
                 cancelled=payload.get("cancelled") is True,
                 request_id=str(request_id),
                 latency_ms=_as_latency(payload.get("latency_ms")),
+                node_ms=_as_latency(payload.get("node_ms")),
+                block_ms=_as_block_ms(payload.get("block_ms")),
+                offset=entry.offset,
             )
             outcomes[str(request_id)] = (key, turn)
         # In the order they were asked, not the order the answers came back: two questions asked
@@ -273,34 +288,59 @@ class ReplayModel:
             )
         self._next[key] = index + 1
         self._served.append(step)
+        self._pacer.taken(
+            _pace_key(scope, turn.branch_id),
+            turn.offset,
+            time.monotonic() + _abandon_after_s(_recorded(turn), scope),
+        )
         return turn
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
-        turn = self._turn_for(envelope, current_scope())
-        if turn.cancelled:
-            await _served_never_answers(_recorded(turn))
+        scope = current_scope()
+        turn = self._turn_for(envelope, scope)
+        key = _pace_key(scope, turn.branch_id)
+        try:
+            asked_at = time.monotonic()
+            if turn.cancelled:
+                await _served_never_answers(_recorded(turn), scope)
+            await self._pacer.due(key, turn.offset, asked_at, turn.latency_ms, scope)
+        finally:
+            # However the call ended: a later answer of the node may be waiting for this one.
+            self._pacer.release(key, turn.offset)
         if turn.failed is not None:
             raise ModelError(turn.failed)
         return turn.response
 
     async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
-        """Re-emit the journaled turn's blocks, with no delay.
+        """Re-emit the journaled turn's blocks at the pace, and in the order, they first came.
 
-        Stream timings are a measurement, never a replay input: reproducing them would make
-        replay take as long as the original run and would make its result depend on a number
-        that has nothing to do with correctness.
+        Timings were once only a measurement here, and a replay handed everything over at
+        once: a node that acts on whichever answer comes first, or falls back when one is not
+        back in time, then decided otherwise, and ``replay --dispatch`` sent a charge the run
+        never made. A replay takes as long as the model took, for that.
         """
-        turn = self._turn_for(envelope, current_scope())
-        response = turn.response
-        for index, block in enumerate(response.content):
-            if isinstance(block, ToolUseBlock):
-                yield ToolUseComplete(index=index, block=block)
-            elif isinstance(block, TextBlock):
-                # Text too, as a live stream and a served one emit it: a node that stopped
-                # reading on a piece of text never saw it here, and waited on for the rest.
-                yield TextDelta(index=index, text=block.text)
-        if turn.cancelled:
-            await _served_never_answers(_recorded(turn))
+        scope = current_scope()
+        turn = self._turn_for(envelope, scope)
+        key = _pace_key(scope, turn.branch_id)
+        try:
+            asked_at = time.monotonic()
+            response = turn.response
+            for index, block in enumerate(response.content):
+                at = turn.block_ms[index] if index < len(turn.block_ms) else -1
+                if at >= 0:
+                    await _sleep_until(asked_at + at / 1000.0)
+                if isinstance(block, ToolUseBlock):
+                    yield ToolUseComplete(index=index, block=block)
+                elif isinstance(block, TextBlock):
+                    # Text too, as a live stream and a served one emit it: a node that stopped
+                    # reading on a piece of text never saw it here, and waited on for the rest.
+                    yield TextDelta(index=index, text=block.text)
+            if turn.cancelled:
+                await _served_never_answers(_recorded(turn), scope)
+            await self._pacer.due(key, turn.offset, asked_at, turn.latency_ms, scope)
+        finally:
+            # However the stream ended -- read to its end, closed part-way, abandoned.
+            self._pacer.release(key, turn.offset)
         if turn.failed is not None:
             # The turn failed in the run being replayed, after what it had streamed so far.
             raise ModelError(turn.failed)
@@ -348,6 +388,10 @@ class RecordedTurns:
     journal: Journal
     run_id: str
     role: str = "target"
+    #: False to ask the model again, live, for a turn the recorded node stopped waiting for,
+    #: instead of serving it as one that never answers -- an operator's way past a resume that
+    #: keeps being abandoned, knowing the new answer may differ from what was acted on.
+    serve_cancelled: bool = True
     #: Per (node, position), each attempt's pinned turns as (request hash, turn), in the order
     #: they were asked; attempts oldest first.
     _attempts: dict[tuple[str, int], list[list[tuple[str, RecordedTurn]]]] = field(
@@ -357,6 +401,7 @@ class RecordedTurns:
     _pinned_branches: frozenset[str] = field(default=frozenset(), init=False)
     _asked: dict[tuple[str, int], list[str]] = field(default_factory=dict, init=False)
     _asking: set[tuple[str, int]] = field(default_factory=set, init=False)
+    _pacer: _Pacer = field(default_factory=_Pacer, init=False)
 
     def __post_init__(self) -> None:
         pinned_before = self._last_send_per_branch()
@@ -400,6 +445,10 @@ class RecordedTurns:
                 failed=failed if isinstance(failed, str) else None,
                 cancelled=payload.get("cancelled") is True,
                 latency_ms=_as_latency(payload.get("latency_ms")),
+                node_ms=_as_latency(payload.get("node_ms")),
+                block_ms=_as_block_ms(payload.get("block_ms")),
+                attempt=branch,
+                order=entry.offset,
             )
             outcomes[request_id] = (
                 key,
@@ -470,9 +519,25 @@ class RecordedTurns:
                 and all(turns[i][0] == asked[i] for i in range(index))
             ):
                 asked.append(digest)
-                return turns[index][1]
+                turn = turns[index][1]
+                if turn.cancelled and not self.serve_cancelled:
+                    return None  # asked live, and the questions after it still matched
+                self._pacer.taken(
+                    _pace_key(scope, turn.attempt),
+                    turn.order,
+                    time.monotonic() + _abandon_after_s(turn, scope),
+                )
+                return turn
         self._asking.add(key)
         return None
+
+    async def due(self, turn: RecordedTurn, scope: CallScope, asked_at: float) -> None:
+        """Hand ``turn`` over no sooner, and in no other order, than it came back."""
+        key = _pace_key(scope, turn.attempt)
+        await self._pacer.due(key, turn.order, asked_at, turn.latency_ms, scope)
+
+    def release(self, turn: RecordedTurn, scope: CallScope) -> None:
+        self._pacer.release(_pace_key(scope, turn.attempt), turn.order)
 
     @property
     def pinned_requests(self) -> frozenset[str]:
@@ -490,13 +555,35 @@ class RecordedTurns:
         return sum(max(map(len, attempts)) for attempts in self._attempts.values())
 
 
+def _pace_key(scope: CallScope, attempt: str) -> tuple[str, int, str]:
+    """Where a served turn is paced: its node and position, among its attempt's turns.
+
+    Turns of different attempts are not ordered against each other. An attempt's served turns
+    end where it last sent something, and nothing is staged while a turn is open, so every turn
+    before that point is over before any after it is asked -- the order is the node's own.
+    """
+    return (scope.node_id, scope.step, attempt)
+
+
 def _as_latency(value: JsonValue) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def _as_block_ms(value: JsonValue) -> tuple[int, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        return ()
+    return tuple(v if isinstance(v, int) and not isinstance(v, bool) else -1 for v in value)
+
+
 def _recorded(turn: JournaledTurn) -> RecordedTurn:
     return RecordedTurn(
-        response=turn.response, offset=-1, cancelled=True, latency_ms=turn.latency_ms
+        response=turn.response,
+        offset=turn.offset,
+        failed=turn.failed,
+        cancelled=turn.cancelled,
+        latency_ms=turn.latency_ms,
+        node_ms=turn.node_ms,
+        block_ms=turn.block_ms,
     )
 
 
@@ -603,6 +690,8 @@ class Recovery:
     started: bool = False
     #: Whether its last "finished" said it failed.
     failed: bool = False
+    #: A graph that drives itself (LangGraph), which cannot be resumed in this version.
+    drives_itself: bool = False
 
     @property
     def exists(self) -> bool:
@@ -619,6 +708,8 @@ class Recovery:
 
     @property
     def resumable(self) -> bool:
+        if self.drives_itself:
+            return False  # `resume` refuses every LangGraph run in this version
         unfinished = not self.finished or self.failed
         return self.started and (unfinished or bool(self.confirmed_not_retired))
 
@@ -665,6 +756,7 @@ def recover(journal: Journal, run_id: str) -> Recovery:
     inputs: dict[str, JsonValue] = {}
     started = False
     failed = False
+    drives_itself = False
 
     for entry in journal.read(run_id):
         last_offset = entry.offset
@@ -673,6 +765,11 @@ def recover(journal: Journal, run_id: str) -> Recovery:
             started = True
             raw = payload.get("inputs")
             inputs = dict(raw) if isinstance(raw, Mapping) else {}
+            graph = payload.get("graph")
+            if isinstance(graph, Mapping):
+                drives_itself = graph.get("drives_itself") is True or graph.get("adapter") == (
+                    "langgraph"
+                )
         elif entry.kind == "run_finished":
             finished = True
             # The last one's word: a run that failed can be resumed -- a resume re-runs what
@@ -766,6 +863,7 @@ def recover(journal: Journal, run_id: str) -> Recovery:
         open_group=open_group,
         started=started,
         failed=failed,
+        drives_itself=drives_itself,
     )
 
 

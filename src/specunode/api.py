@@ -159,6 +159,10 @@ class Runtime:
         """Run the graph to the end. ``result.run_id`` is what :meth:`resume` takes."""
         return await self.scheduler().run(run_id or new_ulid(), dict(inputs or {}))
 
-    async def resume(self, run_id: str) -> RunResult:
-        """Continue a run a crash interrupted, without sending again what already went out."""
-        return await self.scheduler().resume(run_id)
+    async def resume(self, run_id: str, *, ask_abandoned: bool = False) -> RunResult:
+        """Continue a run a crash interrupted, without sending again what already went out.
+
+        ``ask_abandoned`` asks the model again for a turn the crashed run had stopped waiting
+        for, instead of stopping the node there with ``TurnAbandoned``; its answer may differ.
+        """
+        return await self.scheduler().resume(run_id, ask_abandoned=ask_abandoned)

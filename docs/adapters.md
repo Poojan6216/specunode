@@ -173,10 +173,17 @@ serves back, and what a replay raises, at the same point: the failure is journal
 outcome, so a node that catches it and asks again is matched with its second question. Catch
 `ModelError`, not the client's own type: a node that catches the client's type is not the same
 node on resume. A turn the node stops waiting for -- its timeout, a cancel -- is journaled as
-cancelled too, and served as one that never answers -- for twice as long as the node waited the
-first time, and 30 seconds more; a node still waiting then ends with `specunode.TurnAbandoned`.
-It is a `BaseException`, not a `ModelError` or any `Exception`: asking again would be asking
-something the recorded run never asked. Do not catch it.
+cancelled too, and served as one that never answers, until well past when the node stopped
+waiting the first time; a node still waiting then ends with `specunode.TurnAbandoned`. It is a
+`BaseException`, not a `ModelError` or any `Exception` -- asking again would be asking something
+the recorded run never asked -- and the node is closed to writes and model asks before it is
+raised, so a `finally` cannot act on the wrong path either. Do not catch it: a node that does,
+and returns, is not committed, and the run stops all the same. Served answers come back at their
+recorded pace and order, so a node that races two calls, or falls back on a timeout without
+cancelling, decides on resume as it did. An answer waits for an earlier one only until the node
+is done with that one -- answered, failed or given up on -- and a node that holds an earlier
+answer open far longer than the recorded run did, while it waits for a later one, is stopped
+with `TurnAbandoned` too.
 
 ## Speculation and node bodies
 

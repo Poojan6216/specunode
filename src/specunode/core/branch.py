@@ -203,6 +203,9 @@ class Branch:
     #: streaming, or abandoned before their end. A write staged while one is open would be
     #: dispatched on a decision that is not on disk, so ``BranchTools.call`` refuses it.
     unjournaled_turns: int = 0
+    #: A served turn this node no longer stopped waiting for was abandoned: the node asks and
+    #: writes nothing more (``Scheduler._halt_node``).
+    abandoned: bool = False
     #: How many entries of ``read_set`` were copied from the parent at fork time. Everything
     #: after that index is a read *this* branch made, which is what adoption has to hand back:
     #: a confirmed speculation never retires, so a read it made on a guess would otherwise be

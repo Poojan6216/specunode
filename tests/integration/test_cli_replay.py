@@ -356,3 +356,28 @@ def test_a_read_only_command_refuses_a_run_or_journal_that_is_not_there(
     Journal(real).append("01REAL", "policy_event", {"v": 1, "event": "e", "reason": "r"})
     typo = CliRunner().invoke(app, [command, "01TYPO", "--journal", str(real)])
     assert typo.exit_code == 2 and "no entries" in typo.output, typo.output
+
+
+def test_a_read_only_command_never_changes_a_database_that_is_not_a_journal(
+    tmp_path: Path,
+) -> None:
+    """Pointed at an application's own SQLite file, ``runs`` wrote the journal's tables into it
+    and switched it to WAL; pointed at a folder or a text file, it printed a traceback. Found by
+    the sixteenth review."""
+    import sqlite3
+
+    app_db = tmp_path / "app.db"
+    with sqlite3.connect(app_db) as db:
+        db.execute("CREATE TABLE customers (id TEXT)")
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    notes = tmp_path / "notes.txt"
+    notes.write_text("hello", encoding="utf-8")
+    for target in (app_db, folder, notes):
+        result = CliRunner().invoke(app, ["runs", "--journal", str(target)])
+        assert result.exit_code == 2, result.output
+        assert "is not a SpecuNode journal" in result.output, result.output
+    with sqlite3.connect(app_db) as db:
+        tables = [row[0] for row in db.execute("SELECT name FROM sqlite_master")]
+        mode = db.execute("PRAGMA journal_mode").fetchone()[0]
+    assert tables == ["customers"] and mode != "wal", (tables, mode)

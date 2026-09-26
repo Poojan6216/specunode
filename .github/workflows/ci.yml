@@ -100,6 +100,9 @@ jobs:
             tests/integration/test_failed_turns.py \
             tests/integration/test_stale_read.py \
             tests/integration/test_t1_end_to_end.py \
+            tests/integration/test_crash_then_resume.py \
+            tests/integration/test_served_pace.py \
+            tests/unit/test_recorded_turns.py \
             tests/test_equivalence.py \
             tests/test_leak.py \
             tests/test_context_equivalence.py \

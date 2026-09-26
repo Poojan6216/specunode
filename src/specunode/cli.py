@@ -120,10 +120,34 @@ def _existing_journal(location: str) -> Journal:
     Opening it creates it: a read-only command given a mistyped path made an empty journal
     there, and then reported on it -- ``verify`` said the chain verified, over 0 entries.
     """
-    if not is_postgres_dsn(location) and not Path(location).expanduser().exists():
-        typer.echo(f"no journal at {location}", err=True)
-        raise typer.Exit(2)
+    if not is_postgres_dsn(location):
+        path = Path(location).expanduser()
+        if not path.exists():
+            typer.echo(f"no journal at {location}", err=True)
+            raise typer.Exit(2)
+        # Opening a file as a journal writes the journal's tables into it: pointed at an
+        # application's own database, a read-only command changed it. Looked at read-only
+        # first, and refused unless it is one.
+        if not _is_journal_file(path):
+            typer.echo(f"{location} is not a SpecuNode journal", err=True)
+            raise typer.Exit(2)
     return Journal(location)
+
+
+def _is_journal_file(path: Path) -> bool:
+    import sqlite3
+
+    if not path.is_file():
+        return False
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as probe:
+            tables = {
+                row[0]
+                for row in probe.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+    except sqlite3.DatabaseError:
+        return False
+    return {"entries", "effect_dispatch"} <= tables
 
 
 def _require_run(book: Journal, run_id: str) -> None:
@@ -233,6 +257,12 @@ def resume(
     run_id: str = typer.Argument(..., help="The run to continue."),
     journal: str | None = typer.Option(None, "--journal", help=JOURNAL_HELP),
     config: Path = typer.Option(None, "--config", help=f"Defaults to ./{DEFAULT_CONFIG_NAME}."),
+    ask_abandoned: bool = typer.Option(
+        False,
+        "--ask-abandoned",
+        help="Ask the model again, live, for a turn the crashed run had stopped waiting for, "
+        "instead of stopping the node there. Its answer may differ from what was acted on.",
+    ),
 ) -> None:
     """Continue a run that was interrupted, without re-sending what already went out.
 
@@ -274,7 +304,7 @@ def resume(
         reducers=loaded.state.reducers,
     )
     try:
-        result = asyncio.run(scheduler.resume(run_id))
+        result = asyncio.run(scheduler.resume(run_id, ask_abandoned=ask_abandoned))
     except (JournalError, SchedulerError) as exc:
         # RunBusy: another process is driving this run. A SchedulerError before anything ran:
         # an unknown run id, or one that never started -- a message, not a traceback, and not

@@ -319,3 +319,23 @@ async def test_one_wrapped_graph_runs_any_number_of_times(tmp_path: Path) -> Non
     first = await graph.run({"customer_id": "cus-1"})
     second = await graph.run({"customer_id": "cus-1"})
     assert first.ok and second.ok and first.run_id != second.run_id
+
+
+async def test_a_failed_langgraph_run_is_not_reported_resumable(tmp_path: Path) -> None:
+    """``status`` said a failed LangGraph run was resumable, and ``resume`` refuses every one.
+    Found by the sixteenth review."""
+    from specunode.journal.replay import recover
+
+    world = standard_world()
+    journal = Journal(tmp_path / "journal.db")
+    registry = build_registry(world)
+    graph = wrap(
+        build_graph(world, ScriptedModel(turns=[])),
+        registry=registry,
+        journal=journal,
+        target=JournaledModel(ScriptedModel(turns=[]), journal, provider="scripted"),
+    )
+    result = await graph.run({"customer_id": "cus-1"})
+    assert not result.ok
+    recovery = recover(journal, result.run_id)
+    assert recovery.finished and recovery.failed and not recovery.resumable
