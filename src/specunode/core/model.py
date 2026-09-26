@@ -521,7 +521,7 @@ class CallScope:
     #: Stops the node: its branch takes no more writes, and its model asks raise
     #: :class:`TurnAbandoned` (``halted``). Called before a served turn is abandoned -- a node's
     #: ``finally`` went on writing, on the very path the runtime had just judged wrong.
-    halt: Callable[[], None] | None = None
+    halt: Callable[[str], None] | None = None
     halted: Callable[[], bool] | None = None
     #: When the node body began (``time.monotonic()``), so a turn it stopped waiting for can be
     #: served against the node's own clock, not only the call's.
@@ -583,9 +583,11 @@ class RecordedTurn:
     latency_ms: int = 0
     #: How far into its node the recorded caller had got when it stopped waiting (0: unknown).
     node_ms: int = 0
-    #: When each block of a streamed turn reached the recorded caller, in ms after it asked
-    #: (-1: unknown), so a served stream hands them over at the same pace.
-    block_ms: tuple[int, ...] = ()
+    #: What of a streamed turn reached the recorded caller as it streamed, piece by piece:
+    #: (block index, ms after it asked, where the piece ended in that block's text -- 0 for a
+    #: tool call), in the order it had them. A served stream hands over exactly these, at that
+    #: pace. ``None``: recorded before pieces were, and each block is handed over whole, at once.
+    pieces: tuple[tuple[int, int, int], ...] | None = None
     #: The attempt it is served from -- the branch that recorded this outcome -- and where the
     #: outcome came back among that attempt's others: the order a served turn is handed over in.
     #: Not ``offset``, which for a turn that attempt was itself served is where it was first
@@ -636,19 +638,45 @@ def _abandon_after_s(recorded: RecordedTurn, scope: CallScope | None = None) -> 
     return wait
 
 
-async def _served_never_answers(recorded: RecordedTurn, scope: CallScope | None = None) -> None:
-    """Wait well past when the recorded caller stopped; then stop the node, loudly."""
+#: What a node still waiting on a served turn is told, by what is serving it.
+RESUME_HINT = (
+    "If it should be asked again, resume with ask_abandoned (`specunode resume --ask-abandoned`)."
+)
+REPLAY_HINT = "A replay cannot go past it: replay the run with the node as it was recorded."
+
+
+async def _wait_out(recorded: RecordedTurn, scope: CallScope | None = None) -> float:
+    """Wait as a turn that never answers: well past when the recorded caller stopped."""
     wait = _abandon_after_s(recorded, scope)
     await asyncio.sleep(wait)
-    if scope is not None and scope.halt is not None:
-        scope.halt()
-    raise TurnAbandoned(
+    return wait
+
+
+def _abandoned(
+    recorded: RecordedTurn, scope: CallScope | None, waited: float, hint: str
+) -> TurnAbandoned:
+    """Stop the node, and say why: it is still waiting for a turn the recorded one gave up on.
+
+    The reason is kept with the node when it is stopped, so what the run reports is this, and
+    not whatever its ``finally`` then tried to do and was refused.
+    """
+    reason = (
         "the run being resumed or replayed stopped waiting for this turn after "
         f"{recorded.latency_ms / 1000.0:.1f} s, and this node is still waiting after "
-        f"{wait:.0f} s: it is not asking what it asked before -- something that shaped it "
-        "changed -- so it stops here rather than decide anew. If it should be asked again, "
-        "resume with ask_abandoned (`specunode resume --ask-abandoned`)."
+        f"{waited:.0f} s: it is not asking what it asked before -- something that shaped it "
+        f"changed -- so it stops here rather than decide anew. {hint}"
     )
+    if scope is not None and scope.halt is not None:
+        scope.halt(reason)
+    return TurnAbandoned(reason)
+
+
+async def _served_never_answers(
+    recorded: RecordedTurn, scope: CallScope | None = None, hint: str = RESUME_HINT
+) -> None:
+    """Wait well past when the recorded caller stopped; then stop the node, loudly."""
+    waited = await _wait_out(recorded, scope)
+    raise _abandoned(recorded, scope, waited, hint)
 
 
 def _refuse_if_halted(scope: CallScope) -> None:
@@ -732,14 +760,15 @@ class _Pacer:
                 except TimeoutError:
                     if released.is_set():
                         continue
-                    if scope is not None and scope.halt is not None:
-                        scope.halt()
-                    raise TurnAbandoned(
+                    reason = (
                         "this node still holds open an earlier turn that the run being resumed "
                         "or replayed was done with before this answer came back: it is not "
                         "doing what it did -- something that shaped it changed -- so it stops "
                         "here rather than decide anew."
-                    ) from None
+                    )
+                    if scope is not None and scope.halt is not None:
+                        scope.halt(reason)
+                    raise TurnAbandoned(reason) from None
         finally:
             self.release(key, order)  # handed over, or given up on: nothing waits on it now
 
@@ -779,8 +808,77 @@ def _partial_response(
     return ModelResponse(model=envelope.model, content=tuple(content), stop_reason="error")
 
 
+class _Handed:
+    """What of a streamed turn reached its caller, and when -- what a resume hands it back as.
+
+    Per text block, every piece, not the block: kept as one time per block, a text block's
+    time was its last piece's, and a served stream handed the whole block over then -- a node
+    that gives up on a model slow to start saw the first word late, fell back, and charged a
+    second time on a resume that changed nothing.
+    """
+
+    def __init__(self, asked_at: float) -> None:
+        self.asked_at = asked_at
+        self.blocks: dict[int, ContentBlock] = {}
+        self.texts: dict[int, list[str]] = {}
+        self.ends: dict[int, int] = {}
+        self.pieces: list[tuple[int, int, int]] = []
+
+    def add(self, event: StreamEvent) -> None:
+        ms = int((time.monotonic() - self.asked_at) * 1000)
+        if isinstance(event, ToolUseComplete):
+            self.blocks[event.index] = event.block
+            self.pieces.append((event.index, ms, 0))
+        elif isinstance(event, TextDelta):
+            self.texts.setdefault(event.index, []).append(event.text)
+            end = self.ends.get(event.index, 0) + len(event.text)
+            self.ends[event.index] = end
+            self.pieces.append((event.index, ms, end))
+
+    def response(self, envelope: RequestEnvelope) -> ModelResponse:
+        """Only what was handed over: a turn the caller stopped waiting for is recorded as the
+        caller saw it. Recorded whole, the next resume handed it every block at once -- ones
+        this caller never had -- and it decided otherwise."""
+        return _partial_response(envelope, self.blocks, self.texts)
+
+
+def _served_events(
+    response: ModelResponse, pieces: Sequence[tuple[int, int, int]] | None
+) -> list[tuple[int, StreamEvent]]:
+    """A recorded stream's pieces, each with when it reached the recorded caller (ms after it
+    asked; -1: at once) -- the pieces it had, in the order and at the pace it had them.
+
+    Recorded before pieces were (``None``), each block goes whole, at once, in order.
+    """
+    events: list[tuple[int, StreamEvent]] = []
+    if pieces is None:
+        for index, block in enumerate(response.content):
+            if isinstance(block, ToolUseBlock):
+                events.append((-1, ToolUseComplete(index=index, block=block)))
+            elif isinstance(block, TextBlock):
+                events.append((-1, TextDelta(index=index, text=block.text)))
+        return events
+    begun: dict[int, int] = {}
+    for index, at, end in pieces:
+        if not 0 <= index < len(response.content):
+            continue
+        piece = response.content[index]
+        if isinstance(piece, ToolUseBlock):
+            events.append((at, ToolUseComplete(index=index, block=piece)))
+        elif isinstance(piece, TextBlock):
+            start = begun.get(index, 0)
+            stop = min(max(end, start), len(piece.text))
+            events.append((at, TextDelta(index=index, text=piece.text[start:stop])))
+            begun[index] = stop
+    return events
+
+
 class RecordedTurnSource(Protocol):
     """Where a resumed run's recorded turns come from; see ``journal.replay.RecordedTurns``."""
+
+    #: Ask a turn the recorded node stopped waiting for again, live, once the resumed node has
+    #: waited for it well past that -- rather than stop the node there.
+    ask_abandoned: bool
 
     def take(self, digest: str, scope: CallScope) -> RecordedTurn | None:
         """The recorded answer to this request, or ``None`` if the model must be asked."""
@@ -917,7 +1015,7 @@ class JournaledModel:
         *,
         failed: str | None = None,
         cancelled: bool = False,
-        block_ms: Sequence[int] = (),
+        pieces: Sequence[tuple[int, int, int]] = (),
         node_ms: int = 0,
     ) -> None:
         if failed is None:
@@ -956,9 +1054,10 @@ class JournaledModel:
                 # carries only a digest, so without this the run would not be replayable.
                 "text": response.text or None,
                 "latency_ms": latency_ms,
-                # When the caller had each block, and how far into its node it stopped waiting:
-                # the pace a resume or a replay hands the turn back at.
-                **({"block_ms": list(block_ms)} if block_ms else {}),
+                # What of it the caller had as it streamed, and when, and how far into its node
+                # it stopped waiting: what a resume or a replay hands the turn back as, and at
+                # what pace. Empty for a turn handed over only whole.
+                "pieces": [list(piece) for piece in pieces],
                 **({"node_ms": node_ms} if node_ms else {}),
                 # Served from the journal, not asked: no model call was made for this entry.
                 **({"recorded_from": recorded.offset} if recorded is not None else {}),
@@ -975,7 +1074,8 @@ class JournaledModel:
         recorded: RecordedTurn | None = None,
         *,
         failed: str | None = None,
-        block_ms: Sequence[int] = (),
+        pieces: Sequence[tuple[int, int, int]] = (),
+        seen: ModelResponse | None = None,
     ) -> None:
         """Journal a turn's outcome -- and if the caller stops waiting while it is written, say so.
 
@@ -994,7 +1094,7 @@ class JournaledModel:
                 latency_ms,
                 recorded,
                 failed=failed,
-                block_ms=block_ms,
+                pieces=pieces,
             )
         )
         try:
@@ -1003,7 +1103,10 @@ class JournaledModel:
             await _let_finish(writing)
             if not writing.cancelled():
                 writing.exception()  # retrieved, so a failed write is not reported as unobserved
-            await self._cancelled(response, scope, request_id, digest, latency_ms, recorded)
+            # The caller never had it whole: what it had is ``seen`` -- a stream's pieces.
+            await self._cancelled(
+                seen or response, scope, request_id, digest, latency_ms, recorded, pieces=pieces
+            )
             raise
 
     async def _cancelled(
@@ -1016,6 +1119,7 @@ class JournaledModel:
         recorded: RecordedTurn | None = None,
         *,
         abandoned: bool = False,
+        pieces: Sequence[tuple[int, int, int]] = (),
     ) -> None:
         """Record that the caller stopped waiting -- a timeout, a cancel -- before it had the turn.
 
@@ -1040,6 +1144,7 @@ class JournaledModel:
                 recorded,
                 failed=CANCELLED,
                 cancelled=True,
+                pieces=pieces,
                 node_ms=node_ms,
             )
         )
@@ -1093,12 +1198,21 @@ class JournaledModel:
                     served = recorded.response
                     try:
                         if recorded.cancelled:
-                            await _served_never_answers(recorded, scope)
-                        # At the pace, and in the order, it first came back.
-                        await source.due(recorded, scope, asked_at)
+                            waited = await _wait_out(recorded, scope)
+                            if not source.ask_abandoned:
+                                raise _abandoned(recorded, scope, waited, RESUME_HINT)
+                            # The operator's call: asked again, live, at the point where it
+                            # would have been abandoned -- and not before, so a turn the node
+                            # stops waiting for again is served as it was.
+                            source.release(recorded, scope)
+                        else:
+                            # At the pace, and in the order, it first came back.
+                            await source.due(recorded, scope, asked_at)
                     except asyncio.CancelledError:
-                        waited = _waited_ms(recorded, asked_at)
-                        await self._cancelled(served, scope, request_id, digest, waited, recorded)
+                        waited_ms = _waited_ms(recorded, asked_at)
+                        await self._cancelled(
+                            served, scope, request_id, digest, waited_ms, recorded
+                        )
                         raise
                     except TurnAbandoned:
                         # Given an outcome too, so the next resume is served this one again.
@@ -1112,32 +1226,31 @@ class JournaledModel:
                             abandoned=True,
                         )
                         raise
-                    await self._outcome(
-                        served,
-                        scope,
-                        request_id,
-                        digest,
-                        recorded.latency_ms,
-                        recorded,
-                        failed=recorded.failed,
-                        block_ms=recorded.block_ms,
-                    )
-                    if recorded.failed is not None:
-                        raise ModelError(recorded.failed)
-                    return served
-                started = time.monotonic()
+                    if not recorded.cancelled:
+                        await self._outcome(
+                            served,
+                            scope,
+                            request_id,
+                            digest,
+                            recorded.latency_ms,
+                            recorded,
+                            failed=recorded.failed,
+                        )
+                        if recorded.failed is not None:
+                            raise ModelError(recorded.failed)
+                        return served
                 response: ModelResponse | None = None
                 try:
                     response = await self._inner.complete(envelope)
                     refuse_cut_off(response)
                 except asyncio.CancelledError:
                     empty = ModelResponse(model=envelope.model, stop_reason="error")
-                    latency_ms = int((time.monotonic() - started) * 1000)
+                    latency_ms = int((time.monotonic() - asked_at) * 1000)
                     await self._cancelled(response or empty, scope, request_id, digest, latency_ms)
                     raise
                 except Exception as exc:
                     failed = response or ModelResponse(model=envelope.model, stop_reason="error")
-                    latency_ms = int((time.monotonic() - started) * 1000)
+                    latency_ms = int((time.monotonic() - asked_at) * 1000)
                     failure = _failure_text(exc)
                     await self._outcome(
                         failed, scope, request_id, digest, latency_ms, failed=failure
@@ -1147,7 +1260,7 @@ class JournaledModel:
                     # What a served failure raises, so a node that catches it does so the same way
                     # live, on resume and in replay; the client's own error is its cause.
                     raise ModelError(failure) from exc
-                latency_ms = int((time.monotonic() - started) * 1000)
+                latency_ms = int((time.monotonic() - asked_at) * 1000)
                 await self._outcome(response, scope, request_id, digest, latency_ms)
                 return response
             finally:
@@ -1173,6 +1286,10 @@ class JournaledModel:
         the branch as open until its response is journaled (``CallScope.track_turn``), and a
         write made while it is open -- or after the node stopped reading before its end -- is
         refused.
+
+        Every outcome records what of the turn reached the caller as it streamed, piece by
+        piece and when (:class:`_Handed`): a resume or a replay hands exactly that back, at that
+        pace -- live or served, answered, failed or given up on.
         """
         scope = current_scope()
         _refuse_if_halted(scope)
@@ -1184,78 +1301,86 @@ class JournaledModel:
             track = scope.track_turn if self._role == "target" else None
             if track is not None:
                 track(1)
-            handed_over = False
+            handed = _Handed(asked_at)
             try:
                 if source is not None and recorded is not None:
-                    # The recorded turn's blocks, in order and at the pace they first came -- so
-                    # early issue, and a node that acts on what arrives first, see a served turn as
-                    # they saw the original.
+                    # The recorded turn's pieces, in order and at the pace they first came -- so
+                    # early issue, and a node that acts on what arrives first, see a served turn
+                    # as they saw the original.
                     response = recorded.response
                     try:
-                        for index, block in enumerate(response.content):
-                            at = recorded.block_ms[index] if index < len(recorded.block_ms) else -1
+                        for at, event in _served_events(response, recorded.pieces):
                             if at >= 0:
                                 await _sleep_until(asked_at + at / 1000.0)
-                            if isinstance(block, ToolUseBlock):
-                                handed_over = True
-                                yield ToolUseComplete(index=index, block=block)
-                            elif isinstance(block, TextBlock):
-                                handed_over = True
-                                yield TextDelta(index=index, text=block.text)
+                            handed.add(event)
+                            yield event
                         if recorded.cancelled:
-                            await _served_never_answers(recorded, scope)
-                        await source.due(recorded, scope, asked_at)
+                            waited = await _wait_out(recorded, scope)
+                            if not source.ask_abandoned:
+                                raise _abandoned(recorded, scope, waited, RESUME_HINT)
+                            if handed.pieces:
+                                raise _abandoned(
+                                    recorded,
+                                    scope,
+                                    waited,
+                                    "It is not asked again, though ask_abandoned is set: part "
+                                    "of it was handed over already, and a turn cannot be asked "
+                                    "again part-way.",
+                                )
+                            # The operator's call: asked again, live, where it would have been
+                            # abandoned; nothing of it had reached the node.
+                            source.release(recorded, scope)
+                        else:
+                            await source.due(recorded, scope, asked_at)
                     except (asyncio.CancelledError, GeneratorExit, TurnAbandoned) as stopped:
-                        # Whatever it was served, the caller did not have the whole turn: recorded
-                        # as that, so the next resume is matched with what this one did.
+                        # The caller did not have the whole turn: recorded as what it did have,
+                        # so the next resume is handed what this one was, and no more.
                         finalised = isinstance(stopped, GeneratorExit) and not self._in_run(scope)
                         if not finalised:
                             abandoned = isinstance(stopped, TurnAbandoned)
-                            waited = (
+                            waited_ms = (
                                 recorded.latency_ms if abandoned else _waited_ms(recorded, asked_at)
                             )
                             await self._cancelled(
-                                response,
+                                handed.response(envelope),
                                 scope,
                                 request_id,
                                 digest,
-                                waited,
+                                waited_ms,
                                 recorded,
                                 abandoned=abandoned,
+                                pieces=handed.pieces,
                             )
                         raise
-                    await self._outcome(
-                        response,
-                        scope,
-                        request_id,
-                        digest,
-                        recorded.latency_ms,
-                        recorded,
-                        failed=recorded.failed,
-                        block_ms=recorded.block_ms,
-                    )
-                    if recorded.failed is not None:
-                        raise ModelError(recorded.failed)
-                    if track is not None:
-                        track(-1)
-                        track = None
-                    yield TurnComplete(response=response)
-                    return
-                started = time.monotonic()
+                    if not recorded.cancelled:
+                        await self._outcome(
+                            response,
+                            scope,
+                            request_id,
+                            digest,
+                            recorded.latency_ms,
+                            recorded,
+                            failed=recorded.failed,
+                            pieces=handed.pieces,
+                            seen=handed.response(envelope),
+                        )
+                        if recorded.failed is not None:
+                            raise ModelError(recorded.failed)
+                        if track is not None:
+                            track(-1)
+                            track = None
+                        yield TurnComplete(response=response)
+                        return
                 completed = False
                 #: An outcome is on disk, or will be: a turn has exactly one, the last word.
                 recorded_outcome = False
-                blocks: dict[int, ContentBlock] = {}
-                texts: dict[int, list[str]] = {}
-                #: When the caller had each block, in ms after it asked.
-                seen_at: dict[int, int] = {}
                 final: ModelResponse | None = None
                 try:
                     async for event in self._inner.stream(envelope):
                         if isinstance(event, TurnComplete):
                             final = event.response
                             refuse_cut_off(event.response)
-                            latency_ms = int((time.monotonic() - started) * 1000)
+                            latency_ms = int((time.monotonic() - asked_at) * 1000)
                             recorded_outcome = True
                             await self._outcome(
                                 event.response,
@@ -1263,22 +1388,15 @@ class JournaledModel:
                                 request_id,
                                 digest,
                                 latency_ms,
-                                block_ms=[
-                                    seen_at.get(index, -1)
-                                    for index in range(len(event.response.content))
-                                ],
+                                pieces=handed.pieces,
+                                seen=handed.response(envelope),
                             )
                             completed = True
                             if track is not None:
                                 track(-1)
                                 track = None
-                        elif isinstance(event, ToolUseComplete):
-                            blocks[event.index] = event.block
-                            seen_at[event.index] = int((time.monotonic() - started) * 1000)
-                        elif isinstance(event, TextDelta):
-                            texts.setdefault(event.index, []).append(event.text)
-                            seen_at[event.index] = int((time.monotonic() - started) * 1000)
-                        handed_over = True
+                        else:
+                            handed.add(event)
                         yield event
                     if not completed:
                         # A stream that simply stops -- a dropped connection the client did not
@@ -1293,24 +1411,31 @@ class JournaledModel:
                     # longer drives that run, and its "run_finished" is already written.
                     finalised = isinstance(stopped, GeneratorExit) and not self._in_run(scope)
                     if not recorded_outcome and not finalised:
-                        latency_ms = int((time.monotonic() - started) * 1000)
-                        seen = final or _partial_response(envelope, blocks, texts)
-                        await self._cancelled(seen, scope, request_id, digest, latency_ms)
+                        latency_ms = int((time.monotonic() - asked_at) * 1000)
+                        await self._cancelled(
+                            final or handed.response(envelope),
+                            scope,
+                            request_id,
+                            digest,
+                            latency_ms,
+                            pieces=handed.pieces,
+                        )
                     raise
                 except Exception as exc:
                     if recorded_outcome:
                         raise
                     # What of the reply reached the caller is recorded with the failure, and
                     # served again before it, so a resumed node sees what this one saw.
-                    latency_ms = int((time.monotonic() - started) * 1000)
+                    latency_ms = int((time.monotonic() - asked_at) * 1000)
                     failure = _failure_text(exc)
                     await self._outcome(
-                        final or _partial_response(envelope, blocks, texts),
+                        final or handed.response(envelope),
                         scope,
                         request_id,
                         digest,
                         latency_ms,
                         failed=failure,
+                        pieces=handed.pieces,
                     )
                     if isinstance(exc, ModelError):
                         raise
@@ -1320,7 +1445,7 @@ class JournaledModel:
                 # neither did one read by call_turn, which hands a failed turn to nobody. One a
                 # node read itself and stopped reading part-way stays open: it may act on what it
                 # saw.
-                if track is not None and (not handed_over or _partial_discarded.get()):
+                if track is not None and (not handed.pieces or _partial_discarded.get()):
                     track(-1)
                 raise
         finally:

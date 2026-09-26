@@ -201,6 +201,13 @@ class StoreBuffer:
                 f"branch {branch.id} is {branch.status.value}; a tool that could not be "
                 "cancelled must not resurrect a buffer nothing will drain"
             )
+        if self._drain_owner(branch)[0] in self._closed:
+            # Adopted by a branch that has since been closed -- its node stopped, or the run
+            # ending: what the adopted guess stages now would land in that branch's buffer.
+            raise BranchClosed(
+                f"branch {branch.id} was adopted by a branch that is closed to writes; what it "
+                "stages now would reach a buffer that was shut"
+            )
         if has_handle(canonical(dict(call.args))):
             # Defence in depth: hazard analysis should have stalled the branch before here.
             raise HazardViolation(

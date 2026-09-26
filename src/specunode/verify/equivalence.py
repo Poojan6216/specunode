@@ -460,6 +460,12 @@ def assert_equivalent(
                 "an unfinished run's ledger is a prefix, and a prefix that matches proves "
                 "nothing"
             )
+        if getattr(ledger, "unsettled", ()):
+            raise EquivalenceError(
+                f"the speculation-{label} run has effects that may have been sent and were "
+                "never settled; what reached the world is not known, so there is nothing to "
+                "compare"
+            )
 
     for label, ledger in (("off", ledger_off), ("on", ledger_on)):
         count = len(ledger.rows)

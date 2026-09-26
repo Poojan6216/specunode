@@ -1057,6 +1057,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [2.5] DEFECTS (fixed), found by the fourteenth review, which found no way to send a write twice: (1) a replay of a run interrupted during a model call waited forever on the turn recorded as cancelled, and replay did not re-emit text, so a node that stopped reading on text waited too -- a served "never answers" turn now waits as long as the recorded caller did, and a margin, then raises TurnAbandoned, and replay re-emits text; (2) replay merged an answer with the marker that its node never saw it only when the two were adjacent, so a question answered in between made replay hand the answer over and `replay --dispatch` send a charge the run never made -- the last outcome per request wins; (3) replay listed turns in answer order, not asked order, and refused a faithful re-run of concurrent calls; (4) a resume hung without a word on a pinned cancelled turn whose cancellation did not recur -- the same bounded wait; (5) a stream closed by the garbage collector after the run ended journaled "cancelled" after run_finished -- not outside a run this process holds; (6) a third cancel while "cancelled" was written cancelled the write; (7) a stale read after a node's last write was reported as a discarded write. Also from its list: a journal failure mid-drain left the parked node running, and a run that lost its Postgres lock after its last drain reported success with no run_finished -- it raises now. And the slow-disk run found one more of finding 6's kind: a caller cancelled while its question was being written left the question on disk with no outcome -- the write is let finish and given a cancelled outcome. Each fix fails under its own planted bug. — 2026-09-25
 [2.5] DEFECTS (fixed), found by the fifteenth review: (1, critical, in the fourteenth's repair) TurnAbandoned was a RuntimeError, so a node's ordinary `except Exception` fallback caught it and asked a question the recorded run never asked -- live -- and a card was charged a second time; nor was the abandoned question given an outcome, so the next resume asked live again. It is a BaseException now, which ends the node, and it is recorded; (2) a served turn cancelled again was journaled with a wait of 0, so the resume after gave up after the margin alone; (3) the bound measured only the model call, and a node whose deadline also covered earlier work -- faster on resume -- was abandoned: it is twice the recorded wait and 30 s more; (4) the stale-read message was wrong for a node that had finished; (5) `status` said a failed run was not resumable while `resume` re-ran it; (6) read-only commands reported on a mistyped run id, and created the journal they were pointed at; (7) `--help` showed raw ``markup``. Each fix fails under its own planted bug. — 2026-09-25
 [2.5] DEFECTS (fixed), found by the sixteenth review: (1, critical) served answers came back at once, in the order asked, so a node that acted on whichever of two answers came first -- or fell back when one was not back in time, without cancelling it -- decided otherwise on resume and in replay, and a different charge went out with nothing changed; they come back at their recorded pace, per block of a stream, and in the order they first came, and a replay takes as long as the model did; (2) a resume that left an earlier attempt's claim unsettled reported success, and the ledger hid it -- the run is not ok, naming the tools for `specunode resolve`, and the ledger marks MAY HAVE BEEN SENT; (3) a node ended by TurnAbandoned still wrote from its `finally`, and was sent -- the node is closed to writes and model asks first; (4) the abandonment bound measured only the call, so a node whose deadline covered earlier work, slower in the recorded run, was abandoned every time -- the bound is also node-relative, and `resume --ask-abandoned` lets an operator ask such a turn again; (5) read-only commands wrote the journal's tables into a database that was not a journal, a folder gave a traceback, and a failed LangGraph run was called resumable. Then the slow-disk run, before any of it was committed, found the fix for (1) hanging resumes: (6) an answer waited for every earlier answer of its node to be handed over, and one the node stopped waiting for never was, so every resume of a node that gives up on a question and asks again waited for ever -- an answer is now released however its call ends. Fixing it turned up two more: (7) answers were ordered by where each was first recorded, which for a resume of a resume put an answer served again ahead of one asked live that came back before it, and a node reading the first only after the second waited for itself for ever -- they are ordered by where each came back in the attempt served, and never held past the earlier one's own bound; and (8), older than both, a node that caught `TurnAbandoned` and returned was committed, and the run reported success -- it is refused. The slow-disk CI job, which had not run the resume tests, runs them now. Each fix fails under its own planted bug. — 2026-09-26
+[2.5] DEFECTS (fixed), found by the seventeenth review -- twelve, four critical, and all four in the sixteenth review's repairs: (1, critical) a streamed text block was timed by its last piece and served whole then, so a node that gives up on a model slow to start saw the first word late on resume and in replay, and charged its fallback as well -- every piece is recorded with its time now, and served as it came; (2, critical) a served stream the node gave up on was recorded with every block and no timing, so the next resume handed the node all of it at once, an early read took the fallback's position, and the fallback went out twice -- a turn is recorded as its caller had it; (3, critical) `--ask-abandoned` asked every turn the recorded node had given up on again at once, including one it would give up on again, and the node charged a price no run had decided -- it asks only at the point the node would be stopped; (4, critical) a dead letter that may have been sent did not keep a resume from reporting success, as a claim still in flight does; (5) a node's `finally` refused on its way out replaced why it was stopped in the run's error; (6) a replay was told to resume; (7) a claim demonstrably never sent failed a resume as maybe sent; (8) `ledger --json` and `--normalised` left out what may have been sent; (9) a journal whose path held `#`, `?` or `%` was refused; (10) read-only commands created the journal's tables in a Postgres database that was not a journal; (11) two tests failed on a disk slower than CI's; (12) replay.md described repeated requests at one step wrongly. A thirteenth, suspected, is closed too: a guess adopted by a branch closed to writes could still stage into it. Each fix fails under its own planted bug. — 2026-09-26
 [3.3] Four tests settled a guess inside a 15–25 ms block delay, which a journal append on a slow CI disk could miss. Found all at once by running the suite with every append 40 ms slower (`tests/slow_journal.py`); each now holds the settling block until the event it needs has happened, and passes at 40, 100 and 250 ms of added latency. The `slow-disk` CI job runs the tests that guess that way on every push. — 2026-09-25
 ```
 
@@ -1067,17 +1068,17 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**1020 tests pass, 24 skip — 17 of the passes against a real Postgres 16 server.** `ruff check`,
+**1035 tests pass, 24 skip — 18 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Sixteen independent adversarial reviews have found 166 defects here, 24 of them critical.** The
-counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8, 10, 6, 7, 7, 6.** All are fixed but one, kept on purpose
+**Seventeen independent adversarial reviews have found 178 defects here, 28 of them critical.** The
+counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8, 10, 6, 7, 7, 6, 12.** All are fixed but one, kept on purpose
 and documented: a node's writes are refused while any model turn it started is unjournaled, even
 one that did not decide the write. That number is the most useful thing in this report, so it
 is at the top rather than buried: the version of this document written a day earlier described
-a finished project. The sixteenth to sixth reviews (2026-09-25 and -26) and the fifth (2026-09-23) are
+a finished project. The seventeenth to sixth reviews (2026-09-25 and -26) and the fifth (2026-09-23) are
 summarised below; the fourth is in commit `c8802ec`.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
@@ -1197,6 +1198,37 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (4 guesses forked, 4 squashed, 4 charges staged and discarded, the
 alpha gate closed once, 0 wasted tokens — a pattern-index guess costs no model tokens — and 0
 leaks) and 7.8 replay under model drift (both cases diverge at step 0).
+
+### What the seventeenth review found
+
+Twelve findings, four critical -- and all four were in the sixteenth review's repairs: the pace
+answers are served at, the flag that asks an abandoned turn again, and the check that a resume
+leaves nothing unsettled.
+
+- **Critical: served text arrived as late as its last word.** A streamed text block was timed by
+  its last piece, and a served one was handed over whole at that time. A node that gives up on a
+  model slow to start -- no first word within 0.3 s -- had its first word 0.6 s late on resume
+  and in replay, and charged its fallback on top of what the run charged. Every piece is
+  recorded now, with when it reached the caller, and served the same way.
+- **Critical: a turn the node gave up on was recorded as if it had seen all of it.** Served,
+  then given up on before its first block, it was recorded with both blocks and no timing; the
+  next resume handed the node both at once, a read issued early took the fallback charge's
+  position, and the fallback went out a second time under a new key. A turn is recorded as its
+  caller had it, live or served, answered, failed or given up on.
+- **Critical: `--ask-abandoned` asked too much.** It asked again every turn the crashed run had
+  given up on, at once -- one the node would give up on again too, which now answered in time,
+  and the node charged a price no run had decided. It asks only at the point the node would be
+  stopped, and not a streamed turn part of which was handed over.
+- **Critical: a dead letter that may have been sent did not stop a resume reporting success.**
+  The sixteenth review's fix counted claims still in flight, not dead letters whose request may
+  have left; one whose node no longer made that call was passed over.
+- And eight more: why a node was stopped was replaced by whatever its `finally` then ran into; a
+  replay was told to resume; a claim demonstrably never sent was reported as maybe sent; the
+  JSON and normalised ledgers left out what may have been sent; a journal path with `#`, `?` or
+  `%` was refused; read-only commands changed a Postgres database that was not a journal; two
+  tests failed on a slower disk than CI's; and the replay docs described one step wrongly. The
+  review suspected, without building it, that a guess adopted by a branch closed to writes could
+  still stage into it; it could, and is refused now. All fixed.
 
 ### What the sixteenth review found
 

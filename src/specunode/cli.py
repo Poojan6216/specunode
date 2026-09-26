@@ -21,6 +21,7 @@ from pathlib import Path
 import typer
 
 from specunode import __version__
+from specunode.canonical import JsonValue
 from specunode.config import (
     DEFAULT_CONFIG_NAME,
     DEFAULT_JOURNAL_PATH,
@@ -119,28 +120,36 @@ def _existing_journal(location: str) -> Journal:
 
     Opening it creates it: a read-only command given a mistyped path made an empty journal
     there, and then reported on it -- ``verify`` said the chain verified, over 0 entries.
+    And opening writes the journal's tables into whatever is there: pointed at an application's
+    own database -- a file, or a Postgres database -- a read-only command changed it. So it is
+    looked at read-only first, and refused unless it is a journal.
     """
-    if not is_postgres_dsn(location):
-        path = Path(location).expanduser()
-        if not path.exists():
-            typer.echo(f"no journal at {location}", err=True)
+    if is_postgres_dsn(location):
+        if not _is_journal_database(location):
+            typer.echo("that Postgres database is not a SpecuNode journal", err=True)
             raise typer.Exit(2)
-        # Opening a file as a journal writes the journal's tables into it: pointed at an
-        # application's own database, a read-only command changed it. Looked at read-only
-        # first, and refused unless it is one.
-        if not _is_journal_file(path):
-            typer.echo(f"{location} is not a SpecuNode journal", err=True)
-            raise typer.Exit(2)
+        return Journal(location)
+    path = Path(location).expanduser()
+    if not path.exists():
+        typer.echo(f"no journal at {location}", err=True)
+        raise typer.Exit(2)
+    if not _is_journal_file(path):
+        typer.echo(f"{location} is not a SpecuNode journal", err=True)
+        raise typer.Exit(2)
     return Journal(location)
 
 
 def _is_journal_file(path: Path) -> bool:
     import sqlite3
+    from contextlib import closing
 
     if not path.is_file():
         return False
     try:
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as probe:
+        # As a URI, so ``mode=ro`` holds -- and percent-encoded: a ``#``, ``?`` or ``%`` in the
+        # path was read as URI syntax, and a real journal was refused.
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as probe:
             tables = {
                 row[0]
                 for row in probe.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -148,6 +157,26 @@ def _is_journal_file(path: Path) -> bool:
     except sqlite3.DatabaseError:
         return False
     return {"entries", "effect_dispatch"} <= tables
+
+
+def _is_journal_database(dsn: str) -> bool:
+    """Whether a Postgres database holds a journal -- asked without creating anything.
+
+    A database that cannot be reached is not judged here: opening it says why, better.
+    """
+    try:
+        import psycopg
+    except ImportError:
+        return True  # opening it names the missing extra
+    try:
+        with psycopg.connect(dsn, autocommit=True) as probe:
+            row = probe.execute(
+                "SELECT to_regclass('entries') IS NOT NULL "
+                "AND to_regclass('effect_dispatch') IS NOT NULL"
+            ).fetchone()
+    except psycopg.OperationalError:
+        return True
+    return bool(row and row[0])
 
 
 def _require_run(book: Journal, run_id: str) -> None:
@@ -231,23 +260,38 @@ def ledger(
     _require_run(book, run_id)
     built = build_ledger(book, run_id)
     if as_json:
-        typer.echo(
-            json.dumps(
-                [
-                    {
-                        "effect_id": row.effect_id,
-                        "tool": row.call.name,
-                        "args": dict(row.call.args),
-                        "key": row.nkey,
-                        "branch": row.branch_id,
-                        "authorised_by_step": row.authorised_by_step,
-                        "status": row.status,
-                    }
-                    for row in built.rows
-                ],
-                indent=2,
-            )
+        # Every effect that may be in the world is in it: the rows, each saying whether nothing
+        # has settled it, and a claim the process died holding, which has no row of its own.
+        unsettled = {effect.nkey: effect for effect in built.unsettled}
+        rows: list[dict[str, JsonValue]] = [
+            {
+                "effect_id": row.effect_id,
+                "tool": row.call.name,
+                "args": dict(row.call.args),
+                "key": row.nkey,
+                "branch": row.branch_id,
+                "authorised_by_step": row.authorised_by_step,
+                "status": row.status,
+                "unsettled": row.nkey in unsettled,
+            }
+            for row in built.rows
+        ]
+        listed = {row.nkey for row in built.rows}
+        rows.extend(
+            {
+                "effect_id": effect.effect_id,
+                "tool": effect.tool,
+                "args": dict(effect.args),
+                "key": effect.nkey,
+                "branch": effect.branch_id,
+                "authorised_by_step": None,
+                "status": "IN_FLIGHT",
+                "unsettled": True,
+            }
+            for effect in built.unsettled
+            if effect.nkey not in listed
         )
+        typer.echo(json.dumps(rows, indent=2))
         return
     typer.echo(render_ledger(built, short_ids=short, normalised=normalised))
 
@@ -260,8 +304,9 @@ def resume(
     ask_abandoned: bool = typer.Option(
         False,
         "--ask-abandoned",
-        help="Ask the model again, live, for a turn the crashed run had stopped waiting for, "
-        "instead of stopping the node there. Its answer may differ from what was acted on.",
+        help="Where a node keeps waiting on a turn the crashed run had stopped waiting for, ask "
+        "the model again, live, at the point it would be stopped -- instead of stopping it. "
+        "Only that turn; its answer may differ from what was acted on.",
     ),
 ) -> None:
     """Continue a run that was interrupted, without re-sending what already went out.

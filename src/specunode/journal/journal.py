@@ -125,6 +125,13 @@ _SELECT_UNRESOLVED = (
     "SELECT nkey, idem_key, effect_id, branch_id, tool, status, last_outcome, attempt "
     "FROM effect_dispatch WHERE run_id = :run_id AND status = 'in_flight'"
 )
+# Claims whose request may have reached the upstream and that nothing has settled: in flight,
+# or dead-lettered, with no proof that it never left. One demonstrably unsent is not among them.
+_SELECT_UNSETTLED = (
+    "SELECT nkey, idem_key, effect_id, branch_id, tool, status, last_outcome, attempt "
+    "FROM effect_dispatch WHERE run_id = :run_id AND status IN ('in_flight', 'dead_letter') "
+    "AND last_outcome <> 'not_sent'"
+)
 _SELECT_CHUNK_KINDS = (
     'SELECT run_id, "offset", kind, payload_json, payload_hash, prev_hash, ts FROM entries '
     'WHERE run_id = :run_id AND "offset" > :after AND kind IN ({placeholders}) '
@@ -718,6 +725,10 @@ class _JournalWriter:
         rows = self._backend.execute(_SELECT_UNRESOLVED, {"run_id": run_id}).fetchall()
         return [dict(row) for row in rows]
 
+    def _unsettled(self, run_id: str) -> list[Mapping[str, JsonValue]]:
+        rows = self._backend.execute(_SELECT_UNSETTLED, {"run_id": run_id}).fetchall()
+        return [dict(row) for row in rows]
+
     def _resolve(
         self,
         run_id: str,
@@ -1235,6 +1246,15 @@ class Journal:
     def unresolved_dispatches(self, run_id: str) -> list[Mapping[str, JsonValue]]:
         """Claims still in flight. A resume's reconciliation list."""
         return self._writer.submit(lambda: self._writer._unresolved(run_id))
+
+    def unsettled_dispatches(self, run_id: str) -> list[Mapping[str, JsonValue]]:
+        """Effects that may have reached the upstream and that nothing has settled.
+
+        A claim still in flight, or a dead letter, with no proof its request never left --
+        whether its own attempt stopped there or a later one moved on without it. Each may or
+        may not be in the world until someone who has checked records which (``resolve``).
+        """
+        return self._writer.submit(lambda: self._writer._unsettled(run_id))
 
     def close(self) -> None:
         """Journals share a process-global writer; closing one closes none of the others."""

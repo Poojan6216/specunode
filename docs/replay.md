@@ -68,9 +68,11 @@ Ordering is by `offset`, never by `ts`. No query in the codebase contains `ORDER
 
 ## Replay
 
-`ReplayModel` serves the journaled responses and calls no model. It is **keyed by step index**,
-not sequential, so repeated requests for one step return the same turn and concurrent branches
-asking for the same step cannot interleave into each other's answers.
+`ReplayModel` serves the journaled responses and calls no model. It is **keyed by node and step
+index**, not by one sequence for the whole run, so two nodes asking at once cannot interleave into
+each other's answers. At one node and step, the turns are served in the order they were asked: a
+node that holds a conversation there is handed its first answer, then its second. Asking once more
+than the run did raises `ReplayExhausted`, naming the node and step.
 
 It refuses the moment the run would ask a *different question*. The comparison is
 `request_hash` — the same envelope projection Hard Rule 13 uses live — so changing one token of
@@ -145,28 +147,33 @@ the dedupe table catches the earlier attempt, whatever the model would have said
 time. A served answer comes back at the pace it first did, and in the order the answers came
 back in the attempt it is served from -- a node that acts on whichever answer arrives first, or
 falls back when one is not back in time, decides as it did; so a resume, and a replay, take as
-long as the model took. An answer waits for an earlier one only until the node is done with that
-one, however it is done with it: answered, failed or given up on. An answer that sent nothing is
-asked for again; there is nothing to protect. A turn that failed -- a reply cut off or refused,
-a model that was overloaded -- is recorded as the failure it was and served again as that
-failure, and a replay raises it again at the same point: a node that caught it and asked again
-then asks its second question, and is matched with the answer to that. A turn the node stopped
-waiting for -- its timeout fired, or it was cancelled, even while the answer was being written
--- is recorded as cancelled, and served as one that never answers: until well past the later of
-when the recorded call and the recorded node stopped waiting -- twice the call's wait, or as far
-into the node as it had got, and 30 seconds more. A node that stops waiting by then -- its
-timeout fires again -- goes on as it did before; one still waiting is not asking what it asked
-before, and ends with `TurnAbandoned`, rather than wait without end or be answered anew. So does
-a node still holding an earlier answer open that long, while it waits for a later one: the run
-it resumes was done with the earlier one first. `TurnAbandoned` is a `BaseException`, like a
-cancellation, so an ordinary `except Exception` fallback cannot catch it; the node is closed
-first, so its `finally` cannot write or ask either; and a node that catches it anyway and
-returns is not committed -- the run stops with `TurnAbandoned` all the same. A replay does the
-same. `specunode resume --ask-abandoned` asks a turn the recorded node stopped waiting for again
-instead, for an operator who has decided to. What a resume cannot keep the same is anything else
-that shapes a call: a read made again that returns something new, a timestamp, code that
-changed. Then a different call at the same position gets a different key, and the world receives
-it as well.
+long as the model took. A streamed answer is handed over piece by piece: exactly the pieces its
+caller had as it streamed, each when it had it -- a node that gives up on a model slow to say
+its first word sees the first word when the model said it -- and a turn its caller gave up on
+part-way is recorded, and served, as far as it got. An answer waits for an earlier one only
+until the node is done with that one, however it is done with it: answered, failed or given up
+on. An answer that sent nothing is asked for again; there is nothing to protect. A turn that
+failed -- a reply cut off or refused, a model that was overloaded -- is recorded as the failure
+it was and served again as that failure, and a replay raises it again at the same point: a node
+that caught it and asked again then asks its second question, and is matched with the answer to
+that. A turn the node stopped waiting for -- its timeout fired, or it was cancelled, even while
+the answer was being written -- is recorded as cancelled, and served as one that never answers:
+until well past the later of when the recorded call and the recorded node stopped waiting --
+twice the call's wait, or as far into the node as it had got, and 30 seconds more. A node that
+stops waiting by then -- its timeout fires again -- goes on as it did before; one still waiting
+is not asking what it asked before, and ends with `TurnAbandoned`, rather than wait without end
+or be answered anew. So does a node still holding an earlier answer open that long, while it
+waits for a later one: the run it resumes was done with the earlier one first. `TurnAbandoned`
+is a `BaseException`, like a cancellation, so an ordinary `except Exception` fallback cannot
+catch it; the node is closed first, so its `finally` cannot write or ask either; a node that
+catches it anyway and returns is not committed -- the run stops with `TurnAbandoned` all the
+same -- and the run reports why the node was stopped, whatever its `finally` ran into after. A
+replay does the same. `specunode resume --ask-abandoned` asks the model again instead, live, at
+the point where the node would be stopped, for an operator who has decided to: that turn only,
+and not a streamed one part of which was already handed over, which cannot be asked again
+part-way. What a resume cannot keep the same is anything else that shapes a call: a read made
+again that returns something new, a timestamp, code that changed. Then a different call at the
+same position gets a different key, and the world receives it as well.
 
 The kill/resume test resumes every kill point with a model that would decide differently if it
 were asked, on a node that asks and charges in one step as well as on one that only decides, and

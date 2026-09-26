@@ -381,3 +381,61 @@ def test_a_read_only_command_never_changes_a_database_that_is_not_a_journal(
         tables = [row[0] for row in db.execute("SELECT name FROM sqlite_master")]
         mode = db.execute("PRAGMA journal_mode").fetchone()[0]
     assert tables == ["customers"] and mode != "wal", (tables, mode)
+
+
+async def _a_charge_left_out(db: Path) -> str:
+    """A run whose process died with a charge out: claimed, sent, no reply."""
+    from tests.integration.test_crash_then_resume import Crash, bury_the_dead_process, scheduler
+    from tests.integration.test_served_pace import SlowFirst
+
+    from specunode.canonical import JsonValue
+    from specunode.core.decision import Decision, ToolCall
+    from specunode.core.graph import RunSession
+    from specunode.integrations.plain import PlainAdapter, node, registry_of, tool
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        raise Crash("the process died with the charge out and its reply lost")
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        await session.call_tool("charge_card", {"customer_id": "cus-1", "amount": 25.0})
+        session.state["billed"] = True
+        return ToolCall("charge_card", {})
+
+    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
+    run_id = new_ulid()
+    with pytest.raises(Crash):
+        await scheduler(
+            Journal(db), adapter, registry_of([charge_card]), SlowFirst(hang=False)
+        ).run(run_id, {})
+    await bury_the_dead_process()
+    return run_id
+
+
+def test_every_view_of_the_ledger_shows_what_may_have_been_sent(tmp_path: Path) -> None:
+    """``--json`` and ``--normalised`` left out a charge the dead process may have made; only
+    the plain ledger showed it. Found by the seventeenth review."""
+    db = tmp_path / "j.db"
+    run_id = asyncio.run(_a_charge_left_out(db))
+    as_json = CliRunner().invoke(app, ["ledger", run_id, "--json", "--journal", str(db)])
+    assert as_json.exit_code == 0, as_json.output
+    rows = json.loads(as_json.output)
+    assert [(r["tool"], r["status"], r["unsettled"]) for r in rows] == [
+        ("charge_card", "IN_FLIGHT", True)
+    ]
+    assert rows[0]["args"] == {"customer_id": "cus-1", "amount": 25.0}
+    normalised = CliRunner().invoke(app, ["ledger", run_id, "--normalised", "--journal", str(db)])
+    assert "MAY HAVE BEEN SENT" in normalised.output, normalised.output
+
+
+@pytest.mark.parametrize("name", ["we#ird.db", "q?mark.db", "pct%41.db"])
+def test_a_journal_whose_path_reads_as_uri_syntax_is_still_a_journal(
+    tmp_path: Path, name: str
+) -> None:
+    """Probed as a URI without encoding its path, a journal named with ``#``, ``?`` or ``%`` was
+    refused by every command, resume included. Found by the seventeenth review."""
+    path = tmp_path / name
+    Journal(path).close()
+    result = CliRunner().invoke(app, ["runs", "--journal", str(path)])
+    assert result.exit_code == 0, result.output

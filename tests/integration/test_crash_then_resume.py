@@ -104,13 +104,21 @@ def before_commit_of(node_id: str) -> Callable[[str, Mapping[str, JsonValue]], b
 def scheduler(
     journal: Journal, adapter: object, registry: object, model: object, **policy: Any
 ) -> Scheduler:
+    # A replay is driven as `specunode replay` drives it: the ReplayModel is the target itself.
+    # Wrapped, a question cancelled while it was being written never reached it, and the replay
+    # matched the next question against that one's turn -- a divergence no user could meet.
+    target = (
+        model
+        if isinstance(model, ReplayModel)
+        else JournaledModel(model, journal, provider="scripted")  # type: ignore[arg-type]
+    )
     return Scheduler(
         graph=adapter,  # type: ignore[arg-type]
         registry=registry,  # type: ignore[arg-type]
         journal=journal,
         buffer=StoreBuffer(journal=journal, run_id=""),
         dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=0.5),  # type: ignore[arg-type]
-        target=JournaledModel(model, journal, provider="scripted"),  # type: ignore[arg-type]
+        target=target,
         policy=Policy(**{"speculation": False, **policy}),
     )
 

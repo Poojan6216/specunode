@@ -385,7 +385,12 @@ async def test_replay_serves_several_turns_from_one_position_in_the_order_they_w
 
 async def test_replay_streams_the_journaled_blocks(tmp_path: Path) -> None:
     journal = Journal(tmp_path / "j.db")
-    await _drive(journal, ScriptedModel(turns=[tool_turn(("a", {}), ("b", {}))]), [envelope()])
+    journaled = JournaledModel(
+        ScriptedModel(turns=[tool_turn(("a", {}), ("b", {}))]), journal, provider="scripted"
+    )
+    with scoped(CallScope(run_id=RUN, branch_id="br-canon", step=0, node_id="agent")):
+        async for _event in journaled.stream(envelope()):
+            pass
     replay = ReplayModel(journal=journal, run_id=RUN)
     events = []
     with scoped(CallScope(run_id=RUN, node_id="agent", step=0)):
@@ -393,6 +398,21 @@ async def test_replay_streams_the_journaled_blocks(tmp_path: Path) -> None:
             events.append(event)
     assert sum(isinstance(e, ToolUseComplete) for e in events) == 2
     assert isinstance(events[-1], TurnComplete)
+
+
+async def test_a_turn_handed_over_whole_is_replayed_whole(tmp_path: Path) -> None:
+    """Asked with ``complete()``, the caller had none of the turn until all of it: a stream
+    that replays it hands over no pieces either -- an early read issued on one would be a
+    call the recorded node never made at that point."""
+    journal = Journal(tmp_path / "j.db")
+    await _drive(journal, ScriptedModel(turns=[tool_turn(("a", {}), ("b", {}))]), [envelope()])
+    replay = ReplayModel(journal=journal, run_id=RUN)
+    events = []
+    with scoped(CallScope(run_id=RUN, node_id="agent", step=0)):
+        async for event in replay.stream(envelope()):
+            events.append(event)
+    assert len(events) == 1 and isinstance(events[0], TurnComplete)
+    assert len(events[0].response.tool_uses) == 2
 
 
 async def test_a_squashed_branch_s_turn_is_never_served_back(tmp_path: Path) -> None:

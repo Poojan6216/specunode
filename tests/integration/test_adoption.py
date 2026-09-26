@@ -500,3 +500,27 @@ async def test_a_run_whose_last_effect_failed_is_still_reported_in_program_order
     ]
     assert ledger.dispatch_order_anomalies == 0
     assert "in program order" in render_ledger(ledger)
+
+
+@pytest.mark.timeout(60)
+async def test_a_guess_adopted_by_a_closed_branch_stages_nothing(tmp_path: Path) -> None:
+    """A node stopped -- a served turn abandoned, or the run ending -- has its branch closed to
+    writes. A guess it had adopted checked only its own branch, and what it staged after the
+    stop was routed into the closed one. Suspected by the seventeenth review."""
+    from specunode.core.branch import Branch, BranchClosed, BranchStatus
+
+    journal = Journal(tmp_path / "closed-owner.db")
+    buffer = StoreBuffer(journal=journal, run_id=new_ulid())
+    registry = registry_for(standard_world())
+    parent = Branch(id=new_ulid())
+    child = parent.fork(new_ulid(), predicted=ToolCall("restart_job", {"job_id": "etl-1"}), step=0)
+    parent.status = BranchStatus.CONFIRMED
+    child.confirm()
+    assert await buffer.adopt(child, parent) == 0
+
+    buffer.close(parent)
+    with pytest.raises(BranchClosed):
+        await buffer.stage(
+            child, ToolCall("restart_job", {"job_id": "etl-1"}), registry.get("restart_job")
+        )
+    assert buffer.pending(parent.id) == ()

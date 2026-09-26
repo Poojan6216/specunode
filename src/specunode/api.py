@@ -162,7 +162,9 @@ class Runtime:
     async def resume(self, run_id: str, *, ask_abandoned: bool = False) -> RunResult:
         """Continue a run a crash interrupted, without sending again what already went out.
 
-        ``ask_abandoned`` asks the model again for a turn the crashed run had stopped waiting
-        for, instead of stopping the node there with ``TurnAbandoned``; its answer may differ.
+        ``ask_abandoned``: where a node keeps waiting on a turn the crashed run had stopped
+        waiting for, the model is asked again, live, at the point the node would be stopped
+        with ``TurnAbandoned`` -- that turn only, and not one the node stops waiting for again
+        as the crashed run did. Its answer may differ from what was acted on.
         """
         return await self.scheduler().resume(run_id, ask_abandoned=ask_abandoned)

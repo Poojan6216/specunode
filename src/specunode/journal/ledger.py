@@ -118,6 +118,25 @@ _PAYLOAD_VERSION: Final = 2
 
 EffectStatus = Literal["DISPATCHED", "DEAD_LETTER", "COMPENSATED"]
 
+
+@dataclass(frozen=True, slots=True)
+class UnsettledEffect:
+    """An effect that may have reached the world and that nothing has settled.
+
+    Claimed and never settled -- the process died with it out -- or dead-lettered with no proof
+    that its request never left. Read from the claim table, which is not signed.
+    """
+
+    tool: str
+    nkey: str
+    key: str
+    effect_id: str
+    branch_id: str
+    #: ``"in_flight"`` or ``"dead_letter"``.
+    status: str
+    args: Mapping[str, JsonValue] = field(default_factory=dict)
+
+
 _ELLIPSIS: Final = "…"
 _MAX_EFFECT_CELL: Final = 60
 #: 8 hex, not section 2's illustrative 4: four hex digits collide with probability ~26% over
@@ -374,10 +393,11 @@ class Ledger:
     terminal: bool = False
     #: ``""`` means unsigned, which is never conflated with forged.
     signature: str = ""
-    #: Effects claimed for sending and never settled: each may or may not have reached the
-    #: world. Read from the claim table, not the chain, so not signed; rendered, because a
-    #: ledger that listed only what settled hid a charge an earlier attempt may have made.
-    in_flight: tuple[str, ...] = ()
+    #: Effects that may have reached the world and that nothing has settled -- claimed and
+    #: never settled, or dead-lettered without proof they never left. Read from the claim
+    #: table, not the chain, so not signed; rendered, and in ``--json``, because a ledger that
+    #: listed only what settled hid a charge an earlier attempt may have made.
+    unsettled: tuple[UnsettledEffect, ...] = ()
 
     @property
     def context_identity(
@@ -442,13 +462,31 @@ def journal_head(entries: Iterable[Entry], run_id: str) -> JournalPosition:
 
 
 def build_ledger(journal: Journal, run_id: str) -> Ledger:
-    """Render a run's ledger from its journal: its entries, and the claims never settled."""
+    """Render a run's ledger from its journal: its entries, and the effects never settled."""
     ledger = build_ledger_from_entries(journal.read(run_id), run_id)
-    in_flight = tuple(
-        f"{claim.get('tool', '?')} {str(claim.get('nkey', ''))[:12]}"
-        for claim in journal.unresolved_dispatches(run_id)
-    )
-    return replace(ledger, in_flight=in_flight) if in_flight else ledger
+    claims = journal.unsettled_dispatches(run_id)
+    if not claims:
+        return ledger
+    staged = {
+        str(entry.payload.get("effect_id")): entry.payload
+        for entry in journal.read(run_id, kinds=["effect_staged"])
+    }
+    unsettled = []
+    for claim in claims:
+        effect_id = str(claim.get("effect_id", ""))
+        args = staged.get(effect_id, {}).get("args")
+        unsettled.append(
+            UnsettledEffect(
+                tool=str(claim.get("tool", "?")),
+                nkey=str(claim.get("nkey", "")),
+                key=str(claim.get("idem_key", "")),
+                effect_id=effect_id,
+                branch_id=str(claim.get("branch_id", "")),
+                status=str(claim.get("status", "")),
+                args=dict(args) if isinstance(args, Mapping) else {},
+            )
+        )
+    return replace(ledger, unsettled=tuple(unsettled))
 
 
 def build_ledger_from_entries(entries: Iterable[Entry], run_id: str) -> Ledger:
@@ -1394,12 +1432,7 @@ def render_ledger(
         )
     else:
         lines.append("(no effects reached the world)")
-    if ledger.in_flight:
-        lines.append(
-            f"MAY HAVE BEEN SENT: {len(ledger.in_flight)} effect(s) claimed and never settled -- "
-            "check the upstream, then `specunode resolve <run> <key> --landed` or `--not-sent`:"
-        )
-        lines.extend(f"  {claim}" for claim in ledger.in_flight)
+    lines.extend(_render_unsettled(ledger, ellipsis=ellipsis))
 
     lines.extend(_summary(ledger, ellipsis=ellipsis, equivalence_digest=equivalence_digest))
     return "\n".join(lines) + "\n"
@@ -1477,11 +1510,30 @@ def _summary(ledger: Ledger, *, ellipsis: str, equivalence_digest: str | None) -
     return lines
 
 
+def _render_unsettled(ledger: Ledger, *, ellipsis: str, keys: bool = True) -> list[str]:
+    """The effects that may have been sent and were never settled, however the ledger is
+    shown: a view that left them out showed a world that may not be the one there is."""
+    if not ledger.unsettled:
+        return []
+    lines = [
+        f"MAY HAVE BEEN SENT: {len(ledger.unsettled)} effect(s) never settled -- check the "
+        "upstream, then `specunode resolve <run> <key> --landed` or `--not-sent`:"
+    ]
+    for effect in ledger.unsettled:
+        how = "dead letter" if effect.status == "dead_letter" else "claimed, no reply"
+        key = f" {_short(effect.nkey, ellipsis=ellipsis, width=12)}" if keys else ""
+        lines.append(f"  {effect.tool}{key}  ({how})")
+    return lines
+
+
 def _render_normalised(ledger: Ledger, *, ellipsis: str) -> str:
-    """Exactly the fields the equivalence relation keeps, in the order it compares them."""
+    """Exactly the fields the equivalence relation keeps, in the order it compares them --
+    and, below them, any effect that may have been sent and was never settled, which the
+    relation refuses to compare past."""
     lines = [f"EFFECT LEDGER (normalised)  n={len(ledger.rows)}"]
     if not ledger.rows:
         lines.append("(no effects reached the world)")
+        lines.extend(_render_unsettled(ledger, ellipsis=ellipsis, keys=False))
         return "\n".join(lines) + "\n"
     table = [
         [
@@ -1497,4 +1549,5 @@ def _render_normalised(ledger: Ledger, *, ellipsis: str) -> str:
     for cells in table:
         cells[0] = cells[0].rjust(width)
     lines.extend(_columns(table, ["#".rjust(width), "effect", "node@step", "decided-by", "status"]))
+    lines.extend(_render_unsettled(ledger, ellipsis=ellipsis, keys=False))
     return "\n".join(lines) + "\n"

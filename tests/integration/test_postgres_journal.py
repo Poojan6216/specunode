@@ -397,3 +397,39 @@ async def test_a_run_that_lost_its_lock_between_attempts_sends_nothing_more(path
     assert "lost its lock" in outcome, outcome
     # Nor does it write that it finished: another process may be driving the run by now.
     assert not list(journal.read(run_id, kinds=["run_finished"]))
+
+
+def test_a_read_only_command_leaves_a_database_that_is_not_a_journal_alone() -> None:
+    """Pointed at an application's own Postgres database, ``runs`` and ``status`` created the
+    journal's tables in it: only a file was looked at first. Found by the seventeenth review."""
+    psycopg = pytest.importorskip("psycopg")
+    import uuid
+
+    from typer.testing import CliRunner
+
+    from specunode.cli import app
+
+    dsn = os.environ["SPECUNODE_TEST_POSTGRES_DSN"]
+    schema = f"app_{uuid.uuid4().hex[:10]}"
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"CREATE TABLE {schema}.customers (id text PRIMARY KEY)")
+    joiner = "&" if "?" in dsn else "?"
+    app_dsn = f"{dsn}{joiner}options=-csearch_path%3D{schema}"
+    try:
+        for args in (["runs"], ["status", "01ANYRUNAAAAAAAAAAAAAAAAAA"]):
+            result = CliRunner().invoke(app, [*args, "--journal", app_dsn])
+            assert result.exit_code == 2, result.output
+            assert "is not a SpecuNode journal" in result.output, result.output
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema = %s",
+                    (schema,),
+                )
+            ]
+        assert tables == ["customers"], tables
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(f"DROP SCHEMA {schema} CASCADE")

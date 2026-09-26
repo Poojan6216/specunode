@@ -39,10 +39,14 @@ and whether it is resumable at all. Options: `--journal`.
 ### `specunode ledger RUN_ID`
 
 Print a run's effect ledger: what reached the world, and what authorised it -- and, marked MAY
-HAVE BEEN SENT, any effect claimed for sending whose outcome was never recorded. Options:
-`--journal`; `--short` abbreviates ids; `--normalised` renders only what the equivalence
-relation compares, so two runs can be diffed; `--json` emits the rows (effect id, tool,
-arguments, idempotency key, branch, authorising step, status) as JSON instead.
+HAVE BEEN SENT, any effect that may have reached the upstream and that nothing has settled: one
+claimed for sending whose reply never came, or one dead-lettered without proof it never left.
+Every view shows them. Options: `--journal`; `--short` abbreviates ids; `--normalised` renders
+only what the equivalence relation compares, so two runs can be diffed, and below it any effect
+that may have been sent -- the relation refuses to compare a run that has one; `--json` emits
+the rows (effect id, tool, arguments, idempotency key, branch, authorising step, status, and
+`unsettled`: whether it may have been sent with nothing settling it) as JSON instead, with an
+`IN_FLIGHT` row for each effect claimed and never answered.
 
 ### `specunode verify RUN_ID`
 
@@ -78,17 +82,21 @@ happened with `specunode resolve`. A node that runs again is served any model an
 already have sent something, rather than asked for it again. This needs a live target, because
 an answer the journal does not hold, or one that sent nothing, is asked for. A model turn that
 failed -- cut off, refused, overloaded -- is recorded as the failure it was and served again as
-that failure, so a node that caught it and asked again is matched with its second question. A run
-is driven by one process at a time: resuming one that another process is running exits 2, as
+that failure, so a node that caught it and asked again is matched with its second question. A
+run is driven by one process at a time: resuming one that another process is running exits 2, as
 does one whose Postgres run lock was lost while it ran, an unknown run, one that never recorded
-its start, and a LangGraph run, which cannot be resumed in this version. Prints the ledger; exits 1 if the run did not complete and 2 if the
-config is missing, unreadable, or cannot build the graph or the target. A turn the crashed run
-had stopped waiting for is served as one that never answers, and a node that keeps waiting ends
-with `TurnAbandoned` -- every time, until someone decides: `--ask-abandoned` asks the model again
-for it instead, live, knowing its answer may differ from what was acted on. A resume that
-finishes while an effect an earlier attempt claimed was never settled does not report success:
-it names the tools, for `specunode resolve`. Options: `--journal`; `--config PATH`;
-`--ask-abandoned`.
+its start, and a LangGraph run, which cannot be resumed in this version. Prints the ledger;
+exits 1 if the run did not complete and 2 if the config is missing, unreadable, or cannot build
+the graph or the target. A turn the crashed run had stopped waiting for is served as one that
+never answers, and a node that keeps waiting well past that ends with `TurnAbandoned` -- every
+time, until someone decides: `--ask-abandoned` asks the model again instead, live, at the point
+the node would be stopped, knowing its answer may differ from what was acted on. Only that turn:
+one the node stops waiting for again, as the crashed run did, is served as it was; and a
+streamed turn part of which was already handed over is not asked again part-way -- the node is
+stopped. A resume that finishes while an effect may have been sent and nothing settled it --
+claimed by an earlier attempt and never answered, or dead-lettered without proof it never left
+-- does not report success: it names the tools, for `specunode resolve`. Options: `--journal`;
+`--config PATH`; `--ask-abandoned`.
 
 ### `specunode resolve RUN_ID KEY`
 

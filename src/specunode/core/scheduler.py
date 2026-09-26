@@ -378,15 +378,18 @@ class Scheduler:
             self._park_events[branch_id] = event
         return event
 
-    def _halt_node(self, branch: Branch) -> None:
+    def _halt_node(self, branch: Branch, reason: str) -> None:
         """Stop a node whose served turn was abandoned: no more writes, and no more model asks.
 
         Its ``finally`` and ``async with`` exits still run, and a write staged there went out --
         decided on the very path the runtime had just judged not to be the recorded one; a
         model ask there went live. A run cancelled from outside closed the branch first; this
-        does the same.
+        does the same. The first reason is kept, and it is what the run reports: a ``finally``
+        refused on its way out raised its own error, and the reason -- and the way past it --
+        were lost.
         """
         branch.abandoned = True
+        branch.abandoned_reason = branch.abandoned_reason or reason
         self.buffer.close(branch)
 
     def mark_parked(self, branch: Branch) -> None:
@@ -736,10 +739,10 @@ class Scheduler:
         self.run_id = run_id
         self.buffer.run_id = run_id
         self.buffer.scheduler_task = asyncio.current_task()
-        # ``ask_abandoned``: a turn the recorded node stopped waiting for is asked for again,
-        # live, instead of served as one that never answers -- the operator's way past a resume
-        # that is abandoned every time, knowing the new answer may differ.
-        recorded = RecordedTurns(self.journal, run_id, serve_cancelled=not ask_abandoned)
+        # ``ask_abandoned``: a turn the recorded node stopped waiting for, and this one waits for
+        # well past that, is asked for again, live, instead of ending the node -- the operator's
+        # way past a resume that is abandoned every time, knowing the new answer may differ.
+        recorded = RecordedTurns(self.journal, run_id, ask_abandoned=ask_abandoned)
         # Any target that offers it: JournaledModel does, and a wrapper can pass it through.
         # One that does not is asked every question again, and run_started says so.
         serve = getattr(self.target, "serve_recorded", None)
@@ -861,7 +864,7 @@ class Scheduler:
             node_id=node_id,
             record_prompt=branch.record_prompt,
             track_turn=branch.track_turn,
-            halt=lambda: self._halt_node(branch),
+            halt=lambda reason: self._halt_node(branch, reason),
             halted=lambda: branch.abandoned,
             node_started=time.monotonic(),
             # Whether this request is being sent on a guess. Always False before, which made
@@ -1243,7 +1246,7 @@ class Scheduler:
             node_id=node_id,
             record_prompt=branch.record_prompt,
             track_turn=branch.track_turn,
-            halt=lambda: self._halt_node(branch),
+            halt=lambda reason: self._halt_node(branch, reason),
             halted=lambda: branch.abandoned,
             node_started=time.monotonic(),
             # Whether this request is being sent on a guess. Always False before, which made
@@ -1334,18 +1337,27 @@ class Scheduler:
                 # stops, and the run reports the node's own error. Only the status lie is
                 # removed. This is the mirror image of the ``_timed_read`` status race -- that
                 # one could promote a squashed branch, this one demotes a confirmed one.
+                reason = f"{type(exc).__name__}: {exc}"
+                if branch.abandoned_reason:
+                    # Stopped, it may have run into the stop on its way out -- a ``finally``
+                    # that wrote -- and that error replaced the reason it was stopped.
+                    reason = f"{TurnAbandoned.__name__}: {branch.abandoned_reason}" + (
+                        ""
+                        if isinstance(exc, TurnAbandoned) and str(exc) == branch.abandoned_reason
+                        else f" -- and on its way out, {type(exc).__name__}: {exc}"
+                    )
                 if branch.status is not BranchStatus.CONFIRMED:
-                    branch.squash(f"{type(exc).__name__}: {exc}")
+                    branch.squash(reason)
                 else:
-                    branch.reason = f"{type(exc).__name__}: {exc}"
+                    branch.reason = reason
                 return BranchOutcome.FAULTED
             if branch.abandoned:
                 # Stopped -- a turn it was served was abandoned -- and it returned all the same:
                 # it caught ``TurnAbandoned``. What it decided on that path was not the recorded
                 # run's; committed, the run went on from it and reported success.
                 reason = (
-                    f"{TurnAbandoned.__name__}: the node was stopped when a turn it was served "
-                    "was abandoned, and returned anyway; what it decided is not committed"
+                    f"{TurnAbandoned.__name__}: {branch.abandoned_reason} -- and the node caught "
+                    "it and returned; what it decided is not committed"
                 )
                 if branch.status is not BranchStatus.CONFIRMED:
                     branch.squash(reason)
@@ -1929,14 +1941,16 @@ class Scheduler:
 
         A resumed node that makes a different call leaves the dead process's claim for the
         first in flight, and nothing ever settles it: the run reported plain success, and the
-        ledger showed only the second -- while the world may hold both.
+        ledger showed only the second -- while the world may hold both. A dead letter whose
+        request may have left is the same: its run stopped for a human, and a resume whose node
+        no longer made that call reported success over it. One demonstrably never sent is not.
         """
-        unresolved = await asyncio.to_thread(self.journal.unresolved_dispatches, self.run_id)
-        if not ok or not unresolved:
+        unsettled = await asyncio.to_thread(self.journal.unsettled_dispatches, self.run_id)
+        if not ok or not unsettled:
             return ok, error
-        tools = ", ".join(sorted({str(claim.get("tool", "?")) for claim in unresolved}))
+        tools = ", ".join(sorted({str(claim.get("tool", "?")) for claim in unsettled}))
         return False, (
-            f"the run finished, but {len(unresolved)} effect(s) an earlier attempt claimed "
+            f"the run finished, but {len(unsettled)} effect(s) an earlier attempt claimed "
             f"({tools}) may have been sent and were never settled -- check the upstream, and "
             "record what happened with `specunode resolve <run> <key> --landed` or `--not-sent`"
         )

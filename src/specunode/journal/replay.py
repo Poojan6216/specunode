@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from specunode.canonical import JsonValue
 from specunode.core.branch import StepCursor
 from specunode.core.model import (
+    REPLAY_HINT,
     CallScope,
     Message,
     ModelError,
@@ -33,13 +34,11 @@ from specunode.core.model import (
     RequestEnvelope,
     StreamEvent,
     TextBlock,
-    TextDelta,
     ToolResultBlock,
-    ToolUseBlock,
-    ToolUseComplete,
     TurnComplete,
     _abandon_after_s,
     _Pacer,
+    _served_events,
     _served_never_answers,
     _sleep_until,
     current_scope,
@@ -105,7 +104,7 @@ class JournaledTurn:
     request_id: str = ""
     latency_ms: int = 0
     node_ms: int = 0
-    block_ms: tuple[int, ...] = ()
+    pieces: tuple[tuple[int, int, int], ...] | None = None
     #: The entry its outcome was recorded in -- where it came back among its attempt's other
     #: turns. That attempt's own entry, not the one a turn it was served was first recorded in:
     #: those kept an earlier attempt's order while the turns it asked live took new offsets, so
@@ -254,7 +253,7 @@ class ReplayModel:
                 request_id=str(request_id),
                 latency_ms=_as_latency(payload.get("latency_ms")),
                 node_ms=_as_latency(payload.get("node_ms")),
-                block_ms=_as_block_ms(payload.get("block_ms")),
+                pieces=_as_pieces(payload.get("pieces")),
                 offset=entry.offset,
             )
             outcomes[str(request_id)] = (key, turn)
@@ -302,7 +301,7 @@ class ReplayModel:
         try:
             asked_at = time.monotonic()
             if turn.cancelled:
-                await _served_never_answers(_recorded(turn), scope)
+                await _served_never_answers(_recorded(turn), scope, REPLAY_HINT)
             await self._pacer.due(key, turn.offset, asked_at, turn.latency_ms, scope)
         finally:
             # However the call ended: a later answer of the node may be waiting for this one.
@@ -325,18 +324,14 @@ class ReplayModel:
         try:
             asked_at = time.monotonic()
             response = turn.response
-            for index, block in enumerate(response.content):
-                at = turn.block_ms[index] if index < len(turn.block_ms) else -1
+            # The pieces the recorded caller had, text too, as a live stream and a served one
+            # hand them over: a node that stopped reading on a piece of text never saw it here.
+            for at, event in _served_events(response, turn.pieces):
                 if at >= 0:
                     await _sleep_until(asked_at + at / 1000.0)
-                if isinstance(block, ToolUseBlock):
-                    yield ToolUseComplete(index=index, block=block)
-                elif isinstance(block, TextBlock):
-                    # Text too, as a live stream and a served one emit it: a node that stopped
-                    # reading on a piece of text never saw it here, and waited on for the rest.
-                    yield TextDelta(index=index, text=block.text)
+                yield event
             if turn.cancelled:
-                await _served_never_answers(_recorded(turn), scope)
+                await _served_never_answers(_recorded(turn), scope, REPLAY_HINT)
             await self._pacer.due(key, turn.offset, asked_at, turn.latency_ms, scope)
         finally:
             # However the stream ended -- read to its end, closed part-way, abandoned.
@@ -388,10 +383,12 @@ class RecordedTurns:
     journal: Journal
     run_id: str
     role: str = "target"
-    #: False to ask the model again, live, for a turn the recorded node stopped waiting for,
-    #: instead of serving it as one that never answers -- an operator's way past a resume that
-    #: keeps being abandoned, knowing the new answer may differ from what was acted on.
-    serve_cancelled: bool = True
+    #: Ask a turn the recorded node stopped waiting for again, live, once the resumed node has
+    #: waited for it well past that, instead of stopping the node there -- an operator's way past
+    #: a resume that keeps being abandoned, knowing the new answer may differ from what was acted
+    #: on. Only then: asked at once, every turn the recorded node had given up on was answered,
+    #: including ones it would have given up on again, and it went down a path no run took.
+    ask_abandoned: bool = False
     #: Per (node, position), each attempt's pinned turns as (request hash, turn), in the order
     #: they were asked; attempts oldest first.
     _attempts: dict[tuple[str, int], list[list[tuple[str, RecordedTurn]]]] = field(
@@ -446,7 +443,7 @@ class RecordedTurns:
                 cancelled=payload.get("cancelled") is True,
                 latency_ms=_as_latency(payload.get("latency_ms")),
                 node_ms=_as_latency(payload.get("node_ms")),
-                block_ms=_as_block_ms(payload.get("block_ms")),
+                pieces=_as_pieces(payload.get("pieces")),
                 attempt=branch,
                 order=entry.offset,
             )
@@ -520,8 +517,6 @@ class RecordedTurns:
             ):
                 asked.append(digest)
                 turn = turns[index][1]
-                if turn.cancelled and not self.serve_cancelled:
-                    return None  # asked live, and the questions after it still matched
                 self._pacer.taken(
                     _pace_key(scope, turn.attempt),
                     turn.order,
@@ -569,10 +564,20 @@ def _as_latency(value: JsonValue) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _as_block_ms(value: JsonValue) -> tuple[int, ...]:
+def _as_pieces(value: JsonValue) -> tuple[tuple[int, int, int], ...] | None:
+    """A turn's recorded pieces; ``None`` if it was recorded before they were."""
     if not isinstance(value, Sequence) or isinstance(value, str):
-        return ()
-    return tuple(v if isinstance(v, int) and not isinstance(v, bool) else -1 for v in value)
+        return None
+    pieces: list[tuple[int, int, int]] = []
+    for piece in value:
+        if (
+            isinstance(piece, Sequence)
+            and not isinstance(piece, str)
+            and len(piece) == 3
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in piece)
+        ):
+            pieces.append((int(piece[0]), int(piece[1]), int(piece[2])))  # type: ignore[arg-type]
+    return tuple(pieces)
 
 
 def _recorded(turn: JournaledTurn) -> RecordedTurn:
@@ -583,7 +588,7 @@ def _recorded(turn: JournaledTurn) -> RecordedTurn:
         cancelled=turn.cancelled,
         latency_ms=turn.latency_ms,
         node_ms=turn.node_ms,
-        block_ms=turn.block_ms,
+        pieces=turn.pieces,
     )
 
 
