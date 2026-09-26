@@ -746,3 +746,131 @@ async def test_a_resume_that_keeps_waiting_where_the_run_gave_up_stops_and_says_
     )
     assert not resumed.ok and TurnAbandoned.__name__ in (resumed.error or ""), resumed.error
     assert asked_live.asked == [] and charged == [25.0]
+
+
+async def test_a_node_cannot_catch_the_abandonment_and_charge_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The node falls back to another question on any ``Exception``. ``TurnAbandoned`` was one,
+    so a resume that gave up on a question its node no longer stopped waiting for handed the
+    node an error it caught -- and it asked the fallback live and charged again; the abandoned
+    question had no outcome either, so the next resume asked live again. It ends the node now,
+    and is recorded. Found by the fifteenth review."""
+    from specunode.core import model as model_module
+    from specunode.core.model import TurnAbandoned
+
+    monkeypatch.setattr(model_module, "_ABANDON_MARGIN_S", 0.1)
+    cache = {"hit": True}
+    charged: list[float] = []
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        charged.append(amount)
+        return {"charge_id": f"ch_{len(charged)}"}
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        asking = asyncio.create_task(session.call_turn(SMALL))  # type: ignore[misc]
+        await asyncio.sleep(0.05)
+        if cache["hit"]:
+            asking.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asking
+            await session.call_tool("charge_card", {"customer_id": "cus-1", "amount": 25.0})
+        else:
+            try:
+                await asking
+            except Exception:  # any failure at all: fall back to asking again
+                await session.call_turn(ROOMY)  # type: ignore[misc]
+        session.state["billed"] = True
+        return ToolCall("charge_card", {})
+
+    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
+    registry = registry_of([charge_card])
+    db = tmp_path / "source.db"
+    run_id = new_ulid()
+    with pytest.raises(Crash):
+        await scheduler(
+            CrashingJournal(db, before_commit_of("bill#0")),
+            adapter,
+            registry,
+            AnswersLate(25.0, slow=True),
+        ).run(run_id, {})
+    await bury_the_dead_process()
+    cache["hit"] = False
+    for _attempt in range(2):
+        asked_live = AnswersLate(30.0, slow=False)
+        resumed = await asyncio.wait_for(
+            scheduler(Journal(db), adapter, registry, asked_live).resume(run_id), timeout=10
+        )
+        assert not resumed.ok and TurnAbandoned.__name__ in (resumed.error or ""), resumed.error
+        assert asked_live.asked == [], "the node asked a question the recorded run never asked"
+        assert charged == [25.0], "a second charge went out"
+    abandoned = [
+        e.payload
+        for e in Journal(db).read(run_id, kinds=["model_response"])
+        if e.payload.get("cancelled") and "recorded_from" in e.payload
+    ]
+    assert abandoned, "the abandoned question has no outcome"
+
+
+async def test_a_second_resume_waits_as_long_as_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A served turn the node stopped waiting for again was journaled with a wait of 0. When
+    that resume went on to send something, the next resume was served from it -- and gave up
+    after the margin alone, before the node's own timeout, which would have fired as it always
+    had. Found by the fifteenth review."""
+    from specunode.core import model as model_module
+
+    monkeypatch.setattr(model_module, "_ABANDON_MARGIN_S", 0.05)
+    receipts = {"send": False}
+    sent: list[str] = []
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        sent.append(f"charge {amount}")
+        return {"charge_id": f"ch_{len(sent)}"}
+
+    @tool(effect="write", idempotent=False)
+    async def send_receipt(customer_id: str) -> JsonValue:
+        sent.append("receipt")
+        return {"sent": True}
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        try:
+            await asyncio.wait_for(session.call_turn(SMALL), timeout=0.2)  # type: ignore[misc]
+        except TimeoutError:
+            await session.call_turn(ROOMY)  # type: ignore[misc]
+        if receipts["send"]:
+            await session.call_tool("send_receipt", {"customer_id": "cus-1"})
+        session.state["billed"] = True
+        return ToolCall("charge_card", {})
+
+    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
+    registry = registry_of([charge_card, send_receipt])
+    db = tmp_path / "source.db"
+    run_id = new_ulid()
+    with pytest.raises(Crash):
+        await scheduler(
+            CrashingJournal(db, before_commit_of("bill#0")),
+            adapter,
+            registry,
+            AnswersLate(25.0, slow=True),
+        ).run(run_id, {})
+    await bury_the_dead_process()
+    receipts["send"] = True  # the first resume sends something new, and dies as well
+    with pytest.raises(Crash):
+        await scheduler(
+            CrashingJournal(db, before_commit_of("bill#0")),
+            adapter,
+            registry,
+            AnswersLate(30.0, slow=False),
+        ).resume(run_id)
+    await bury_the_dead_process()
+    resumed = await scheduler(Journal(db), adapter, registry, AnswersLate(35.0, slow=False)).resume(
+        run_id
+    )
+    assert resumed.ok, resumed.error
+    assert sent == ["charge 25.0", "receipt"]

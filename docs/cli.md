@@ -8,7 +8,9 @@ Without it, the journal is the one the config's `journal` section names -- its `
 to the config file's folder and with `~` expanded, or for `kind: postgres` its `dsn` (or
 `SPECUNODE_JOURNAL_DSN`) -- and without a config, `./.specunode/journal.db`. Every such command
 also takes `--config`, so each can read the journal a `resume --config` used; a config that does
-not load is an error, exit 2, and `--journal` names the journal directly. `--version` (or `-V`)
+not load is an error, exit 2, and `--journal` names the journal directly. A journal that does
+not exist, and a run id it does not hold, are errors too, exit 2 -- never an empty report, and
+never a journal created to report on. `--version` (or `-V`)
 prints the version; `specunode` alone prints this list.
 
 Commands that need a config (`resume`, `replay`, `mcp-proxy`) take `--config PATH`. Without the
@@ -77,8 +79,8 @@ an answer the journal does not hold, or one that sent nothing, is asked for. A m
 failed -- cut off, refused, overloaded -- is recorded as the failure it was and served again as
 that failure, so a node that caught it and asked again is matched with its second question. A run
 is driven by one process at a time: resuming one that another process is running exits 2, as
-does an unknown run, one that never recorded its start, and a LangGraph run, which cannot be
-resumed in this version. Prints the ledger; exits 1 if the run did not complete and 2 if the
+does one whose Postgres run lock was lost while it ran, an unknown run, one that never recorded
+its start, and a LangGraph run, which cannot be resumed in this version. Prints the ledger; exits 1 if the run did not complete and 2 if the
 config is missing, unreadable, or cannot build the graph or the target. Options: `--journal`;
 `--config PATH`.
 

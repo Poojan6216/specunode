@@ -578,11 +578,14 @@ class RecordedTurn:
 #: The outcome recorded for a turn its caller stopped waiting for.
 CANCELLED = "cancelled: the caller stopped waiting before the turn was handed over"
 
-#: How much longer than the recorded caller did a served "never answers" turn waits.
-_ABANDON_MARGIN_S = 5.0
+#: How much longer a served "never answers" turn waits than twice the recorded caller did. The
+#: recorded wait is the model call's alone; a node whose deadline also covers earlier work --
+#: faster on a resume -- stops waiting later into the call, and too short a bound failed a
+#: resume that was doing exactly what it did before.
+_ABANDON_MARGIN_S = 30.0
 
 
-class TurnAbandoned(RuntimeError):
+class TurnAbandoned(BaseException):
     """A resumed or replayed node kept waiting for a turn the recorded run stopped waiting for.
 
     The recorded node gave up on this question -- its timeout fired, or something cancelled
@@ -591,20 +594,33 @@ class TurnAbandoned(RuntimeError):
     forever hung the resume with no word of why; answering from the live model could decide
     differently from what may already have been sent. So it stops here, and says so.
 
-    Not a :class:`ModelError`: a node that caught it and asked again would be asking a question
-    the recorded run never asked.
+    A ``BaseException``, like a cancellation, and not a :class:`ModelError` or any other
+    ``Exception``: it ends the node. As a ``RuntimeError`` it was caught by an ordinary
+    ``except Exception`` fallback, and the node went on to ask something the recorded run never
+    asked -- live, and a card was charged a second time. Do not catch it.
     """
 
 
+def _abandon_after_s(recorded: RecordedTurn) -> float:
+    return 2 * recorded.latency_ms / 1000.0 + _ABANDON_MARGIN_S
+
+
 async def _served_never_answers(recorded: RecordedTurn) -> None:
-    """Wait as the recorded caller did before it stopped, and a margin; then give up, loudly."""
-    waited = recorded.latency_ms / 1000.0
-    await asyncio.sleep(waited + _ABANDON_MARGIN_S)
+    """Wait well past when the recorded caller stopped; then give up, loudly."""
+    await asyncio.sleep(_abandon_after_s(recorded))
     raise TurnAbandoned(
-        f"the run being resumed or replayed stopped waiting for this turn after {waited:.1f} s, "
-        "and this node is still waiting: it is not asking what it asked before -- something "
-        "that shaped it changed -- so it stops here rather than decide anew"
+        "the run being resumed or replayed stopped waiting for this turn after "
+        f"{recorded.latency_ms / 1000.0:.1f} s, and this node is still waiting after "
+        f"{_abandon_after_s(recorded):.0f} s: it is not asking what it asked before -- "
+        "something that shaped it changed -- so it stops here rather than decide anew"
     )
+
+
+def _waited_ms(recorded: RecordedTurn | None, begun: float) -> int:
+    """How long a served turn's caller waited, for its outcome: never less than the recorded
+    wait -- journaled as 0, the next resume gave up after the margin alone."""
+    waited = int((time.monotonic() - begun) * 1000)
+    return max(waited, recorded.latency_ms if recorded is not None else 0)
 
 
 async def _let_finish(writing: asyncio.Future[Any]) -> None:
@@ -832,6 +848,8 @@ class JournaledModel:
             await asyncio.shield(writing)
         except asyncio.CancelledError:
             await _let_finish(writing)
+            if not writing.cancelled():
+                writing.exception()  # retrieved, so a failed write is not reported as unobserved
             await self._cancelled(response, scope, request_id, digest, latency_ms, recorded)
             raise
 
@@ -887,7 +905,8 @@ class JournaledModel:
             await _let_finish(writing)
             if not writing.cancelled() and writing.exception() is None:
                 empty = ModelResponse(model=envelope.model, stop_reason="error")
-                await self._cancelled(empty, scope, writing.result(), digest, 0, recorded)
+                waited = recorded.latency_ms if recorded is not None else 0
+                await self._cancelled(empty, scope, writing.result(), digest, waited, recorded)
             raise
 
     def _in_run(self, scope: CallScope) -> bool:
@@ -907,10 +926,17 @@ class JournaledModel:
             if recorded is not None:
                 served = recorded.response
                 if recorded.cancelled:
+                    begun = time.monotonic()
                     try:
                         await _served_never_answers(recorded)
                     except asyncio.CancelledError:
-                        await self._cancelled(served, scope, request_id, digest, 0, recorded)
+                        waited = _waited_ms(recorded, begun)
+                        await self._cancelled(served, scope, request_id, digest, waited, recorded)
+                        raise
+                    except TurnAbandoned:
+                        # Given an outcome too, so the next resume is served this one again.
+                        waited = recorded.latency_ms
+                        await self._cancelled(served, scope, request_id, digest, waited, recorded)
                         raise
                 await self._outcome(
                     served, scope, request_id, digest, 0, recorded, failed=recorded.failed
@@ -973,6 +999,7 @@ class JournaledModel:
                 # The recorded turn's blocks, in order and with no delay, as a live stream
                 # would emit them -- so early issue sees a served turn as it saw the original.
                 response = recorded.response
+                begun = time.monotonic()
                 try:
                     for index, block in enumerate(response.content):
                         if isinstance(block, ToolUseBlock):
@@ -983,10 +1010,15 @@ class JournaledModel:
                             yield TextDelta(index=index, text=block.text)
                     if recorded.cancelled:
                         await _served_never_answers(recorded)
-                except (asyncio.CancelledError, GeneratorExit) as stopped:
+                except (asyncio.CancelledError, GeneratorExit, TurnAbandoned) as stopped:
                     finalised = isinstance(stopped, GeneratorExit) and not self._in_run(scope)
                     if recorded.cancelled and not finalised:
-                        await self._cancelled(response, scope, request_id, digest, 0, recorded)
+                        waited = (
+                            recorded.latency_ms
+                            if isinstance(stopped, TurnAbandoned)
+                            else _waited_ms(recorded, begun)
+                        )
+                        await self._cancelled(response, scope, request_id, digest, waited, recorded)
                     raise
                 await self._outcome(
                     response, scope, request_id, digest, 0, recorded, failed=recorded.failed

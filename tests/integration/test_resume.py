@@ -294,3 +294,28 @@ async def test_a_run_that_never_recorded_its_start_is_started_not_resumed(tmp_pa
     result = await starter.run(run_id, {"customer_id": "cus-1"})
     assert result.ok, result.error
     assert [m.tool for m in world.mutations] == ["charge_card", "send_receipt"]
+
+
+async def test_a_run_that_failed_is_reported_resumable(tmp_path: Path) -> None:
+    """``status`` said "resumable: False" for a run that finished having failed, while
+    ``resume`` re-ran it -- as it should, a failed node never retired. Found by the fifteenth
+    review."""
+    world = standard_world()
+    adapter, registry = build(world)
+    journal = Journal(tmp_path / "journal.db")
+    failing = Scheduler(
+        graph=adapter,
+        registry=registry,  # type: ignore[arg-type]
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=2, base_delay_ms=0.5),  # type: ignore[arg-type]
+        target=JournaledModel(ScriptedModel(turns=[]), journal, provider="scripted"),
+        policy=Policy(speculation=False),
+    )
+    result = await failing.run(new_ulid(), {"customer_id": "cus-1"})
+    assert not result.ok
+    recovery = recover(journal, result.run_id)
+    assert recovery.finished and recovery.resumable
+    resumer, _ = make(tmp_path, world)
+    assert (await resumer.resume(result.run_id)).ok
+    assert not recover(journal, result.run_id).resumable

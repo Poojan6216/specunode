@@ -257,6 +257,7 @@ def test_the_cli_reads_the_journal_the_config_names(
 def test_resuming_an_unknown_run_is_a_message_not_a_traceback(scene: Path) -> None:
     """The refusal escaped as a traceback and exit 1 -- which says a run did not complete.
     Found by the twelfth review."""
+    Journal(scene / "journal.db")  # a journal, without this run in it
     result = CliRunner().invoke(
         app,
         [
@@ -338,3 +339,20 @@ def test_a_config_that_names_no_journal_leaves_it_where_runs_write_it(
     listed = CliRunner().invoke(app, ["runs"])
     assert listed.output.split() == ["01HERE"], listed.output
     assert not (xdg / "specunode" / ".specunode").exists()
+
+
+@pytest.mark.parametrize("command", ["verify", "status", "ledger"])
+def test_a_read_only_command_refuses_a_run_or_journal_that_is_not_there(
+    tmp_path: Path, command: str
+) -> None:
+    """A mistyped run id was reported on as though it existed -- ``verify`` said the chain of
+    0 entries verified -- and a mistyped journal path was created, empty, to report on. Found
+    by the fifteenth review."""
+    missing = tmp_path / "nowhere.db"
+    absent = CliRunner().invoke(app, [command, "01TYPO", "--journal", str(missing)])
+    assert absent.exit_code == 2 and "no journal at" in absent.output, absent.output
+    assert not missing.exists(), "reading a journal created it"
+    real = tmp_path / "journal.db"
+    Journal(real).append("01REAL", "policy_event", {"v": 1, "event": "e", "reason": "r"})
+    typo = CliRunner().invoke(app, [command, "01TYPO", "--journal", str(real)])
+    assert typo.exit_code == 2 and "no entries" in typo.output, typo.output

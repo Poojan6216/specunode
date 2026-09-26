@@ -1,9 +1,9 @@
-"""The ``specunode`` command-line interface.
+"""The specunode command-line interface.
 
 Every subcommand here answers a question about a run that already happened, or continues one
 that did not finish. None of them decides anything: the journal decides, and these read it.
 
-``replay`` deserves a note. It re-runs a journaled run against :class:`ReplayModel`, which
+replay deserves a note. It re-runs a journaled run against :class:`ReplayModel`, which
 serves the recorded responses and refuses the moment the run would ask the model something the
 journal does not record. By default it dispatches nothing -- a replay that re-sent every effect
 would charge every card again -- and re-dispatching is available only behind an explicit flag
@@ -57,8 +57,8 @@ CONFIG_HELP = f"The config whose journal to read. Defaults to ./{DEFAULT_CONFIG_
 def _load_or_exit(config: Path | None) -> Config:
     """Load a config, reporting a missing or unreadable one rather than raising a traceback.
 
-    An explicit ``--config`` that does not exist is exit 2 with a message. Without the option,
-    the search is ``./specunode.yaml`` then ``$XDG_CONFIG_HOME/specunode/config.yaml``, and
+    An explicit --config that does not exist is exit 2 with a message. Without the option,
+    the search is ./specunode.yaml then $XDG_CONFIG_HOME/specunode/config.yaml, and
     finding nothing means built-in defaults, as it always has.
     """
     if config is not None and not config.is_file():
@@ -74,16 +74,16 @@ def _load_or_exit(config: Path | None) -> Config:
 def _journal_location(
     journal: str | None, config: Path | None = None, loaded: Config | None = None
 ) -> str:
-    """Where a command's journal is: ``--journal``, else the ``journal`` section of the config.
+    """Where a command's journal is: --journal, else the journal section of the config.
 
-    The config is ``--config``, or the one the usual search finds -- the same one ``resume`` and
-    ``replay`` build the run from, so every command reads one journal. A relative ``path`` is
-    taken from the config file's folder, and ``~`` is expanded: left as written, a path in a
+    The config is --config, or the one the usual search finds -- the same one resume and
+    replay build the run from, so every command reads one journal. A relative path is
+    taken from the config file's folder, and ~ is expanded: left as written, a path in a
     config read from elsewhere named a journal nobody had written, relative to wherever the
     command was run.
 
-    A string, never a ``Path``: a Postgres DSN is a location too, and ``Path`` folds its ``//``
-    into ``/``, which turned ``postgresql://host/db`` into a SQLite file named ``postgresql:``.
+    A string, never a Path: a Postgres DSN is a location too, and Path folds its //
+    into /, which turned postgresql://host/db into a SQLite file named postgresql:.
     And the config's section was read by nothing, so a journal configured there was not the
     one any command used.
     """
@@ -107,11 +107,34 @@ def _journal_location(
         return settings.dsn or os.environ.get("SPECUNODE_JOURNAL_DSN", "")
     path = settings.path.expanduser()
     if path.is_absolute() or "path" not in settings.model_fields_set:
-        # A config that names no journal path means the default, where ``Runtime`` writes it:
+        # A config that names no journal path means the default, where Runtime writes it:
         # under the working directory, not under wherever the config was found -- a config in
         # $XDG_CONFIG_HOME sent every command to an empty journal beside it.
         return str(path)
     return str(source.parent / path)
+
+
+def _existing_journal(location: str) -> Journal:
+    """Open a journal a command reads, refusing one that does not exist.
+
+    Opening it creates it: a read-only command given a mistyped path made an empty journal
+    there, and then reported on it -- ``verify`` said the chain verified, over 0 entries.
+    """
+    if not is_postgres_dsn(location) and not Path(location).expanduser().exists():
+        typer.echo(f"no journal at {location}", err=True)
+        raise typer.Exit(2)
+    return Journal(location)
+
+
+def _require_run(book: Journal, run_id: str) -> None:
+    """Refuse a run id this journal has never seen, rather than report on nothing."""
+    if book.last_offset(run_id) is None:
+        typer.echo(
+            f"run {run_id!r} has no entries in this journal; `specunode runs` lists the ones "
+            "it has",
+            err=True,
+        )
+        raise typer.Exit(2)
 
 
 def _version_callback(value: bool) -> None:
@@ -138,7 +161,7 @@ def _root(
 def init(
     directory: Path = typer.Argument(Path(), help="Where to write the config and state."),
 ) -> None:
-    """Write ``specunode.yaml`` and create ``.specunode/``."""
+    """Write specunode.yaml and create .specunode/."""
     directory.mkdir(parents=True, exist_ok=True)
     (directory / ".specunode").mkdir(exist_ok=True)
     target = directory / DEFAULT_CONFIG_NAME
@@ -146,10 +169,10 @@ def init(
         typer.echo(f"{target} already exists; leaving it alone")
     else:
         # Read from inside the package, not from the repo root. It used to resolve
-        # ``parents[2]``, which is the checkout only when running from source: from an
-        # installed wheel that is ``lib/python3.11/``, the file was absent, and the fallback
-        # wrote ``schema_version: 1`` and nothing else -- no ``graph:``, no ``target:``, no
-        # ``tools:``. Every user who installed the package and ran ``init`` got an 18-byte
+        # parents[2], which is the checkout only when running from source: from an
+        # installed wheel that is lib/python3.11/, the file was absent, and the fallback
+        # wrote schema_version: 1 and nothing else -- no graph:, no target:, no
+        # tools:. Every user who installed the package and ran init got an 18-byte
         # config that cannot drive anything. The example was listed in neither the wheel nor
         # the sdist include lists, so the fallback was the only path that ever ran for them.
         example = resources.files("specunode").joinpath("specunode.yaml.example")
@@ -164,7 +187,7 @@ def runs(
     config: Path = typer.Option(None, "--config", help=CONFIG_HELP),
 ) -> None:
     """List the runs this journal holds."""
-    for run_id in Journal(_journal_location(journal, config)).runs():
+    for run_id in _existing_journal(_journal_location(journal, config)).runs():
         typer.echo(run_id)
 
 
@@ -180,7 +203,9 @@ def ledger(
     as_json: bool = typer.Option(False, "--json", help="Emit the rows as JSON."),
 ) -> None:
     """Print a run's effect ledger: what reached the world, and what authorised it."""
-    built = build_ledger(Journal(_journal_location(journal, config)), run_id)
+    book = _existing_journal(_journal_location(journal, config))
+    _require_run(book, run_id)
+    built = build_ledger(book, run_id)
     if as_json:
         typer.echo(
             json.dumps(
@@ -237,7 +262,7 @@ def resume(
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc
 
-    book = Journal(_journal_location(journal, config, loaded))
+    book = _existing_journal(_journal_location(journal, config, loaded))
     scheduler = Scheduler(
         graph=adapter,
         registry=registry,
@@ -295,7 +320,7 @@ def resolve(
         raise typer.Exit(2)
     # The ledger shortens keys with an ellipsis; a key pasted from it keeps one.
     key = key.rstrip("…").rstrip(".")
-    book = Journal(_journal_location(journal, config))
+    book = _existing_journal(_journal_location(journal, config))
     # Either key names the effect: the ledger prints the idempotency key the tool was handed,
     # and the dedupe key is what the claim is filed under. Both lead to the dedupe key.
     names: dict[str, str] = {}
@@ -341,7 +366,7 @@ def replay(
 
     Refuses at the first turn whose request does not match the journal's, naming the step and
     the fields that differ, rather than continuing down a trajectory the recorded run never
-    took. Dispatches nothing unless ``--dispatch`` says otherwise.
+    took. Dispatches nothing unless --dispatch says otherwise.
     """
     import asyncio
 
@@ -362,7 +387,7 @@ def replay(
         raise typer.Exit(2) from exc
 
     location = _journal_location(journal, config, loaded)
-    source = Journal(location)
+    source = _existing_journal(location)
     recovery = recover(source, run_id)
     # A replay re-drives the run from its *beginning*, so it starts from the inputs the
     # journal recorded rather than from the state the run ended in. Starting from the end
@@ -405,7 +430,7 @@ def replay(
 
 
 def _beside(journal: Path | str) -> Path:
-    """The folder files that belong with a journal go in: its own, or ``.specunode`` here."""
+    """The folder files that belong with a journal go in: its own, or .specunode here."""
     if is_postgres_dsn(journal):
         return Path(".specunode")
     return Path(journal).parent
@@ -414,13 +439,13 @@ def _beside(journal: Path | str) -> Path:
 def signature_path(journal: Path | str, run_id: str, explicit: Path | None = None) -> Path:
     """Where a run's ledger signature lives: beside the journal, never inside it.
 
-    Inside is impossible, not merely untidy. The signed payload covers ``journal_head`` and
-    ``journal_entries``, so appending the signature to the journal it signs changes the material
+    Inside is impossible, not merely untidy. The signed payload covers journal_head and
+    journal_entries, so appending the signature to the journal it signs changes the material
     it was computed over and the signature stops verifying against a freshly built ledger.
 
-    This is why ``verify-ledger`` could never verify anything: ``sign-ledger`` echoed the
-    envelope to the terminal and wrote it nowhere, ``build_ledger`` never assigns ``signature``,
-    and so verification returned ``unsigned`` before running any of its four checks.
+    This is why verify-ledger could never verify anything: sign-ledger echoed the
+    envelope to the terminal and wrote it nowhere, build_ledger never assigns signature,
+    and so verification returned unsigned before running any of its four checks.
     """
     if explicit is not None:
         return explicit
@@ -445,7 +470,8 @@ def verify_ledger_command(
     from dataclasses import replace as _replace
 
     location = _journal_location(journal, config)
-    store = Journal(location)
+    store = _existing_journal(location)
+    _require_run(store, run_id)
     built = build_ledger(store, run_id)
     envelope_path = signature_path(location, run_id, signature)
     if envelope_path.is_file():
@@ -471,11 +497,12 @@ def sign_ledger_command(
     """Sign a run's ledger with the local key, creating one on first use.
 
     The envelope is **written to a file**, not only printed. It used to be echoed and stored
-    nowhere, so ``verify-ledger`` rebuilt an unsigned ledger and reported ``unsigned`` on every
+    nowhere, so verify-ledger rebuilt an unsigned ledger and reported unsigned on every
     run that had been signed.
     """
     location = _journal_location(journal, config)
-    store = Journal(location)
+    store = _existing_journal(location)
+    _require_run(store, run_id)
     key = load_or_create_key(keystore)
     signed = sign_ledger(build_ledger(store, run_id), key)
     destination = signature_path(location, run_id, out)
@@ -493,7 +520,9 @@ def verify(
     config: Path = typer.Option(None, "--config", help=CONFIG_HELP),
 ) -> None:
     """Walk a run's hash chain and report the first break, if any."""
-    result = Journal(_journal_location(journal, config)).verify_chain(run_id)
+    book = _existing_journal(_journal_location(journal, config))
+    _require_run(book, run_id)
+    result = book.verify_chain(run_id)
     if result.ok:
         typer.echo(f"ok: {result.entries} entries, chain verified")
         return
@@ -508,7 +537,9 @@ def status(
     config: Path = typer.Option(None, "--config", help=CONFIG_HELP),
 ) -> None:
     """Say what a run left behind, and what a resume would build on."""
-    recovery = recover(Journal(_journal_location(journal, config)), run_id)
+    book = _existing_journal(_journal_location(journal, config))
+    _require_run(book, run_id)
+    recovery = recover(book, run_id)
     typer.echo(f"run {run_id}")
     typer.echo(f"  finished: {recovery.finished}")
     typer.echo(f"  entries through offset: {recovery.last_offset}")
@@ -546,7 +577,7 @@ def mcp_proxy(
 
     Reads are forwarded immediately. Everything else is held. Because the proxy cannot see the
     model, the decision arrives out of band -- from a client that reports it, or from
-    a second call to the proxy's own ``specunode.retire`` tool. That needs a client which can
+    a second call to the proxy's own specunode.retire tool. That needs a client which can
     issue one while a write is outstanding; a single-threaded client blocked on the write
     cannot, and its call gives up after the proxy's decision deadline with the write still
     held and unsent.
@@ -558,7 +589,7 @@ def mcp_proxy(
     from specunode.integrations.mcp_proxy import ClientMode, ProxyState, serve
 
     # An explicit path that does not exist is an error, not a reason to load something else.
-    # This used to fall back to ``find_config()`` -- ./specunode.yaml, then
+    # This used to fall back to find_config() -- ./specunode.yaml, then
     # $XDG_CONFIG_HOME/specunode/config.yaml -- so a typo in the path silently proxied with a
     # different override table and said nothing about which file it had read.
     if config is not None and not config.is_file():

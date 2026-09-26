@@ -601,6 +601,8 @@ class Recovery:
     #: Whether the run recorded its start. Nothing is sent before it does, so a run that did not
     #: sent nothing -- and its inputs are recorded there, so it cannot be resumed without them.
     started: bool = False
+    #: Whether its last "finished" said it failed.
+    failed: bool = False
 
     @property
     def exists(self) -> bool:
@@ -617,7 +619,8 @@ class Recovery:
 
     @property
     def resumable(self) -> bool:
-        return self.started and (not self.finished or bool(self.confirmed_not_retired))
+        unfinished = not self.finished or self.failed
+        return self.started and (unfinished or bool(self.confirmed_not_retired))
 
 
 def _cursor_from(payload: JsonValue, fallback: StepCursor) -> StepCursor:
@@ -661,6 +664,7 @@ def recover(journal: Journal, run_id: str) -> Recovery:
     # nothing to apply to.
     inputs: dict[str, JsonValue] = {}
     started = False
+    failed = False
 
     for entry in journal.read(run_id):
         last_offset = entry.offset
@@ -671,6 +675,9 @@ def recover(journal: Journal, run_id: str) -> Recovery:
             inputs = dict(raw) if isinstance(raw, Mapping) else {}
         elif entry.kind == "run_finished":
             finished = True
+            # The last one's word: a run that failed can be resumed -- a resume re-runs what
+            # did not retire -- and "resumable: False" said otherwise while resume went ahead.
+            failed = payload.get("ok") is False
         elif entry.kind == "group_forked":
             group_id = payload.get("group_id")
             if isinstance(group_id, str):
@@ -758,6 +765,7 @@ def recover(journal: Journal, run_id: str) -> Recovery:
         finished=finished,
         open_group=open_group,
         started=started,
+        failed=failed,
     )
 
 

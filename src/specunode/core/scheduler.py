@@ -1398,7 +1398,8 @@ class Scheduler:
                 return ok, undrained, None
             self._park_event(branch.id).clear()
             outcome = await self._quiesce(branch, task)
-            checked, went_stale = await self._recheck_reads(branch, checked)
+            finished = outcome is not BranchOutcome.PARKED
+            checked, went_stale = await self._recheck_reads(branch, checked, finished=finished)
             if went_stale is not None:
                 return ok, undrained, went_stale
             if outcome is not BranchOutcome.PARKED:
@@ -1414,7 +1415,9 @@ class Scheduler:
                 self.counters.effects_dead_lettered += final.count(EffectOutcome.DEAD_LETTER)
                 return ok and final.ok, final.undrained, None
 
-    async def _recheck_reads(self, branch: Branch, checked: int) -> tuple[int, str | None]:
+    async def _recheck_reads(
+        self, branch: Branch, checked: int, *, finished: bool = False
+    ) -> tuple[int, str | None]:
         """Check the reads a node made since its last check, before its next write is sent.
 
         Returns how many reads are now checked, and -- if one went stale and the policy says
@@ -1452,9 +1455,17 @@ class Scheduler:
             detail = f"{later.stale} read(s) stale and {later.unreadable} unreadable"
         detail += " after its first write was sent"
         if discarded:
-            detail += f", so the {discarded} write(s) it staged since were discarded, unsent"
+            detail += (
+                f", so the {discarded} write(s) it staged since were discarded, unsent, and it "
+                "is stopped there"
+            )
+        elif finished:
+            detail += (
+                "; it had finished, with nothing more to send, but what it did with that read "
+                "is not committed"
+            )
         else:
-            detail += ", before it finished; it had nothing more to send"
+            detail += ", and it is stopped there"
         return checked, detail
 
     async def _retire(
@@ -1556,7 +1567,7 @@ class Scheduler:
             self.buffer.close(branch)
             if isinstance(task, asyncio.Task) and not task.done():
                 task.cancel()
-                await asyncio.wait({task})
+                await asyncio.wait({task}, timeout=_STOP_GRACE_S)
             raise
 
         if went_stale is not None:
@@ -1567,8 +1578,7 @@ class Scheduler:
                 task.cancel()
                 await asyncio.wait({task})
             raise SchedulerError(
-                f"node {node_id}: {went_stale}. It is stopped there; a resume runs it again, "
-                "on fresh reads"
+                f"node {node_id}: {went_stale}. A resume runs it again, on fresh reads"
             )
         if isinstance(task, asyncio.Task) and not task.done():
             # Refuse its next write before cancelling it, and wait for it to stop: a node left

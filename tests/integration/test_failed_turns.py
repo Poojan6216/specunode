@@ -394,8 +394,8 @@ async def test_a_run_whose_confirmed_guess_was_discarded_is_not_reported_in_flig
 ) -> None:
     """The turn fails after confirming a guess, and the node lets the failure end the run. The
     guess's resolution stayed "confirmed", which recovery reads as a drain the process died in:
-    a run that sent nothing was reported resumable, with a branch that might have sent
-    something. Found by the twelfth review."""
+    a run that sent nothing was reported with a branch that might have sent something. Found by
+    the twelfth review."""
     from specunode.journal.replay import recover
 
     async def gives_up(session: RunSession) -> None:
@@ -405,7 +405,9 @@ async def test_a_run_whose_confirmed_guess_was_discarded_is_not_reported_in_flig
     assert not result.ok
     assert world.mutations == []
     recovery = recover(journal, result.run_id)
-    assert recovery.confirmed_not_retired == () and not recovery.resumable
+    # Resumable -- it failed, and a resume re-runs what did not retire -- but not because a
+    # drain might have been in flight: there is no confirmed, unretired branch.
+    assert recovery.confirmed_not_retired == ()
     resolved = journal.read(result.run_id, kinds=["branch_resolved"])
     resolutions = [(e.payload["status"], e.payload.get("reason")) for e in resolved]
     assert ("squashed", "turn_failed") in resolutions, resolutions
