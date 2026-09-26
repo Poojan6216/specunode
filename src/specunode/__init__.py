@@ -41,6 +41,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "RunResult": ("specunode.core.scheduler", "RunResult"),
     "ToolDispatchError": ("specunode.buffer.dispatcher", "ToolDispatchError"),
     "ModelError": ("specunode.core.model", "ModelError"),
+    "TurnAbandoned": ("specunode.core.model", "TurnAbandoned"),
     "AnthropicModel": ("specunode.integrations.anthropic", "AnthropicModel"),
 }
 
@@ -56,6 +57,7 @@ __all__ = [
     "Runtime",
     "ToolCall",
     "ToolDispatchError",
+    "TurnAbandoned",
     "__version__",
     "agent_loop",
     "current_idempotency_key",
@@ -71,7 +73,7 @@ if TYPE_CHECKING:  # the same names, for type checkers and editors
     from specunode.core.effects import EffectClass
     from specunode.core.graph import RunSession
     from specunode.core.loop import agent_loop
-    from specunode.core.model import ModelError
+    from specunode.core.model import ModelError, TurnAbandoned
     from specunode.core.policy import Policy
     from specunode.core.scheduler import RunResult
     from specunode.integrations.anthropic import AnthropicModel

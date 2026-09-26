@@ -13,6 +13,7 @@ and nothing the committed run did not decide is reproduced.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -688,3 +689,60 @@ async def test_a_client_error_reaches_the_node_as_a_model_error(tmp_path: Path) 
     )
     assert result.ok, result.error
     assert len(seen) == 1 and isinstance(seen[0].__cause__, ConnectionError)
+
+
+async def test_a_resume_that_keeps_waiting_where_the_run_gave_up_stops_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The node asked the model, found the answer in its cache meanwhile, cancelled the call and
+    charged; the process died. On resume the cache had expired and the node waited for the
+    call -- served as one that never answers, with nothing to end it, the resume hung without
+    a word. It gives up once it has waited as the recorded run did, and a margin, and says why.
+    Found by the fourteenth review."""
+    from specunode.core import model as model_module
+    from specunode.core.model import TurnAbandoned
+
+    monkeypatch.setattr(model_module, "_ABANDON_MARGIN_S", 0.1)
+    cache = {"hit": True}
+    charged: list[float] = []
+
+    @tool(effect="write", idempotent=False)
+    async def charge_card(customer_id: str, amount: float) -> JsonValue:
+        charged.append(amount)
+        return {"charge_id": f"ch_{len(charged)}"}
+
+    @node(name="bill")
+    async def bill(session: RunSession) -> Decision:
+        asking = asyncio.create_task(session.call_turn(SMALL))  # type: ignore[misc]
+        await asyncio.sleep(0.05)
+        if cache["hit"]:
+            asking.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asking
+            await session.call_tool("charge_card", {"customer_id": "cus-1", "amount": 25.0})
+        else:
+            await asking
+        session.state["billed"] = True
+        return ToolCall("charge_card", {})
+
+    adapter = PlainAdapter.of([bill], lambda s: None if s.get("billed") else "bill")
+    registry = registry_of([charge_card])
+    db = tmp_path / "source.db"
+    run_id = new_ulid()
+    with pytest.raises(Crash):
+        await scheduler(
+            CrashingJournal(db, before_commit_of("bill#0")),
+            adapter,
+            registry,
+            AnswersLate(25.0, slow=True),
+        ).run(run_id, {})
+    await bury_the_dead_process()
+    assert charged == [25.0]
+
+    cache["hit"] = False
+    asked_live = AnswersLate(30.0, slow=False)
+    resumed = await asyncio.wait_for(
+        scheduler(Journal(db), adapter, registry, asked_live).resume(run_id), timeout=10
+    )
+    assert not resumed.ok and TurnAbandoned.__name__ in (resumed.error or ""), resumed.error
+    assert asked_live.asked == [] and charged == [25.0]

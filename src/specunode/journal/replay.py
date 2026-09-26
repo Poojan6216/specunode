@@ -18,7 +18,6 @@ and feeding one back as an input would replay a decision the run never actually 
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -33,10 +32,12 @@ from specunode.core.model import (
     RequestEnvelope,
     StreamEvent,
     TextBlock,
+    TextDelta,
     ToolResultBlock,
     ToolUseBlock,
     ToolUseComplete,
     TurnComplete,
+    _served_never_answers,
     current_scope,
     project,
     request_hash,
@@ -94,9 +95,11 @@ class JournaledTurn:
     speculative: bool
     #: The error the turn ended in, if it failed; a replay raises it again at the same point.
     failed: str | None = None
-    #: Its caller stopped waiting for it; a replay does not answer it either.
+    #: Its caller stopped waiting for it; a replay does not answer it either, for as long as it
+    #: waited, and a margin.
     cancelled: bool = False
     request_id: str = ""
+    latency_ms: int = 0
 
 
 def _describe(value: JsonValue, limit: int = 120) -> str:
@@ -192,6 +195,11 @@ class ReplayModel:
 
     def _load(self) -> None:
         requests: dict[str, Mapping[str, JsonValue]] = {}
+        asked_at: dict[str, int] = {}
+        # Per request, its last outcome -- an answer the caller stopped waiting for is followed
+        # by a second outcome saying so, and not always next to it: a question asked at the same
+        # time can be answered in between, and the answer its node never saw was then served.
+        outcomes: dict[str, tuple[tuple[str, int], JournaledTurn]] = {}
         for entry in self.journal.read(self.run_id, kinds=["model_request", "model_response"]):
             payload = entry.payload
             if payload.get("role") != self.role:
@@ -200,6 +208,7 @@ class ReplayModel:
                 request_id = payload.get("request_id")
                 if isinstance(request_id, str):
                     requests[request_id] = payload
+                    asked_at[request_id] = entry.offset
                 continue
 
             request_id = payload.get("request_id")
@@ -231,14 +240,14 @@ class ReplayModel:
                 failed=failed if isinstance(failed, str) else None,
                 cancelled=payload.get("cancelled") is True,
                 request_id=str(request_id),
+                latency_ms=_as_latency(payload.get("latency_ms")),
             )
-            turns = self._turns.setdefault(key, [])
-            if turns and turns[-1].request_id == turn.request_id:
-                # A second outcome for one request -- the caller stopped waiting while the first
-                # was written -- is the last word on it.
-                turns[-1] = turn
-            else:
-                turns.append(turn)
+            outcomes[str(request_id)] = (key, turn)
+        # In the order they were asked, not the order the answers came back: two questions asked
+        # at once and answered the other way round were matched each with the other's answer.
+        for request_id in sorted(outcomes, key=lambda asked: asked_at.get(asked, -1)):
+            key, turn = outcomes[request_id]
+            self._turns.setdefault(key, []).append(turn)
 
     # -- the ModelClient surface ---------------------------------------------------------------
 
@@ -269,7 +278,7 @@ class ReplayModel:
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
         turn = self._turn_for(envelope, current_scope())
         if turn.cancelled:
-            await asyncio.Event().wait()  # never answered; the caller stops waiting again
+            await _served_never_answers(_recorded(turn))
         if turn.failed is not None:
             raise ModelError(turn.failed)
         return turn.response
@@ -286,8 +295,12 @@ class ReplayModel:
         for index, block in enumerate(response.content):
             if isinstance(block, ToolUseBlock):
                 yield ToolUseComplete(index=index, block=block)
+            elif isinstance(block, TextBlock):
+                # Text too, as a live stream and a served one emit it: a node that stopped
+                # reading on a piece of text never saw it here, and waited on for the rest.
+                yield TextDelta(index=index, text=block.text)
         if turn.cancelled:
-            await asyncio.Event().wait()  # never finished; the caller stops waiting again
+            await _served_never_answers(_recorded(turn))
         if turn.failed is not None:
             # The turn failed in the run being replayed, after what it had streamed so far.
             raise ModelError(turn.failed)
@@ -386,6 +399,7 @@ class RecordedTurns:
                 offset=offset,
                 failed=failed if isinstance(failed, str) else None,
                 cancelled=payload.get("cancelled") is True,
+                latency_ms=_as_latency(payload.get("latency_ms")),
             )
             outcomes[request_id] = (
                 key,
@@ -474,6 +488,16 @@ class RecordedTurns:
     def recorded(self) -> int:
         """How many turns a resume could be served, over every node and position."""
         return sum(max(map(len, attempts)) for attempts in self._attempts.values())
+
+
+def _as_latency(value: JsonValue) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _recorded(turn: JournaledTurn) -> RecordedTurn:
+    return RecordedTurn(
+        response=turn.response, offset=-1, cancelled=True, latency_ms=turn.latency_ms
+    )
 
 
 def _as_mapping(value: JsonValue) -> Mapping[str, JsonValue]:

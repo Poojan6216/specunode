@@ -173,7 +173,10 @@ serves back, and what a replay raises, at the same point: the failure is journal
 outcome, so a node that catches it and asks again is matched with its second question. Catch
 `ModelError`, not the client's own type: a node that catches the client's type is not the same
 node on resume. A turn the node stops waiting for -- its timeout, a cancel -- is journaled as
-cancelled too, and served as one that never answers, until the node stops waiting again.
+cancelled too, and served as one that never answers for as long as the node waited the first
+time, and a few seconds more; a node still waiting then stops with `specunode.TurnAbandoned`,
+which is not a `ModelError` -- asking again would be asking something the recorded run never
+asked.
 
 ## Speculation and node bodies
 

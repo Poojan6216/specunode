@@ -592,3 +592,87 @@ async def test_a_read_made_after_the_nodes_first_write_is_rechecked(
     assert ledger.reads_validated.stale == 1
     discarded = [e.payload for e in journal.read(result.run_id, kinds=["effect_discarded"])]
     assert [d["reason"] for d in discarded] == ["stale_read"]
+
+
+async def test_a_stale_read_after_the_last_write_is_reported_as_what_it_is(tmp_path: Path) -> None:
+    """A deposit, then a read that goes stale, and the node finishes: the run said "the write
+    that followed was not sent -- discarded", and there was none. Found by the fourteenth
+    review."""
+    import asyncio
+    from collections.abc import AsyncIterator
+
+    from specunode.core.decision import Decision, ToolCall
+    from specunode.core.graph import RunSession
+    from specunode.core.model import (
+        Message,
+        RequestEnvelope,
+        StreamEvent,
+        TextBlock,
+        ToolUseComplete,
+        TurnComplete,
+    )
+    from specunode.integrations.plain import PlainAdapter, node, registry_of, tool
+
+    turns = [
+        (("charge", {"customer_id": "cus-1", "amount": 1.0}),),
+        (("get_stock", {"item": "i"}),),
+    ]
+    version = {"i": 1}
+    reads: list[int] = []
+
+    @tool(effect=EffectClass.READ, witness=True, forward_keys="item:{args.item}")
+    async def get_stock(item: str) -> JsonValue:
+        reads.append(version[item])
+        return {"value": {"stock": 3}, "witness": version[item]}
+
+    @tool(effect=EffectClass.WRITE, forward_keys="customer:{args.customer_id}")
+    async def charge(customer_id: str, amount: float) -> JsonValue:
+        return {"charge_id": "ch_1"}
+
+    class Model:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def complete(self, envelope: RequestEnvelope) -> object:
+            raise NotImplementedError
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            reply = tool_turn(*turns[self.turn])
+            self.turn += 1
+            yield ToolUseComplete(index=0, block=reply.content[0])  # type: ignore[arg-type]
+            if self.turn == 2:
+                for _ in range(5000):
+                    if reads:
+                        break
+                    await asyncio.sleep(0.001)
+                version["i"] += 1
+            yield TurnComplete(response=reply)
+
+    @node(name="act")
+    async def act(session: RunSession) -> Decision:
+        for index in range(len(turns)):
+            await session.call_turn(  # type: ignore[misc]
+                RequestEnvelope(
+                    model="m",
+                    messages=(Message(role="user", content=(TextBlock(text=f"{index}"),)),),
+                    stream=True,
+                )
+            )
+        session.state["done"] = True
+        return ToolCall("x", {})
+
+    registry = registry_of([get_stock, charge])
+    journal = Journal(tmp_path / "journal.db")
+    scheduler = Scheduler(
+        graph=PlainAdapter.of([act], lambda s: None if s.get("done") else "act"),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(Model(), journal),  # type: ignore[arg-type]
+        policy=Policy(speculation=False),
+    )
+    result = await scheduler.run(new_ulid(), {})
+    assert not result.ok and "nothing more to send" in (result.error or ""), result.error
+    assert "discarded" not in (result.error or "")
+    assert not list(journal.read(result.run_id, kinds=["effect_discarded"]))

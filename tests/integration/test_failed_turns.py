@@ -31,6 +31,7 @@ from specunode.core.model import (
     TextBlock,
     ToolUseBlock,
     ToolUseComplete,
+    TurnComplete,
     decisions_of,
 )
 from specunode.core.policy import Policy
@@ -459,3 +460,48 @@ async def test_a_run_cancelled_from_outside_writes_nothing_after_it_returns(
     assert journal.last_offset(run_id) == written, "the run wrote after it had returned"
     discarded = list(journal.read(run_id, kinds=["effect_discarded"]))
     assert discarded, "the guess's staged write was never recorded as discarded"
+
+
+async def test_a_stream_collected_after_the_run_writes_nothing_into_it(tmp_path: object) -> None:
+    """A node read the first block of a stream and raised; the stream lived on in the
+    traceback, and when the garbage collector closed it -- after the run had written
+    ``run_finished`` and let go of the run -- a "cancelled" outcome landed in the journal.
+    Found by the fourteenth review."""
+    import gc
+
+    class OneBlockThenMore:
+        async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+            raise NotImplementedError
+
+        async def stream(self, envelope: RequestEnvelope) -> AsyncIterator[StreamEvent]:
+            block = ToolUseBlock(id="t1", name="fetch_runbook", args={"section": "restart"})
+            yield ToolUseComplete(index=0, block=block)
+            await asyncio.sleep(0.05)
+            yield TurnComplete(response=ModelResponse(model="m", content=(block,)))
+
+    async def peeks(session: RunSession) -> None:
+        events = session.model.stream(ASK)  # type: ignore[union-attr]
+        async for _event in events:
+            break  # it has what it wanted
+        raise RuntimeError("the node gave up after peeking")
+
+    world = standard_world()
+    registry = registry_for(world)
+    journal = Journal(tmp_path / "journal.db")  # type: ignore[operator]
+    scheduler: Scheduler | None = Scheduler(
+        graph=OneNode(peeks),  # type: ignore[arg-type]
+        registry=registry,
+        journal=journal,
+        buffer=StoreBuffer(journal=journal, run_id=""),
+        dispatcher=Dispatcher(registry=registry, max_attempts=1, base_delay_ms=1.0),
+        target=JournaledModel(OneBlockThenMore(), journal),
+        policy=Policy(speculation=False),
+    )
+    assert scheduler is not None
+    result = await scheduler.run(new_ulid(), {})
+    run_id = result.run_id
+    del scheduler, result
+    gc.collect()
+    await asyncio.sleep(0.2)
+    kinds = [e.kind for e in journal.read(run_id)]
+    assert kinds[-1] == "run_finished", kinds

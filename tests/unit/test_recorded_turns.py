@@ -401,3 +401,141 @@ async def test_calls_made_at_once_are_matched_in_the_order_they_were_asked(
         )
     assert changed.calls == 0
     assert calls(charge) == [ToolCall(*CHARGE_25)]
+
+
+# -- replay: one outcome per question, in the order asked, and no wait without end --------------
+
+
+async def journal_two_questions(journal: Journal, *, a_cancelled: bool) -> None:
+    """Questions A then B, asked at once; B answered first, then A -- and, if ``a_cancelled``,
+    A's caller had stopped waiting while its answer was written, so a marker follows B's."""
+    from specunode.core.model import CANCELLED, request_hash
+
+    writer = JournaledModel(ScriptedModel(turns=[]), journal)
+    here = scope("br-1")
+    a, b = ask("question A"), ask("question B")
+    request_a = await writer._journal_request(a, here, request_hash(a), None)
+    request_b = await writer._journal_request(b, here, request_hash(b), None)
+    answer_a, answer_b = tool_turn(CHARGE_25), tool_turn(CHARGE_30)
+    if a_cancelled:
+        await writer._journal_response(answer_a, here, request_a, request_hash(a), 50)
+        await writer._journal_response(answer_b, here, request_b, request_hash(b), 5)
+        await writer._journal_response(
+            answer_a, here, request_a, request_hash(a), 50, failed=CANCELLED, cancelled=True
+        )
+    else:
+        await writer._journal_response(answer_b, here, request_b, request_hash(b), 5)
+        await writer._journal_response(answer_a, here, request_a, request_hash(a), 50)
+
+
+async def test_replay_matches_questions_in_the_order_they_were_asked(tmp_path: Path) -> None:
+    """Answered the other way round, two questions asked at once were each matched with the
+    other's answer, and the replay of a faithful run was refused. Found by the fourteenth
+    review."""
+    from specunode.journal.replay import ReplayModel
+
+    journal = Journal(tmp_path / "journal.db")
+    await journal_two_questions(journal, a_cancelled=False)
+    replay = ReplayModel(journal=journal, run_id=RUN)
+    with scoped(scope("br-2")):
+        first = await replay.complete(ask("question A"))
+        second = await replay.complete(ask("question B"))
+    assert calls(first) == [ToolCall(*CHARGE_25)] and calls(second) == [ToolCall(*CHARGE_30)]
+
+
+async def test_replay_never_hands_over_an_answer_its_node_never_saw(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """A's answer, B's answer, then the marker that A's node had stopped waiting: the marker was
+    merged only when it sat next to the answer, so replay handed A's answer over -- and
+    ``replay --dispatch`` sent a charge the run never made. Nor does it wait without end for a
+    question nothing asks it to stop waiting on. Found by the fourteenth review."""
+    import pytest
+
+    from specunode.core import model as model_module
+    from specunode.core.model import TurnAbandoned
+    from specunode.journal.replay import ReplayModel
+
+    monkeypatch.setattr(model_module, "_ABANDON_MARGIN_S", 0.05)  # type: ignore[attr-defined]
+    journal = Journal(tmp_path / "journal.db")
+    await journal_two_questions(journal, a_cancelled=True)
+    replay = ReplayModel(journal=journal, run_id=RUN)
+    with scoped(scope("br-2")):
+        with pytest.raises(TurnAbandoned):
+            await replay.complete(ask("question A"))
+        answer_b = await replay.complete(ask("question B"))
+    assert calls(answer_b) == [ToolCall(*CHARGE_30)]
+
+
+async def test_a_turn_cancelled_again_and_again_is_still_recorded(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """A third cancel while the "cancelled" outcome was being written cancelled the write
+    itself, and the question was left with no outcome. Found by the fourteenth review."""
+    import contextlib
+
+    journal = Journal(tmp_path / "journal.db")
+    real = JournaledModel._journal_response
+
+    async def slow(self: JournaledModel, *args: object, **kwargs: object) -> None:
+        await asyncio.sleep(0.2)  # the writer is busy
+        await real(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(JournaledModel, "_journal_response", slow)  # type: ignore[attr-defined]
+
+    class Hangs:
+        async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    model_ = JournaledModel(Hangs(), journal)  # type: ignore[arg-type]
+
+    async def asking() -> None:
+        with scoped(scope("br-1")):
+            await model_.complete(ask("question A"))
+
+    task = asyncio.create_task(asking())
+    for _ in range(1000):  # the question is on disk and the model is being asked
+        if list(journal.read(RUN, kinds=["model_request"])):
+            break
+        await asyncio.sleep(0.005)
+    await asyncio.sleep(0.02)
+    for _ in range(3):
+        task.cancel()
+        await asyncio.sleep(0.02)
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    outcomes = [e.payload for e in journal.read(RUN, kinds=["model_response"])]
+    assert outcomes and outcomes[-1].get("cancelled") is True, outcomes
+
+
+async def test_a_turn_cancelled_while_its_question_is_written_has_an_outcome(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """The caller stopped waiting while the question itself was being written: the write
+    finished anyway, and a question on disk with no outcome sent every later question at its
+    position to the live model on resume. Found by the slow-disk run."""
+    import contextlib
+
+    journal = Journal(tmp_path / "journal.db")
+    real = JournaledModel._journal_request
+
+    async def slow(self: JournaledModel, *args: object, **kwargs: object) -> str:
+        await asyncio.sleep(0.2)
+        return await real(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(JournaledModel, "_journal_request", slow)  # type: ignore[attr-defined]
+    model_ = JournaledModel(ScriptedModel(turns=[tool_turn(CHARGE_25)]), journal)
+
+    async def asking() -> None:
+        with scoped(scope("br-1")):
+            await model_.complete(ask("question A"))
+
+    task = asyncio.create_task(asking())
+    await asyncio.sleep(0.05)  # the question is being written
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    requests = list(journal.read(RUN, kinds=["model_request"]))
+    outcomes = [e.payload for e in journal.read(RUN, kinds=["model_response"])]
+    assert len(requests) == 1 and outcomes and outcomes[-1].get("cancelled") is True, outcomes

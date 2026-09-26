@@ -1122,6 +1122,11 @@ class Journal:
         else:
             held.__exit__(None, None, None)
 
+    def holds(self, run_id: str) -> bool:
+        """Whether this process is driving ``run_id`` right now (``hold_run``)."""
+        with _held_runs_lock:
+            return (self._lock_location(), run_id) in _held_runs
+
     def _lock_location(self) -> str:
         """The journal's location as the run lock names it: a DSN, or the file's real path.
 

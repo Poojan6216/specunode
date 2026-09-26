@@ -67,7 +67,7 @@ from specunode.core.state import (
 )
 from specunode.drafters.base import DraftContext, Drafter
 from specunode.ids import new_ulid
-from specunode.journal.journal import Journal, RunBusy
+from specunode.journal.journal import Journal
 from specunode.journal.ledger import Ledger, build_ledger
 from specunode.journal.replay import OpenGroup, RecordedTurns, recover
 from specunode.verify.gate import resolve_decision
@@ -1365,6 +1365,55 @@ class Scheduler:
         self.counters.context_divergences += 1
         return 0
 
+    async def _drain_until_done(
+        self,
+        branch: Branch,
+        task: object,
+        confirmed_offset: int,
+        *,
+        checked: int,
+    ) -> tuple[bool, tuple[str, ...], str | None]:
+        """Drain, let the node go on, drain again, until it finishes or a drain fails.
+
+        Returns whether every drain was ok, what the last one left undrained, and -- if a read
+        the node made since the last check went stale -- why it stopped. ``checked`` is how
+        many of its reads the check at its first park covered; the rest are checked before each
+        later drain -- checked once, a write decided on a read that went stale after the node's
+        first write went out, and the ledger said 0 stale.
+        """
+        ok = True
+        undrained: tuple[str, ...] = ()
+        while True:
+            report = await self.buffer.drain(
+                branch,
+                self.dispatcher,
+                confirmed_offset=confirmed_offset,
+                authorised_by_offset=confirmed_offset,
+            )
+            ok = ok and report.ok
+            undrained = report.undrained
+            self.counters.effects_dispatched += report.count(EffectOutcome.DISPATCHED)
+            self.counters.effects_dead_lettered += report.count(EffectOutcome.DEAD_LETTER)
+            if not isinstance(task, asyncio.Task) or task.done() or not report.ok:
+                return ok, undrained, None
+            self._park_event(branch.id).clear()
+            outcome = await self._quiesce(branch, task)
+            checked, went_stale = await self._recheck_reads(branch, checked)
+            if went_stale is not None:
+                return ok, undrained, went_stale
+            if outcome is not BranchOutcome.PARKED:
+                # The node finished. Anything it staged on the way out is picked up by one
+                # more pass, which then finds nothing new and stops.
+                final = await self.buffer.drain(
+                    branch,
+                    self.dispatcher,
+                    confirmed_offset=confirmed_offset,
+                    authorised_by_offset=confirmed_offset,
+                )
+                self.counters.effects_dispatched += final.count(EffectOutcome.DISPATCHED)
+                self.counters.effects_dead_lettered += final.count(EffectOutcome.DEAD_LETTER)
+                return ok and final.ok, final.undrained, None
+
     async def _recheck_reads(self, branch: Branch, checked: int) -> tuple[int, str | None]:
         """Check the reads a node made since its last check, before its next write is sent.
 
@@ -1396,12 +1445,16 @@ class Scheduler:
         refuse = refuse or (later.unreadable and self.policy.on_unverifiable_read == "squash")
         if not refuse:
             return checked, None
-        self.counters.effects_discarded += await self.buffer.discard_unsent_and_journal(
-            branch, "stale_read"
-        )
+        discarded = await self.buffer.discard_unsent_and_journal(branch, "stale_read")
+        self.counters.effects_discarded += discarded
         detail = f"{later.stale} witnessed read(s) went stale"
         if later.unreadable:
             detail = f"{later.stale} read(s) stale and {later.unreadable} unreadable"
+        detail += " after its first write was sent"
+        if discarded:
+            detail += f", so the {discarded} write(s) it staged since were discarded, unsent"
+        else:
+            detail += ", before it finished; it had nothing more to send"
         return checked, detail
 
     async def _retire(
@@ -1493,45 +1546,18 @@ class Scheduler:
         # stage the next write from the value it just received, so a single pass would leave
         # that effect staged and never dispatched -- an authorised write dropped silently.
         task = branch.task
-        ok = True
-        undrained: tuple[str, ...] = ()
-        # Reads checked so far. The check above ran when the node first parked; a node that
-        # reads again and parks on a later write has its new reads checked before that write
-        # goes -- once, it let a write decided on a stale read out, and the ledger said 0 stale.
-        checked = len(validation.verdicts)
-        went_stale: str | None = None
-        while True:
-            report = await self.buffer.drain(
-                branch,
-                self.dispatcher,
-                confirmed_offset=confirmed_offset,
-                authorised_by_offset=confirmed_offset,
+        try:
+            ok, undrained, went_stale = await self._drain_until_done(
+                branch, task, confirmed_offset, checked=len(validation.verdicts)
             )
-            ok = ok and report.ok
-            undrained = report.undrained
-            self.counters.effects_dispatched += report.count(EffectOutcome.DISPATCHED)
-            self.counters.effects_dead_lettered += report.count(EffectOutcome.DEAD_LETTER)
-            if not isinstance(task, asyncio.Task) or task.done() or not report.ok:
-                break
-            self._park_event(branch.id).clear()
-            outcome = await self._quiesce(branch, task)
-            checked, went_stale = await self._recheck_reads(branch, checked)
-            if went_stale is not None:
-                break
-            if outcome is not BranchOutcome.PARKED:
-                # The node finished. Anything it staged on the way out is picked up by one
-                # more pass, which then finds nothing new and stops.
-                final = await self.buffer.drain(
-                    branch,
-                    self.dispatcher,
-                    confirmed_offset=confirmed_offset,
-                    authorised_by_offset=confirmed_offset,
-                )
-                ok = ok and final.ok
-                undrained = final.undrained
-                self.counters.effects_dispatched += final.count(EffectOutcome.DISPATCHED)
-                self.counters.effects_dead_lettered += final.count(EffectOutcome.DEAD_LETTER)
-                break
+        except BaseException:
+            # A journal or dispatch failure mid-drain ends the run; the node parked on its
+            # write must not outlive it, waiting on an ack nothing will complete.
+            self.buffer.close(branch)
+            if isinstance(task, asyncio.Task) and not task.done():
+                task.cancel()
+                await asyncio.wait({task})
+            raise
 
         if went_stale is not None:
             # What it sent before stays sent; the write it staged since was discarded unsent,
@@ -1541,9 +1567,8 @@ class Scheduler:
                 task.cancel()
                 await asyncio.wait({task})
             raise SchedulerError(
-                f"node {node_id}: {went_stale} after its first write was sent, so the write "
-                "that followed was not sent -- discarded, for a resume to decide again on "
-                "fresh reads"
+                f"node {node_id}: {went_stale}. It is stopped there; a resume runs it again, "
+                "on fresh reads"
             )
         if isinstance(task, asyncio.Task) and not task.done():
             # Refuse its next write before cancelling it, and wait for it to stop: a node left
@@ -1845,12 +1870,11 @@ class Scheduler:
     async def _journal_run_finished(
         self, ok: bool, error: str | None, steps: int, committed: CommittedState
     ) -> None:
-        try:
-            await self.journal.check_run_lock(self.run_id)
-        except RunBusy:
-            # The run's lock went while it ran, and another process may be driving it now: a
-            # "finished" written from here would land in the middle of that process's run.
-            return
+        # The run's lock may have gone while it ran, and another process may be driving it
+        # now: a "finished" written from here would land in the middle of that process's run.
+        # Raised rather than skipped -- a run that could not say it finished did not report
+        # success with no "finished" on disk, which a status reads as a run still to resume.
+        await self.journal.check_run_lock(self.run_id)
         await self.journal.append_async(
             self.run_id,
             "run_finished",

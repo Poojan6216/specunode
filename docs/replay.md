@@ -147,8 +147,11 @@ failed -- a reply cut off or refused, a model that was overloaded -- is recorded
 it was and served again as that failure, and a replay raises it again at the same point: a node
 that caught it and asked again then asks its second question, and is matched with the answer to
 that. A turn the node stopped waiting for -- its timeout fired, or it was cancelled, even while
-the answer was being written -- is recorded as cancelled, and served as one that never answers,
-until the node stops waiting again. What a resume cannot keep the same is anything else that
+the answer was being written -- is recorded as cancelled, and served as one that never answers
+for as long as the recorded node waited, and a few seconds more. A node that stops waiting by
+then -- its timeout fires again -- goes on as it did before; one that is still waiting is not
+asking what it asked before, and stops with `TurnAbandoned` rather than wait without end or be
+answered anew. A replay does the same. What a resume cannot keep the same is anything else that
 shapes a call: a read made again
 that returns something new, a timestamp, code that changed. Then a different call at the same
 position gets a different key, and the world receives it as well.

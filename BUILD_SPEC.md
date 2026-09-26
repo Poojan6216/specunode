@@ -1054,6 +1054,7 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 [2.5] DEFECTS (fixed), found by the eleventh review: (1, critical) the Anthropic adapter built a finished turn from a stream that dropped mid-reply, and nothing read `stop_reason`, so a tool call cut off mid-argument -- "amount": 150.0 cut after the 1 -- was sent as a charge of 1; a reply that did not finish, or stopped at `max_tokens` or by a refusal with a call in it, is now refused before it is journaled; (2) a guess confirmed at the end of a reply joined the branch when the turn ended, so the drain that sent the reply's first write sent it too, ahead of a read the model had asked for between them -- each guess now joins at its place in the reply; (3) the LangGraph wrapper shared one Scheduler across every call, and two requests at once ran as one -- each call gets its own, a Scheduler drives one run, a buffer serves one run at a time, and `run` refuses a run id the journal already holds; (4) the SQLite run lock was keyed by the path as given and named after the run id -- it is keyed by the real path and named by a hash, and an OSError is a JournalError; (5) the Postgres run lock used a 32-bit key on the shared writer connection -- 64 bits, on its own connection, checked before every send; (6) a dead letter took its stage index as its place in the send order -- it records where it was tried, and the order check counts sent effects only; (7) an adoption moved the guess's write before journaling the move -- a failed append left it to be sent; the record now comes first; (8) `--journal` was a Path, which mangled a Postgres DSN -- as did `specunode.Runtime`; and the config's `journal` section, read by nothing, is now the CLI's default. Each fix fails under its own planted bug. — 2026-09-25
 [2.5] DEFECTS (fixed), found by the twelfth review: (1, critical) a turn that failed -- a reply cut off and refused, an overloaded model -- left no outcome on disk, so a node that caught the failure and asked again, then crashed after its charge went out, was not served on resume: every question after the failed one went to the live model, which could charge a second time, and replay refused the same run; a failed turn is recorded as the failure it was and served and replayed as that failure, and the Anthropic adapter raises its SDK's API errors as ModelError; (2, critical) the Postgres run lock was checked once, before the claim, and a process that lost it during a retry's backoff sent the retry while another sent the same charge -- it is checked before every attempt, and a settle that finds its offset taken is a JournalConcurrencyError; (3, critical) a crash after a policy_event and before run_started left a run `run` refused and `resume` drove from empty state, charging the wrong customer -- run_started is first, and a run that never recorded its start is started, not resumed; (4) the eleventh review's per-slot adoption moved a guess's reads with its writes, after the stale-read check -- reads move when the turn ends; (5) the documented recovery of a crashed LangGraph run did not exist -- documented as unsupported, `resume` says so, and LangGraph's own config is passed through; (6) agent_loop reported a reply cut off without a call as end_turn; (7) ledgers signed before the dispatch-order change were reported as edited -- format 1 is recognised; (8) the CLI read a config's journal path from the wrong folder and without `~` -- fixed, and every command takes --config; (9) wrap(run_id=) made a wrapped graph single-use -- removed; (10) resuming an unknown run printed a traceback. And three it suspected but could not reproduce, all real: a confirmed guess discarded with its turn made a failed run look resumable; a run cancelled from outside journaled its nodes' cleanup after letting go of the run; the Postgres run lock was taken on the event loop. Each fix fails under its own planted bug. — 2026-09-25
 [2.5] DEFECTS (fixed), found by the thirteenth review: (1, critical) a model call a node's own timeout cancelled left no outcome, so a node that asked again, charged and crashed was sent to the live model on resume and could charge twice -- a cancelled turn is journaled as one and served as one that never answers, until the node stops waiting again; (2, critical) an answer written after the node's timeout fired was on disk as delivered, and a resume acted on it -- the write is let finish and a second outcome says it was never handed over, and the last outcome of a question is the one served and replayed; (3) a served failure was a ModelError while the live one was the client's own error, so a node catching the client's type could never be resumed -- the live path raises ModelError too, caused by the client's error, and ModelError is exported; (4) witnessed reads were re-checked once per node, at its first park, so a write after a later read went out on a stale value -- reads made since are re-checked before every later drain, and what the node staged since a stale one is discarded unsent; (5) a connection dropped mid-reply reached nodes as the HTTP client's own error -- the adapter raises it as ModelError; (6) a user-level config without a journal section sent every command to an empty journal beside it. And two it suspected: a second cancel while the run lock was being taken left its release to the garbage collector, and a run that lost its Postgres lock still wrote run_finished into a run another process might be driving. Each fix fails under its own planted bug. — 2026-09-25
+[2.5] DEFECTS (fixed), found by the fourteenth review, which found no way to send a write twice: (1) a replay of a run interrupted during a model call waited forever on the turn recorded as cancelled, and replay did not re-emit text, so a node that stopped reading on text waited too -- a served "never answers" turn now waits as long as the recorded caller did, and a margin, then raises TurnAbandoned, and replay re-emits text; (2) replay merged an answer with the marker that its node never saw it only when the two were adjacent, so a question answered in between made replay hand the answer over and `replay --dispatch` send a charge the run never made -- the last outcome per request wins; (3) replay listed turns in answer order, not asked order, and refused a faithful re-run of concurrent calls; (4) a resume hung without a word on a pinned cancelled turn whose cancellation did not recur -- the same bounded wait; (5) a stream closed by the garbage collector after the run ended journaled "cancelled" after run_finished -- not outside a run this process holds; (6) a third cancel while "cancelled" was written cancelled the write; (7) a stale read after a node's last write was reported as a discarded write. Also from its list: a journal failure mid-drain left the parked node running, and a run that lost its Postgres lock after its last drain reported success with no run_finished -- it raises now. And the slow-disk run found one more of finding 6's kind: a caller cancelled while its question was being written left the question on disk with no outcome -- the write is let finish and given a cancelled outcome. Each fix fails under its own planted bug. — 2026-09-25
 [3.3] Four tests settled a guess inside a 15–25 ms block delay, which a journal append on a slow CI disk could miss. Found all at once by running the suite with every append 40 ms slower (`tests/slow_journal.py`); each now holds the settling block until the event it needs has happened, and passes at 40, 100 and 250 ms of added latency. The `slow-disk` CI job runs the tests that guess that way on every push. — 2026-09-25
 ```
 
@@ -1064,17 +1065,17 @@ Goal: publish the attacks that beat it, with measured rates. Each strategy is on
 **Written 2026-09-16, revised 2026-09-17 after an independent adversarial audit, and on
 2026-09-23 after the first measurements against a real model.**
 
-**994 tests pass, 24 skip — 17 of the passes against a real Postgres 16 server.** `ruff check`,
+**1001 tests pass, 24 skip — 17 of the passes against a real Postgres 16 server.** `ruff check`,
 `ruff format --check` and `mypy --strict` are clean with every extra installed, which is a
 stronger statement than it was: the `anthropic` package sits in mypy's `ignore_missing_imports`
 list and was not installed, so a whole adapter had been type-checking against `Any`.
 
-**Thirteen independent adversarial reviews have found 146 defects here, 22 of them critical.** The
-counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8, 10, 6.** All are fixed but one, kept on purpose
+**Fourteen independent adversarial reviews have found 153 defects here, 22 of them critical.** The
+counts, in order, were **23, 17, 13, 24, 9, 6, 6, 9, 8, 7, 8, 10, 6, 7.** All are fixed but one, kept on purpose
 and documented: a node's writes are refused while any model turn it started is unjournaled, even
 one that did not decide the write. That number is the most useful thing in this report, so it
 is at the top rather than buried: the version of this document written a day earlier described
-a finished project. The thirteenth to sixth reviews (2026-09-25) and the fifth (2026-09-23) are
+a finished project. The fourteenth to sixth reviews (2026-09-25) and the fifth (2026-09-23) are
 summarised below; the fourth is in commit `c8802ec`.
 
 The second audit is the one worth reading twice. It was told to assume the first round's fixes
@@ -1194,6 +1195,27 @@ Ten strategies run; eight defeat the runtime.
 Held: 7.7 drafter poisoning (4 guesses forked, 4 squashed, 4 charges staged and discarded, the
 alpha gate closed once, 0 wasted tokens — a pattern-index guess costs no model tokens — and 0
 leaks) and 7.8 replay under model drift (both cases diverge at step 0).
+
+### What the fourteenth review found
+
+No critical finding: it found no way to send a write twice, and said so. Seven others, five
+major, in replay, in hangs and in late writes -- two of them in the thirteenth's repairs.
+
+- **A turn served as "never answers" could wait forever.** A replay of a run interrupted during
+  a model call, and a resume whose node no longer cancelled the call its recorded run had given
+  up on, waited without end and said nothing. Such a turn now waits as long as the recorded
+  caller did, and a few seconds more, then raises `TurnAbandoned`: the node is not asking what
+  it asked before. Replay also re-emits text now, as a served turn does.
+- **Replay could hand a node an answer it never saw.** The marker that a caller had stopped
+  waiting was merged with its answer only when the two sat next to each other; a question
+  answered in between made replay serve the answer, and `replay --dispatch` sent a charge the
+  run never made. And replay matched concurrent questions in the order their answers came back.
+  Each question's last outcome is the one used now, in the order the questions were asked.
+- A stream the garbage collector closed after the run had ended wrote "cancelled" after
+  `run_finished`; a third cancel cancelled the write recording the second; and a stale read
+  after a node's last write was reported as a discarded write. All fixed -- and the slow-disk
+  run of the new tests found one more: a caller cancelled while its *question* was being written
+  left it on disk with no outcome. It is let finish, and recorded as cancelled.
 
 ### What the thirteenth review found
 

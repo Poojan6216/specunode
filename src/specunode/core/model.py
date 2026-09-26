@@ -40,7 +40,7 @@ from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import Literal, Protocol, TypeAlias, runtime_checkable
+from typing import Any, Literal, Protocol, TypeAlias, runtime_checkable
 
 from specunode.canonical import JsonValue, canonical, chash
 from specunode.core.decision import (
@@ -569,12 +569,54 @@ class RecordedTurn:
     failed: str | None = None
     #: The caller stopped waiting before it had the whole turn -- a timeout, a cancel. Served
     #: as a turn that never finishes: what the caller saw of it, then nothing, until it stops
-    #: waiting again.
+    #: waiting again -- for as long as it waited the first time, and a margin.
     cancelled: bool = False
+    #: How long the recorded caller waited for this turn.
+    latency_ms: int = 0
 
 
 #: The outcome recorded for a turn its caller stopped waiting for.
 CANCELLED = "cancelled: the caller stopped waiting before the turn was handed over"
+
+#: How much longer than the recorded caller did a served "never answers" turn waits.
+_ABANDON_MARGIN_S = 5.0
+
+
+class TurnAbandoned(RuntimeError):
+    """A resumed or replayed node kept waiting for a turn the recorded run stopped waiting for.
+
+    The recorded node gave up on this question -- its timeout fired, or something cancelled
+    it -- and went on to decide what it decided. This one is still waiting, so something that
+    shaped it changed across the crash, and it is not making the calls it made before. Waiting
+    forever hung the resume with no word of why; answering from the live model could decide
+    differently from what may already have been sent. So it stops here, and says so.
+
+    Not a :class:`ModelError`: a node that caught it and asked again would be asking a question
+    the recorded run never asked.
+    """
+
+
+async def _served_never_answers(recorded: RecordedTurn) -> None:
+    """Wait as the recorded caller did before it stopped, and a margin; then give up, loudly."""
+    waited = recorded.latency_ms / 1000.0
+    await asyncio.sleep(waited + _ABANDON_MARGIN_S)
+    raise TurnAbandoned(
+        f"the run being resumed or replayed stopped waiting for this turn after {waited:.1f} s, "
+        "and this node is still waiting: it is not asking what it asked before -- something "
+        "that shaped it changed -- so it stops here rather than decide anew"
+    )
+
+
+async def _let_finish(writing: asyncio.Future[Any]) -> None:
+    """Wait for a journal write to finish, however many times the caller is cancelled meanwhile.
+
+    The write is on the journal's own thread and finishes anyway; a caller that stopped waiting
+    for it went on before the outcome it records was on disk, and a write still queued behind
+    another could be cancelled before it ran at all.
+    """
+    while not writing.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait({writing})
 
 
 def _failure_text(exc: BaseException) -> str:
@@ -789,8 +831,7 @@ class JournaledModel:
         try:
             await asyncio.shield(writing)
         except asyncio.CancelledError:
-            with contextlib.suppress(BaseException):
-                await writing
+            await _let_finish(writing)
             await self._cancelled(response, scope, request_id, digest, latency_ms, recorded)
             raise
 
@@ -821,21 +862,44 @@ class JournaledModel:
                 cancelled=True,
             )
         )
-        with contextlib.suppress(BaseException):
-            await asyncio.shield(writing)
-        if not writing.done():
-            with contextlib.suppress(BaseException):
-                await writing
+        await _let_finish(writing)
+        if not writing.cancelled():
+            writing.exception()  # retrieved, so a failed write is not reported as unobserved
 
-    async def _never_answers(self) -> None:
-        """A served turn that never finished the first time does not finish now either."""
-        await asyncio.Event().wait()
+    async def _ask(
+        self,
+        envelope: RequestEnvelope,
+        scope: CallScope,
+        digest: str,
+        recorded: RecordedTurn | None,
+    ) -> str:
+        """Journal the question -- and if the caller stops waiting while it is written, say so.
+
+        The write finishes on the journal's thread whatever the caller does, and a question on
+        disk with no outcome sent every later question at its position to the live model on
+        resume. So it is let finish, and given its outcome: the caller never waited for an
+        answer to it.
+        """
+        writing = asyncio.ensure_future(self._journal_request(envelope, scope, digest, recorded))
+        try:
+            return await asyncio.shield(writing)
+        except asyncio.CancelledError:
+            await _let_finish(writing)
+            if not writing.cancelled() and writing.exception() is None:
+                empty = ModelResponse(model=envelope.model, stop_reason="error")
+                await self._cancelled(empty, scope, writing.result(), digest, 0, recorded)
+            raise
+
+    def _in_run(self, scope: CallScope) -> bool:
+        """Whether this process still drives the scope's run -- a stream closed by the garbage
+        collector after the run ended is not, and writes nothing into a run it let go of."""
+        return self._journal.holds(scope.run_id)
 
     async def complete(self, envelope: RequestEnvelope) -> ModelResponse:
         scope = current_scope()
         digest = request_hash(envelope)
         recorded = self._recorded_for(digest, scope)
-        request_id = await self._journal_request(envelope, scope, digest, recorded)
+        request_id = await self._ask(envelope, scope, digest, recorded)
         track = scope.track_turn if self._role == "target" else None
         if track is not None:
             track(1)
@@ -844,7 +908,7 @@ class JournaledModel:
                 served = recorded.response
                 if recorded.cancelled:
                     try:
-                        await self._never_answers()
+                        await _served_never_answers(recorded)
                     except asyncio.CancelledError:
                         await self._cancelled(served, scope, request_id, digest, 0, recorded)
                         raise
@@ -899,7 +963,7 @@ class JournaledModel:
         scope = current_scope()
         digest = request_hash(envelope)
         recorded = self._recorded_for(digest, scope)
-        request_id = await self._journal_request(envelope, scope, digest, recorded)
+        request_id = await self._ask(envelope, scope, digest, recorded)
         track = scope.track_turn if self._role == "target" else None
         if track is not None:
             track(1)
@@ -918,9 +982,10 @@ class JournaledModel:
                             handed_over = True
                             yield TextDelta(index=index, text=block.text)
                     if recorded.cancelled:
-                        await self._never_answers()
-                except (asyncio.CancelledError, GeneratorExit):
-                    if recorded.cancelled:
+                        await _served_never_answers(recorded)
+                except (asyncio.CancelledError, GeneratorExit) as stopped:
+                    finalised = isinstance(stopped, GeneratorExit) and not self._in_run(scope)
+                    if recorded.cancelled and not finalised:
                         await self._cancelled(response, scope, request_id, digest, 0, recorded)
                     raise
                 await self._outcome(
@@ -964,10 +1029,13 @@ class JournaledModel:
                     # a failure: read as a complete turn, it let a confirmed guess's write go
                     # out with no decision on disk.
                     raise ModelError("the model's stream ended without completing its turn")
-            except (asyncio.CancelledError, GeneratorExit):
+            except (asyncio.CancelledError, GeneratorExit) as stopped:
                 # The caller stopped waiting -- its timeout, or it stopped reading -- before the
-                # turn was handed over. What it saw of the reply is recorded with that.
-                if not recorded_outcome:
+                # turn was handed over. What it saw of the reply is recorded with that. Not a
+                # stream the garbage collector closes after the run ended: the process no
+                # longer drives that run, and its "run_finished" is already written.
+                finalised = isinstance(stopped, GeneratorExit) and not self._in_run(scope)
+                if not recorded_outcome and not finalised:
                     latency_ms = int((time.monotonic() - started) * 1000)
                     seen = final or _partial_response(envelope, blocks, texts)
                     await self._cancelled(seen, scope, request_id, digest, latency_ms)
